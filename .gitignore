@@ -37,3 +37,6 @@ Thumbs.db
 *.log
 # Local benchmarks
 tmp_bench/
+
+# Local datasets
+playground/Datasets/

@@ -1,0 +1,130 @@
+run_id: robot_ft_trossen_vjepa21_small_a100x4_30ep
+run_root_dir: checkpoints
+seed: 42
+trackers:
+  - tensorboard
+is_debug: false
+
+framework:
+  name: VLA_JEPA
+  qwenvl:
+    base_vlm: "Qwen/Qwen3.5-0.8B"
+    attn_implementation: sdpa
+    enable_fast_linear_attention: false
+    vl_hidden_dim: 1024
+  action_model:
+    action_model_type: DiT-B
+    action_hidden_dim: 1024
+    hidden_size: 1024
+    add_pos_embed: true
+    max_seq_len: 1024
+    action_dim: 14
+    state_dim: 14
+    future_action_window_size: 6
+    action_horizon: 7
+    past_action_window_size: 0
+    noise_beta_alpha: 1.5
+    noise_beta_beta: 1.0
+    noise_s: 0.999
+    num_timestep_buckets: 1000
+    num_inference_timesteps: 4
+    num_target_vision_tokens: 32
+    diffusion_model_cfg:
+      cross_attention_dim: 1024
+      dropout: 0.2
+      final_dropout: true
+      interleave_self_attention: true
+      norm_type: ada_norm
+      num_layers: 16
+      output_dim: 1024
+      positional_embeddings: null
+  vj2_model:
+    source: torchhub
+    hub_repo_or_dir: /home/mehul_yonduai_com/work/vjepa2
+    hub_model_name: vjepa2_1_vit_base_384
+    hub_preprocessor_name: vjepa2_preprocessor
+    crop_size: 384
+    pretrained: true
+    freeze_encoder: true
+    num_video_views: 3
+    depth: 12
+    num_heads: 8
+    use_legacy_rope_bug: false
+    special_action_token: <|action_{}|>
+    num_action_tokens_per_timestep: 8
+    embodied_action_token: <|embodied_action|>
+    num_embodied_action_tokens_per_instruction: 32
+    num_frames: 8
+  reduce_in_full_precision: true
+
+datasets:
+  vla_data:
+    dataset_py: lerobot_datasets
+    data_root_dir: playground/Datasets/TROSSEN_SUBTASK_COMBINED
+    data_mix: trossen_subtask_combined
+    action_type: delta_qpos
+    CoT_prompt: "Your task is {instruction}. Infer the temporal dynamics from frames {actions} and produce the corresponding policy actions {e_actions}."
+    resolution_size: 224
+    video_resolution_size: 384
+    per_device_batch_size: 100
+    num_workers: 2
+    prefetch_factor: 2
+    persistent_workers: false
+    multiprocessing_context: spawn
+    pin_memory: true
+    drop_last: true
+    load_all_data_for_training: true
+    with_state: true
+
+trainer:
+  epochs: 2
+  max_train_steps: auto
+  num_warmup_steps: auto
+  save_interval: 1000
+  eval_interval: 1000
+  save_best_only: true
+  best_metric_name: mae_score
+  best_metric_mode: min
+  learning_rate:
+    base: 3.0e-05
+    qwen_vl_interface: 1.0e-05
+    action_model: 1.0e-04
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 1.0e-06
+  freeze_modules: "qwen_vl_interface.model,vj_encoder"
+  loss_scale:
+    action: 1.0
+    wm: 0.1
+  warmup_ratio: 0.01
+  logging_frequency: 50
+  eval_before_train: false
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 1
+  repeated_diffusion_steps: 2
+
+  optimizer:
+    name: AdamW8bit
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 1.0e-04
+    fused: true
+
+  is_resume: false
+  resume_epoch: null
+  resume_step: null
+  enable_gradient_checkpointing: true
+  enable_mixed_precision_training: false
+  mixed_precision: no
+  channels_last: true
+  compile_qwen_model: false
+  compile_action_model: false
+  compile_vj_predictor: false
+  compile_mode: default
+  compile_dynamic: true
+  use_rabc: true
+  rabc_progress_key: rabc_progress_delta
+  rabc_fallback_progress_key: rabc_global_progress_delta
+  rabc_kappa: 0.01
+  rabc_epsilon: 1.0e-06
+  rabc_mistake_weight: 0.25
