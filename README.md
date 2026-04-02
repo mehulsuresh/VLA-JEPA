@@ -31,6 +31,11 @@
 <a id="table-of-contents"></a>
 ## Table of Contents
 - [Table of Contents](#table-of-contents)
+- [YonduAI Fork Summary](#yonduai-fork-summary)
+- [Current Architecture](#current-architecture)
+- [What Changed From Base VLA-JEPA](#what-changed-from-base-vla-jepa)
+- [Operational Defaults](#operational-defaults)
+- [Runbook](#runbook)
 - [🚧 TODO](#todo)
 - [⚙️ Environment Setup](#environment-setup)
 - [🔥 Training](#training)
@@ -44,6 +49,158 @@
   - [SimplerEnv](#simplerenv)
 - [🤝 Acknowledgement](#acknowledgement)
 - [📝 Citation](#citation)
+
+<a id="yonduai-fork-summary"></a>
+## YonduAI Fork Summary
+
+This repository is a production-oriented YonduAI fork of the original `ginwind/VLA-JEPA` codebase.
+
+The main goal of this fork is not to change the headline method, but to make the training and deployment path materially safer, more debuggable, and more faithful to the intended optimization objectives.
+
+The major themes of the fork are:
+
+- clarify the actual model architecture being trained
+- fix silent training bugs in the world-model and optimizer/eval paths
+- stabilize dataloading and checkpointing behavior
+- clean up conflicting or dead configuration
+- document the active training pipeline and operational defaults
+
+For a visual overview of the current architecture, see:
+
+- [`assets/vla_jepa_architecture_research.svg`](./assets/vla_jepa_architecture_research.svg)
+- [`docs/vla_jepa_architecture.md`](./docs/vla_jepa_architecture.md)
+
+<a id="current-architecture"></a>
+## Current Architecture
+
+The active training path uses:
+
+- `Qwen 3.5 VL` as a frozen multimodal feature extractor
+- `V-JEPA encoder` as a frozen multi-view video latent encoder
+- `VJ predictor` as a trainable latent world model
+- `GR00T action head` as a trainable diffusion / flow-matching policy head
+
+Training optimizes two objectives jointly:
+
+- `action_loss`: policy learning objective from the GR00T action head
+- `wm_loss`: latent future-prediction objective from the VJ predictor
+
+Current total loss:
+
+```text
+total_loss = action_loss + 0.1 * wm_loss
+```
+
+Inference uses only:
+
+- the Qwen branch for embodied-action conditioning
+- the GR00T action head for denoising into a future action chunk
+
+<a id="what-changed-from-base-vla-jepa"></a>
+## What Changed From Base VLA-JEPA
+
+### Architecture / modeling changes
+
+- Added and documented the `Qwen 3.5` path used in this fork via [`starVLA/model/modules/vlm/QWen3_5.py`](./starVLA/model/modules/vlm/QWen3_5.py).
+- Corrected the world-model gradient path so `vj_predictor` actually receives gradients when Qwen is frozen.
+- Added support for the corrected predictor RoPE path while keeping a compatibility flag for legacy behavior:
+  - `framework.vj2_model.use_legacy_rope_bug`
+- Moved `wm_loss` scaling out of the model body and into trainer-side loss composition.
+- Kept the action head in a mixed path that is optimized for speed while preserving `float32`-safe inputs and loss reduction semantics.
+
+### Training correctness fixes
+
+- Fixed distributed checkpointing so all ranks participate in collective state extraction before rank 0 writes to disk.
+- Fixed evaluation so it no longer steals batches from the training iterator.
+- Fixed the resume/save flow so checkpoint directories are compatible with `Accelerate` state restore.
+- Fixed gradient accumulation semantics in the training loop.
+- Fixed `state` dtype mismatch between train and inference paths.
+- Removed unconditional per-step `.item()` calls that forced needless GPU synchronization.
+- Fixed trainer-side handling of periodic save/eval intervals with epoch-based auto resolution.
+
+### Dataloader and pipeline fixes
+
+- Added a worker-side collator for `preprocessed_subtask_dataset`.
+- Added bounded frame caching for repeated JPEG decode reuse:
+  - `datasets.vla_data.frame_cache_size`
+- Added safe worker clamping for the heavy preprocessed dataset path:
+  - `datasets.vla_data.safe_num_workers_cap`
+- Added distributed sampler support and safer iterator reset handling.
+
+### Config hygiene and runtime cleanup
+
+- Removed dead or conflicting config fields such as duplicate `repeated_diffusion_steps`.
+- Unified canonical optimizer fields under `trainer.optimizer.*`.
+- Removed dead gradient clipping aliases.
+- Switched tracker usage to a real `Accelerate`-managed tracker flow.
+- Added a proper TensorBoard path through configured trackers.
+- Added architecture documentation and an updated fork README.
+
+### Deployment / server cleanup
+
+- Hardened websocket and deployment server behavior in:
+  - [`deployment/model_server/server_policy.py`](./deployment/model_server/server_policy.py)
+  - [`deployment/model_server/tools/websocket_policy_server.py`](./deployment/model_server/tools/websocket_policy_server.py)
+
+<a id="operational-defaults"></a>
+## Operational Defaults
+
+The active single-GPU training config lives at:
+
+- [`scripts/config/vlajepa_robot_ft_trossen_vjepa21_small_5090.yaml`](./scripts/config/vlajepa_robot_ft_trossen_vjepa21_small_5090.yaml)
+
+Important defaults in this fork:
+
+- `Qwen` frozen
+- `V-JEPA encoder` frozen
+- `VJ predictor` trainable
+- `GR00T action head` trainable
+- `repeated_diffusion_steps: 4`
+- `weight_decay: 1e-4`
+- `save_interval: 1000`
+- `eval_interval: 1000`
+- `save_best_only: true`
+- `best_metric_name: mae_score`
+
+The current training path is intended for the environment:
+
+- Python `3.10`
+- conda env `vla-jepa-vjepa21`
+
+<a id="runbook"></a>
+## Runbook
+
+### Train
+
+```bash
+cd /home/mehul/work/vjepa/VLA-JEPA
+/home/mehul/miniconda3/envs/vla-jepa-vjepa21/bin/python -u starVLA/training/train_starvla.py \
+  --config_yaml scripts/config/vlajepa_robot_ft_trossen_vjepa21_small_5090.yaml
+```
+
+### TensorBoard
+
+```bash
+cd /home/mehul/work/vjepa/VLA-JEPA
+/home/mehul/miniconda3/envs/vla-jepa-vjepa21/bin/tensorboard \
+  --logdir checkpoints/robot_ft_trossen_vjepa21_small_5090_30ep \
+  --port 6006
+```
+
+### Checkpoints
+
+This fork saves full `Accelerate` state directories and supports resume from checkpoint.
+
+Checkpoint directories are written under:
+
+```text
+checkpoints/<run_id>/checkpoints/steps_<N>/
+```
+
+### Notes
+
+- This fork is verified primarily for the single-GPU training path used during development.
+- Multi-GPU handling has been substantially cleaned up, but should still be smoke-tested on real multi-GPU hardware before being treated as fully certified.
 
 <a id="todo"></a>
 ## 🚧 TODO
