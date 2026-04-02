@@ -84,12 +84,14 @@ class _QWen_VL_Interface(nn.Module):
 
         qwenvl_config = config.framework.get("qwenvl", {})
         model_id = qwenvl_config.get("base_vlm", "Qwen/Qwen2.5-VL-3B-Instruct")
+        attn_implementation = qwenvl_config.get("attn_implementation", "sdpa")
+        device_map = qwenvl_config.get("device_map", "cuda")
 
         model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             model_id,
-            attn_implementation="flash_attention_2",
+            attn_implementation=attn_implementation,
             torch_dtype="auto",
-            device_map="cuda",
+            device_map=device_map,
         )
         processor = AutoProcessor.from_pretrained(model_id)
         processor.tokenizer.padding_side = "left"
@@ -156,6 +158,33 @@ class _QWen_VL_Interface(nn.Module):
             )
 
         return outputs
+
+    def forward_features(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        pixel_values: Optional[torch.FloatTensor] = None,
+        image_grid_thw: Optional[torch.FloatTensor] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        """
+        Feature-extraction path: runs only the base transformer (no LM head, no
+        intermediate hidden states stored).  Returns last_hidden_state directly.
+
+        Saves compute (skips vocab-size matmul) and memory (no per-layer state tuple).
+        """
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            base_outputs = self.model.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                pixel_values=pixel_values,
+                image_grid_thw=image_grid_thw,
+                output_hidden_states=False,
+                output_attentions=False,
+                return_dict=True,
+                **kwargs,
+            )
+        return base_outputs.last_hidden_state
 
     def generate(
         self,

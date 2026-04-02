@@ -34,7 +34,6 @@ class CategorySpecificLinear(nn.Module):
     def forward(self, x, cat_ids):
         selected_W = self.W[cat_ids]
         selected_b = self.b[cat_ids]
-        # import ipdb; ipdb.set_trace()
         return torch.bmm(x, selected_W) + selected_b.unsqueeze(1)
 
 
@@ -220,7 +219,7 @@ class FlowmatchingActionHead(nn.Module):
     ):
         super().__init__()
         config = full_config.framework.action_model
-        self.hidden_size = config.hidden_size # 是不要和 Q对齐？
+        self.hidden_size = config.hidden_size
         self.full_config = full_config
         action_model_type = config.action_model_type
         action_model_cfg = DiTConfig[action_model_type]
@@ -267,7 +266,13 @@ class FlowmatchingActionHead(nn.Module):
         return BatchFeature(data=batch)
 
 
-    def forward(self, vl_embs: torch.Tensor, actions: torch.Tensor, state: torch.Tensor = None):
+    def forward(
+        self,
+        vl_embs: torch.Tensor,
+        actions: torch.Tensor,
+        state: torch.Tensor = None,
+        reduction: str = "mean",
+    ):
         """
         vl_embs: shape (B, seq_length, feature_dim)
         actions: shape (B, future_action_window_size, D_action)
@@ -313,8 +318,13 @@ class FlowmatchingActionHead(nn.Module):
         pred_actions = pred[:, -actions.shape[1] :]
 
         # Slice out only the action portion of pred and target.
-        loss = ((pred_actions - velocity) ** 2).mean()
-        return loss
+        per_token_loss = (pred_actions - velocity) ** 2
+        per_sample_loss = per_token_loss.mean(dim=(1, 2))
+        if reduction == "none":
+            return per_sample_loss
+        if reduction == "mean":
+            return per_sample_loss.mean()
+        raise ValueError(f"Unsupported reduction: {reduction}")
 
     @torch.no_grad()
     def predict_action(self, vl_embs: torch.Tensor, state: torch.Tensor = None) -> torch.Tensor:

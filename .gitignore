@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Training artifacts
+checkpoints/
+results/
+cache/
+wandb/
+runs/
+*.pt
+*.pth
+*.ckpt
+
+# Debug outputs
+data_view_*.mp4
+data_image_*.png
+video_view_*.mp4
+video_image_*.png
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+*.log
+# Local benchmarks
+tmp_bench/

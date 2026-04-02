@@ -187,8 +187,9 @@ class TrainerUtils:
                     print(f"⚠️ module path does not exist, cannot freeze: {path}")
                     continue
 
-        dist.barrier()  # synchronize when distributed training
-        if dist.get_rank == 0:
+        if dist.is_initialized():
+            dist.barrier()  # synchronize when distributed training
+        if not dist.is_initialized() or dist.get_rank() == 0:
             print(f"🔒 Frozen modules with re pattern: {frozen}")
         return model
 
@@ -198,7 +199,7 @@ class TrainerUtils:
         print the total number of parameters and trainable parameters of the model
         :param model: PyTorch model instance
         """
-        if dist.get_rank() != 0:
+        if dist.is_initialized() and dist.get_rank() != 0:
             return
         print("📊 model parameter statistics:")
         num_params = sum(p.numel() for p in model.parameters())
@@ -220,7 +221,7 @@ class TrainerUtils:
         """
         if not checkpoint_path:
             return []
-        if dist.get_rank() == 0:
+        if not dist.is_initialized() or dist.get_rank() == 0:
             print(f"📦 loading checkpoint: {checkpoint_path}")
         try:
             checkpoint = torch.load(checkpoint_path, map_location="cpu")
@@ -241,7 +242,7 @@ class TrainerUtils:
                     sub_state_dict = {k[len(prefix) :]: v for k, v in checkpoint.items() if k.startswith(prefix)}
                     if sub_state_dict:
                         module.load_state_dict(sub_state_dict, strict=True)
-                        if dist.get_rank() == 0:
+                        if not dist.is_initialized() or dist.get_rank() == 0:
                             print(f"✅ parameters loaded to module '{path}'")
                         loaded_modules.append(path)
                     else:
@@ -251,7 +252,7 @@ class TrainerUtils:
         else:  # full load
             try:
                 model.load_state_dict(checkpoint, strict=True)
-                if dist.get_rank() == 0:
+                if not dist.is_initialized() or dist.get_rank() == 0:
                     print("✅ loaded <full_model> model parameters")
                 loaded_modules = ["<full_model>"]
             except Exception as e:

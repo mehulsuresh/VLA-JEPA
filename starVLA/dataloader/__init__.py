@@ -5,12 +5,16 @@ from functools import partial
 import torch
 import numpy as np
 from torch.utils.data import DataLoader
-import numpy as np
+from torch.utils.data.distributed import DistributedSampler
 import torch.distributed as dist
 from pathlib import Path
 from starVLA.dataloader.vlm_datasets import make_vlm_dataloader
 
 logger = get_logger(__name__)
+
+
+def _identity_collate(batch):
+    return batch
 
 def save_dataset_statistics(dataset_statistics, run_dir):
     """Saves a `dataset_statistics.json` file."""
@@ -34,29 +38,125 @@ def save_dataset_statistics(dataset_statistics, run_dir):
     logger.info(f"Saved dataset statistics file at path {out_path}")
 
 
+def _resolve_output_dir(cfg) -> Path | None:
+    if "output_dir" in cfg:
+        return Path(cfg.output_dir)
+    if "run_root_dir" in cfg and "run_id" in cfg:
+        return Path(cfg.run_root_dir) / cfg.run_id
+    return None
 
-def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe"): # TODO now here only is get dataset, we need mv dataloader to here
+
+
+def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe", model=None): # TODO now here only is get dataset, we need mv dataloader to here
 
     if dataset_py == "lerobot_datasets":
         from starVLA.dataloader.lerobot_datasets import get_vla_dataset, collate_fn
         vla_dataset_cfg = cfg.datasets.vla_data
+        num_workers = int(vla_dataset_cfg.get("num_workers", 8))
+        pin_memory = bool(vla_dataset_cfg.get("pin_memory", torch.cuda.is_available()))
+        drop_last = bool(vla_dataset_cfg.get("drop_last", True))
 
         vla_dataset = get_vla_dataset(
             data_cfg=vla_dataset_cfg,
             action_horizon=cfg.framework.action_model.action_horizon,
             video_horizon=cfg.framework.vj2_model.num_frames)
-        
-        vla_train_dataloader = DataLoader(
-            vla_dataset,
+
+        loader_kwargs = dict(
+            dataset=vla_dataset,
             batch_size=cfg.datasets.vla_data.per_device_batch_size,
             collate_fn=collate_fn,
-            num_workers=8,
-            # shuffle=True
-        )        
-        if dist.get_rank() == 0: 
-            
-            output_dir = Path(cfg.output_dir)
-            vla_dataset.save_dataset_statistics(output_dir / "dataset_statistics.json")
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            drop_last=drop_last,
+        )
+        if num_workers > 0:
+            loader_kwargs["prefetch_factor"] = max(2, int(vla_dataset_cfg.get("prefetch_factor", 2)))
+            loader_kwargs["persistent_workers"] = bool(vla_dataset_cfg.get("persistent_workers", True))
+            loader_kwargs["multiprocessing_context"] = vla_dataset_cfg.get("multiprocessing_context", "spawn")
+
+        vla_train_dataloader = DataLoader(**loader_kwargs)
+        if not dist.is_initialized() or dist.get_rank() == 0:
+            output_dir = _resolve_output_dir(cfg)
+            if output_dir is not None:
+                output_dir.mkdir(parents=True, exist_ok=True)
+                vla_dataset.save_dataset_statistics(output_dir / "dataset_statistics.json")
+        return vla_train_dataloader
+    elif dataset_py == "preprocessed_subtask_dataset":
+        from starVLA.dataloader.preprocessed_subtask_dataset import (
+            PreprocessedSubtaskCollator,
+            PreprocessedSubtaskVLADataset,
+        )
+
+        vla_dataset_cfg = cfg.datasets.vla_data
+        num_workers = int(vla_dataset_cfg.get("num_workers", 8))
+        pin_memory = bool(vla_dataset_cfg.get("pin_memory", torch.cuda.is_available()))
+        drop_last = bool(vla_dataset_cfg.get("drop_last", True))
+
+        vla_dataset = PreprocessedSubtaskVLADataset(
+            data_root_dir=vla_dataset_cfg.data_root_dir,
+            action_horizon=cfg.framework.action_model.action_horizon,
+            video_horizon=cfg.framework.vj2_model.num_frames,
+            resolution_size=vla_dataset_cfg.get("resolution_size", 224),
+            video_resolution_size=vla_dataset_cfg.get("video_resolution_size", 384),
+            instruction_text=vla_dataset_cfg.get("instruction_text", "Complete the task successfully."),
+            current_cameras=vla_dataset_cfg.get("current_cameras", None),
+            frame_cache_size=vla_dataset_cfg.get("frame_cache_size", 256),
+        )
+
+        collate_fn = _identity_collate
+        if model is not None:
+            collate_fn = PreprocessedSubtaskCollator(
+                model_id=cfg.framework.qwenvl.base_vlm,
+                prompt_template=vla_dataset_cfg.get("CoT_prompt", ""),
+                replace_prompt=model.replace_prompt,
+                embodied_replace_prompt=model.embodied_replace_prompt,
+                special_action_token=cfg.framework.vj2_model.special_action_token,
+                max_action_tokens=cfg.framework.action_model.action_horizon * 4,
+                embodied_action_token=cfg.framework.vj2_model.get(
+                    "embodied_action_token", "<|embodied_action|>"
+                ),
+            )
+            safe_worker_cap = int(vla_dataset_cfg.get("safe_num_workers_cap", 2))
+            if num_workers > safe_worker_cap:
+                logger.warning(
+                    "Clamping preprocessed_subtask_dataset num_workers from "
+                    f"{num_workers} to {safe_worker_cap} to avoid worker RAM blowups"
+                )
+                num_workers = safe_worker_cap
+
+        sampler = None
+        shuffle = True
+        if dist.is_initialized():
+            sampler = DistributedSampler(
+                vla_dataset,
+                num_replicas=dist.get_world_size(),
+                rank=dist.get_rank(),
+                shuffle=True,
+                drop_last=drop_last,
+            )
+            shuffle = False
+
+        loader_kwargs = dict(
+            dataset=vla_dataset,
+            batch_size=cfg.datasets.vla_data.per_device_batch_size,
+            collate_fn=collate_fn,
+            shuffle=shuffle,
+            sampler=sampler,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            drop_last=drop_last,
+        )
+        if num_workers > 0:
+            loader_kwargs["prefetch_factor"] = max(2, int(vla_dataset_cfg.get("prefetch_factor", 2)))
+            loader_kwargs["persistent_workers"] = False
+            loader_kwargs["multiprocessing_context"] = vla_dataset_cfg.get("multiprocessing_context", "spawn")
+
+        vla_train_dataloader = DataLoader(**loader_kwargs)
+        if not dist.is_initialized() or dist.get_rank() == 0:
+            output_dir = _resolve_output_dir(cfg)
+            if output_dir is not None:
+                output_dir.mkdir(parents=True, exist_ok=True)
+                vla_dataset.save_dataset_statistics(output_dir / "dataset_statistics.json")
         return vla_train_dataloader
     elif dataset_py == "vlm_datasets":
         vlm_data_module = make_vlm_dataloader(cfg)

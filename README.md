@@ -63,6 +63,9 @@ git clone https://github.com/ginwind/VLA-JEPA
 conda create -n VLA_JEPA python=3.10 -y
 conda activate VLA_JEPA
 
+# Install MPI runtime required by DeepSpeed's MPI discovery path
+conda install -y -c conda-forge openmpi
+
 # Install requirements
 pip install -r requirements.txt
 

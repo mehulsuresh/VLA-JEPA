@@ -20,6 +20,7 @@ fastparquet==2024.11.0
 av==12.3.0
 numpydantic==1.6.9
 deepspeed==0.16.9
+mpi4py
 qwen-vl-utils
 omegaconf
 numpy==1.26.4
@@ -27,3 +28,6 @@ wandb
 rich
 diffusers
 timm
+websockets
+msgpack
+opencv-python-headless

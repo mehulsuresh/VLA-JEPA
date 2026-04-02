@@ -23,7 +23,7 @@ def build_action_block_causal_attention_mask(T, H, W, add_tokens=1):
     return mask
 
 
-def rotate_queries_or_keys(x, pos):
+def rotate_queries_or_keys(x, pos, use_legacy_rope_bug=True):
     B, num_heads, N, D = x.size()
     assert D % 2 == 0, "Embedding dimension must be a multiple of 2 for block matrix rotation"
 
@@ -40,10 +40,12 @@ def rotate_queries_or_keys(x, pos):
     # -- Fixing the bug would break compatibility with the pretrained model, but the fix can be applied by commenting
     # -- out the two lines below, and uncommenting the following two lines.
     # -- Thanks to @echosprint, original PR: https://github.com/facebookresearch/vjepa2/pull/15
-    emb_sin = emb_sin.squeeze(-1).repeat(1, 1, 1, 2)
-    emb_cos = emb_cos.squeeze(-1).repeat(1, 1, 1, 2)
-    # emb_sin = emb_sin.repeat_interleave(2, dim=-1)  # (..., N, D)
-    # emb_cos = emb_cos.repeat_interleave(2, dim=-1)  # (..., N, D)
+    if use_legacy_rope_bug:
+        emb_sin = emb_sin.squeeze(-1).repeat(1, 1, 1, 2)
+        emb_cos = emb_cos.squeeze(-1).repeat(1, 1, 1, 2)
+    else:
+        emb_sin = emb_sin.repeat_interleave(2, dim=-1)  # (..., N, D)
+        emb_cos = emb_cos.repeat_interleave(2, dim=-1)  # (..., N, D)
 
     # --
     y = x.unflatten(-1, (-1, 2))
@@ -123,6 +125,7 @@ class ACRoPEAttention(nn.Module):
         use_sdpa=True,
         is_causal=False,
         grid_size=16,
+        use_legacy_rope_bug=True,
     ):
         super().__init__()
         self.num_heads = num_heads
@@ -140,6 +143,7 @@ class ACRoPEAttention(nn.Module):
         self.w_dim = int(2 * ((head_dim // 3) // 2))
         self.grid_size = grid_size
         self.is_causal = is_causal
+        self.use_legacy_rope_bug = use_legacy_rope_bug
 
     def _get_frame_pos(self, ids, H_patches, W_patches):
         tokens_per_frame = int(H_patches * W_patches)
@@ -192,8 +196,12 @@ class ACRoPEAttention(nn.Module):
                 qkv = self.qkv(a).unflatten(-1, (3, self.num_heads, -1)).permute(2, 0, 3, 1, 4)
                 q, k, v = qkv[0], qkv[1], qkv[2]  # [B, num_heads, N, D]
                 # --
-                qd = rotate_queries_or_keys(q[..., : self.d_dim], pos=torch.arange(T, device=x.device))
-                kd = rotate_queries_or_keys(k[..., : self.d_dim], pos=torch.arange(T, device=x.device))
+                qd = rotate_queries_or_keys(
+                    q[..., : self.d_dim], pos=torch.arange(T, device=x.device), use_legacy_rope_bug=self.use_legacy_rope_bug
+                )
+                kd = rotate_queries_or_keys(
+                    k[..., : self.d_dim], pos=torch.arange(T, device=x.device), use_legacy_rope_bug=self.use_legacy_rope_bug
+                )
                 qr = q[..., self.d_dim :]
                 kr = k[..., self.d_dim :]
                 action_q += [torch.cat([qd, qr], dim=-1).view(B, self.num_heads, T, 1, -1)]
@@ -211,16 +219,16 @@ class ACRoPEAttention(nn.Module):
 
         s = 0
         # Rotate depth
-        qd = rotate_queries_or_keys(q[..., s : s + self.d_dim], pos=d_mask)
-        kd = rotate_queries_or_keys(k[..., s : s + self.d_dim], pos=d_mask)
+        qd = rotate_queries_or_keys(q[..., s : s + self.d_dim], pos=d_mask, use_legacy_rope_bug=self.use_legacy_rope_bug)
+        kd = rotate_queries_or_keys(k[..., s : s + self.d_dim], pos=d_mask, use_legacy_rope_bug=self.use_legacy_rope_bug)
         s += self.d_dim
         # Rotate height dim
-        qh = rotate_queries_or_keys(q[..., s : s + self.h_dim], pos=h_mask)
-        kh = rotate_queries_or_keys(k[..., s : s + self.h_dim], pos=h_mask)
+        qh = rotate_queries_or_keys(q[..., s : s + self.h_dim], pos=h_mask, use_legacy_rope_bug=self.use_legacy_rope_bug)
+        kh = rotate_queries_or_keys(k[..., s : s + self.h_dim], pos=h_mask, use_legacy_rope_bug=self.use_legacy_rope_bug)
         s += self.h_dim
         # Rotate width dim
-        qw = rotate_queries_or_keys(q[..., s : s + self.w_dim], pos=w_mask)
-        kw = rotate_queries_or_keys(k[..., s : s + self.w_dim], pos=w_mask)
+        qw = rotate_queries_or_keys(q[..., s : s + self.w_dim], pos=w_mask, use_legacy_rope_bug=self.use_legacy_rope_bug)
+        kw = rotate_queries_or_keys(k[..., s : s + self.w_dim], pos=w_mask, use_legacy_rope_bug=self.use_legacy_rope_bug)
         s += self.w_dim
 
         # Combine rotated dimension
@@ -275,6 +283,7 @@ class RoPEAttention(nn.Module):
         use_sdpa=True,
         grid_size=14,
         is_causal=False,
+        use_legacy_rope_bug=True,
     ):
         super().__init__()
         self.num_heads = num_heads
@@ -292,6 +301,7 @@ class RoPEAttention(nn.Module):
         self.w_dim = int(2 * ((head_dim // 3) // 2))
         self.grid_size = grid_size
         self.is_causal = is_causal
+        self.use_legacy_rope_bug = use_legacy_rope_bug
 
     def _get_frame_pos(self, ids, H_patches=None, W_patches=None):
         if H_patches is None or W_patches is None:
@@ -347,16 +357,16 @@ class RoPEAttention(nn.Module):
 
         s = 0
         # Rotate depth
-        qd = rotate_queries_or_keys(q[..., s : s + self.d_dim], pos=d_mask)
-        kd = rotate_queries_or_keys(k[..., s : s + self.d_dim], pos=d_mask)
+        qd = rotate_queries_or_keys(q[..., s : s + self.d_dim], pos=d_mask, use_legacy_rope_bug=self.use_legacy_rope_bug)
+        kd = rotate_queries_or_keys(k[..., s : s + self.d_dim], pos=d_mask, use_legacy_rope_bug=self.use_legacy_rope_bug)
         s += self.d_dim
         # Rotate height dim
-        qh = rotate_queries_or_keys(q[..., s : s + self.h_dim], pos=h_mask)
-        kh = rotate_queries_or_keys(k[..., s : s + self.h_dim], pos=h_mask)
+        qh = rotate_queries_or_keys(q[..., s : s + self.h_dim], pos=h_mask, use_legacy_rope_bug=self.use_legacy_rope_bug)
+        kh = rotate_queries_or_keys(k[..., s : s + self.h_dim], pos=h_mask, use_legacy_rope_bug=self.use_legacy_rope_bug)
         s += self.h_dim
         # Rotate width dim
-        qw = rotate_queries_or_keys(q[..., s : s + self.w_dim], pos=w_mask)
-        kw = rotate_queries_or_keys(k[..., s : s + self.w_dim], pos=w_mask)
+        qw = rotate_queries_or_keys(q[..., s : s + self.w_dim], pos=w_mask, use_legacy_rope_bug=self.use_legacy_rope_bug)
+        kw = rotate_queries_or_keys(k[..., s : s + self.w_dim], pos=w_mask, use_legacy_rope_bug=self.use_legacy_rope_bug)
         s += self.w_dim
 
         # Combine rotated dimension
@@ -452,6 +462,7 @@ class ACBlock(nn.Module):
         is_causal=False,
         grid_size=16,
         use_rope=False,
+        use_legacy_rope_bug=True,
         **kwargs,
     ):
         super().__init__()
@@ -466,6 +477,7 @@ class ACBlock(nn.Module):
                 use_sdpa=use_sdpa,
                 is_causal=is_causal,
                 grid_size=grid_size,
+                use_legacy_rope_bug=use_legacy_rope_bug,
                 proj_drop=drop,
             )
         else:
@@ -520,6 +532,7 @@ class Block(nn.Module):
         is_causal=False,
         grid_size=16,
         use_rope=False,
+        use_legacy_rope_bug=True,
         **kwargs,
     ):
         super().__init__()
@@ -534,6 +547,7 @@ class Block(nn.Module):
                 use_sdpa=use_sdpa,
                 is_causal=is_causal,
                 grid_size=grid_size,
+                use_legacy_rope_bug=use_legacy_rope_bug,
                 proj_drop=drop,
             )
         else:

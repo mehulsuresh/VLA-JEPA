@@ -28,6 +28,10 @@ DATASET_NAMED_MIXTURES = {
         ("", 1.0, "fr3_real_world"),
     ],
 
+    "trossen_subtask_combined": [
+        ("", 1.0, "trossen_ai_stationary"),
+    ],
+
     "libero_goal": [
         ("libero_goal_no_noops_1.0.0_lerobot", 1.0, "libero_franka"),
     ],

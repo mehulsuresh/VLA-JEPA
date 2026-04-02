@@ -46,7 +46,7 @@ class WebsocketPolicyServer:
             await server.serve_forever()
 
     async def _handler(self, websocket: websockets.asyncio.server.ServerConnection):
-        logging.info(f"Connection from {websocket.remote_address} opened")
+        logging.info("Connection from %s opened", websocket.remote_address)
         packer = msgpack_numpy.Packer()
 
         await websocket.send(packer.pack(self._metadata))
@@ -57,13 +57,24 @@ class WebsocketPolicyServer:
                 ret = self._route_message(msg)  # route message
                 await websocket.send(packer.pack(ret))
             except websockets.ConnectionClosed:
-                logging.info(f"Connection from {websocket.remote_address} closed")
+                logging.info("Connection from %s closed", websocket.remote_address)
                 break
             except Exception:
-                await websocket.send(traceback.format_exc())
+                logging.exception("Unhandled websocket server error for %s", websocket.remote_address)
+                error_payload = {
+                    "status": "error",
+                    "ok": False,
+                    "type": "internal_error",
+                    "request_id": "unknown",
+                    "error": {
+                        "message": "Internal server error",
+                        "traceback": traceback.format_exc(),
+                    },
+                }
+                await websocket.send(packer.pack(error_payload))
                 await websocket.close(
                     code=websockets.frames.CloseCode.INTERNAL_ERROR,
-                    reason="Internal server error. Traceback included in previous frame.",
+                    reason="Internal server error. Details sent in previous frame.",
                 )
                 raise
 
@@ -84,6 +95,15 @@ class WebsocketPolicyServer:
             }
         - Does NOT raise inside this function: all exceptions are caught and encoded in response.
         """
+        if not isinstance(msg, dict):
+            return {
+                "status": "error",
+                "ok": False,
+                "type": "invalid_request",
+                "request_id": "unknown",
+                "error": {"message": f"Expected dict message, got {type(msg).__name__}"},
+            }
+
         req_id = msg.get("request_id", "default")
         mtype = msg.get("type", "infer")          # default = infer
         payload = msg.get("payload", msg)         # when no explicit payload, treat top-level as payload
@@ -101,15 +121,22 @@ class WebsocketPolicyServer:
                     "ok": False,
                     "type": "inference_result",
                     "request_id": req_id,
-                    "error": {"message": "Payload must be a dict", "payload_type": str(type(payload))}
+                    "error": {"message": "Payload must be a dict", "payload_type": str(type(payload))},
+                }
+            if "batch_images" not in payload:
+                return {
+                    "status": "error",
+                    "ok": False,
+                    "type": "inference_result",
+                    "request_id": req_id,
+                    "error": {"message": "Payload must include `batch_images`"},
                 }
             try:
-                payload["batch_images"] = image_tools.to_pil_preserve(payload["batch_images"])
-                ouput_dict = self._policy.predict_action(**payload)
+                infer_payload = dict(payload)
+                infer_payload["batch_images"] = image_tools.to_pil_preserve(infer_payload["batch_images"])
+                output_dict = self._policy.predict_action(**infer_payload)
             except Exception as e:
                 logging.exception("Policy inference error (request_id=%s)", req_id)
-                logging.exception(e)
-                
                 return {
                     "status": "error",
                     "ok": False,
@@ -117,16 +144,14 @@ class WebsocketPolicyServer:
                     "request_id": req_id,
                     "error": {
                         "message": str(e),
-                        # "traceback": traceback.format_exc(),
                     },
                 }
-            data = ouput_dict
             return {
                 "status": "ok",
                 "ok": True,
                 "type": "inference_result",
                 "request_id": req_id,
-                "data": data,
+                "data": output_dict,
             }
 
         # unknow request type

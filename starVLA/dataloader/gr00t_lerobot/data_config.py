@@ -782,11 +782,78 @@ class SingleFrankaRobotiqDeltaJointsDataConfig:
 ###########################################################################################
 
 
+class TrossenAIStationaryDataConfig:
+    video_keys = [
+        "video.base_view",
+        "video.left_wrist",
+        "video.right_wrist",
+    ]
+    state_keys = [
+        "state.joints",
+    ]
+    action_keys = [
+        "action.delta_joints",
+    ]
+    language_keys = ["annotation.human.action.task_description"]
+
+    def __init__(self, observation_indices, action_indices):
+        self.observation_indices = observation_indices
+        self.action_indices = action_indices
+
+    def modality_config(self):
+        video_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.video_keys,
+        )
+        state_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.state_keys,
+        )
+        action_modality = ModalityConfig(
+            delta_indices=self.action_indices,
+            modality_keys=self.action_keys,
+        )
+        language_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.language_keys,
+        )
+        return {
+            "video": video_modality,
+            "state": state_modality,
+            "action": action_modality,
+            "language": language_modality,
+        }
+
+    def transform(self):
+        transforms = [
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionTransform(
+                apply_to=self.state_keys,
+                normalization_modes={
+                    "state.joints": "min_max",
+                },
+            ),
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                normalization_modes={
+                    "action.delta_joints": "min_max",
+                },
+            ),
+        ]
+
+        return ComposedModalityTransform(transforms=transforms)
+
+
+###########################################################################################
+
+
 
 ROBOT_TYPE_CONFIG_MAP = {
     "libero_franka": Libero4in1DataConfig,
     "droid_franka": LeRobotDroidDataConfig,
     "fr3_real_world": FR3RealWorldConfig,
+    "trossen_ai_stationary": TrossenAIStationaryDataConfig,
     #"oxe_droid": OxeDroidDataConfig(),
     "oxe_bridge": OxeBridgeDataConfig,
     "oxe_rt1": OxeRT1DataConfig,

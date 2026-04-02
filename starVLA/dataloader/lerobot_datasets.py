@@ -45,7 +45,7 @@ def make_LeRobotSingleDataset(
         modality_configs=modality_config,
         transforms=transforms,
         embodiment_tag=embodiment_tag,
-        video_backend="torchvision_av",
+        video_backend="decord",
         delete_pause_frame=delete_pause_frame,
     )
 

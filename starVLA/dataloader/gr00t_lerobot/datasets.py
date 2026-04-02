@@ -585,6 +585,9 @@ class LeRobotSingleDataset(Dataset):
             # Fallback to the old hardcoded approach if metadata approach fails
             if 'action.delta_eef_position' in data.columns:
                 delta_position_values = data['action.delta_eef_position'].to_numpy().tolist()
+            elif 'action' in data.columns:
+                # Generic vector-action fallback for datasets that store all action dims in one field.
+                delta_position_values = np.stack(data['action']).tolist()
             elif all(col in data.columns for col in ['action.x', 'action.y', 'action.z']):
                 x_vals = data['action.x'].to_numpy()
                 y_vals = data['action.y'].to_numpy() 
@@ -619,6 +622,8 @@ class LeRobotSingleDataset(Dataset):
                 gripper_values = data['action.gripper_close'].to_numpy().tolist()
             elif 'action.gripper' in data.columns:
                 gripper_values = data['action.gripper'].to_numpy().tolist()
+            elif 'action' in data.columns:
+                gripper_values = [0.0] * len(data)
             else:
                 raise ValueError(f"No suitable gripper columns found. Available columns: {data.columns.tolist()}")
         
@@ -1594,14 +1599,10 @@ class LeRobotMixtureDataset(Dataset):
                 
                 # Process all video keys dynamically
                 videos, images = [], []
-                for i, video_key in enumerate(dataset.modality_keys["video"]):
+                for video_key in dataset.modality_keys["video"]:
                     video = data[video_key] # Shape: (T, H, W, C)
                     video = self.resize_video_opencv(video, self.video_resolution_size)
-                    if len(dataset.modality_keys["video"]) > 2:
-                        if i in [0, 2]:
-                            videos.append(video)
-                    else:
-                        videos.append(video)
+                    videos.append(video)
                     primary_image = Image.fromarray(video[0]).resize((self.resolution_size, self.resolution_size))
                     images.append(primary_image)
                 if len(dataset.modality_keys["video"]) == 1:
@@ -1622,6 +1623,103 @@ class LeRobotMixtureDataset(Dataset):
                         state.append(data[state_key])
                     state = np.concatenate(state, axis=1).astype(np.float16)
                     return_dict["state"] = state[0:1]
+
+                if dataset.curr_traj_data is not None and step < len(dataset.curr_traj_data):
+                    label_row = dataset.curr_traj_data.iloc[step]
+                    for label_key in (
+                        "index",
+                        "frame_index",
+                        "episode_index",
+                        "task_index",
+                        "task_id",
+                        "sub_task_id",
+                        "reward",
+                        "global_complexity_to_go",
+                        "local_complexity_to_go",
+                    ):
+                        if label_key in label_row.index:
+                            label_value = label_row[label_key]
+                            if isinstance(label_value, np.generic):
+                                label_value = label_value.item()
+                            return_dict[label_key] = label_value
+
+                    future_step = min(step + action.shape[0] - 1, len(dataset.curr_traj_data) - 1)
+                    future_row = dataset.curr_traj_data.iloc[future_step]
+                    for label_key in (
+                        "reward",
+                        "global_complexity_to_go",
+                        "local_complexity_to_go",
+                        "task_id",
+                        "sub_task_id",
+                    ):
+                        if label_key in future_row.index:
+                            label_value = future_row[label_key]
+                            if isinstance(label_value, np.generic):
+                                label_value = label_value.item()
+                            return_dict[f"future_{label_key}"] = label_value
+
+                    if "sub_task_id" in label_row.index:
+                        current_ok_flag = float(label_row["sub_task_id"])
+                        future_ok_flag = float(future_row.get("sub_task_id", current_ok_flag))
+                        current_mistake = 1.0 - current_ok_flag
+                        future_mistake = 1.0 - future_ok_flag
+                        return_dict["mistake_label"] = current_mistake
+                        return_dict["future_mistake_label"] = future_mistake
+
+                    progress_candidates = (
+                        "mistake",
+                        "mistake_label",
+                        "is_mistake",
+                        "failure",
+                        "error",
+                    )
+                    for mistake_key in progress_candidates:
+                        if mistake_key in label_row.index:
+                            current_value = label_row[mistake_key]
+                            future_value = future_row[mistake_key]
+                            if isinstance(current_value, np.generic):
+                                current_value = current_value.item()
+                            if isinstance(future_value, np.generic):
+                                future_value = future_value.item()
+                            return_dict[mistake_key] = current_value
+                            return_dict[f"future_{mistake_key}"] = future_value
+                            break
+
+                    def _safe_progress(value, default=0.0):
+                        if value is None:
+                            return default
+                        value = float(value)
+                        if np.isnan(value):
+                            return default
+                        return float(np.clip(value, 0.0, 1.0))
+
+                    if "global_complexity_to_go" in label_row.index:
+                        current_global_progress = 1.0 - _safe_progress(label_row["global_complexity_to_go"], 1.0)
+                        future_global_progress = 1.0 - _safe_progress(
+                            future_row.get("global_complexity_to_go", label_row["global_complexity_to_go"]),
+                            1.0,
+                        )
+                        return_dict["rabc_global_progress"] = current_global_progress
+                        return_dict["rabc_future_global_progress"] = future_global_progress
+                        return_dict["rabc_global_progress_delta"] = future_global_progress - current_global_progress
+
+                    if "task_id" in label_row.index and "local_complexity_to_go" in label_row.index:
+                        stage_series = dataset.curr_traj_data["task_id"]
+                        stage_min = int(stage_series.min())
+                        stage_max = int(stage_series.max())
+                        num_stages = max(stage_max - stage_min + 1, 1)
+                        current_stage_idx = int(label_row["task_id"]) - stage_min
+                        future_stage_idx = int(future_row.get("task_id", label_row["task_id"])) - stage_min
+                        current_local_progress = 1.0 - _safe_progress(label_row["local_complexity_to_go"], 1.0)
+                        future_local_progress = 1.0 - _safe_progress(
+                            future_row.get("local_complexity_to_go", label_row["local_complexity_to_go"]),
+                            1.0,
+                        )
+                        current_stage_progress = (current_stage_idx + current_local_progress) / num_stages
+                        future_stage_progress = (future_stage_idx + future_local_progress) / num_stages
+                        return_dict["rabc_stage_progress"] = current_stage_progress
+                        return_dict["rabc_future_stage_progress"] = future_stage_progress
+                        return_dict["rabc_progress_delta"] = future_stage_progress - current_stage_progress
                 #print(videos[0].shape) #[horizon, H, W, 3]
                 #print(action.shape) #[horizon, action_dim]
                 #print(images[0]) #PIL.Image
@@ -2122,6 +2220,3 @@ class LeRobotMixtureDataset(Dataset):
                 dataset.set_transforms_metadata(self.merged_metadata[dataset.tag])
         
         print(f"Applied cached statistics for {len(self.merged_metadata)} embodiment tags.")
-
-
-

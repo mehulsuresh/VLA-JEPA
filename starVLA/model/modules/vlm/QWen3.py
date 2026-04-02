@@ -3,11 +3,9 @@
 # Implemented by [Jinhui YE / HKUST University] in [2025].
 
 import torch
-from typing import Optional, List
+from typing import Dict, Optional, List
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
-from transformers.modeling_outputs import CausalLMOutputWithPast
-from typing import Dict, Optional, List
 from torch.nn.utils.rnn import pad_sequence
 from transformers import BatchFeature
 
@@ -54,12 +52,14 @@ class _QWen3_VL_Interface(nn.Module):
 
         qwenvl_config = config.framework.get("qwenvl", {})
         model_id = qwenvl_config.get("base_vlm", "Qwen/Qwen3-VL-4B-Instruct")
+        attn_implementation = qwenvl_config.get("attn_implementation", "sdpa")
+        device_map = qwenvl_config.get("device_map", "cuda")
 
         model = Qwen3VLForConditionalGeneration.from_pretrained(
             model_id,
-            attn_implementation="flash_attention_2",
+            attn_implementation=attn_implementation,
             dtype=torch.bfloat16,
-            device_map="cuda",
+            device_map=device_map,
         )
         processor = AutoProcessor.from_pretrained(model_id)
         processor.tokenizer.padding_side = "left"
@@ -133,8 +133,6 @@ class _QWen3_VL_Interface(nn.Module):
 
             content.append({"type": "text", "text": prompt})
             msg = [{"role": "user", "content": content}]
-            #print(msg)
-            #exit()
 
             if solutions is not None:
                 solution = solutions[len(messages)]
@@ -151,10 +149,6 @@ class _QWen3_VL_Interface(nn.Module):
         return_dict=True,
         return_tensors="pt"
         )
-
-        #for k, v in batch_inputs.items():
-        #    print(k, v.shape if isinstance(v, torch.Tensor) else v)
-        #exit()
 
         # if solutions, mask out the solution tokens in labels
         if solutions is not None: #  here only for fast_tokenizer now. 
@@ -180,24 +174,3 @@ class _QWen3_VL_Interface(nn.Module):
             batch_inputs['labels'] = labels
 
         return batch_inputs.to(self.model.device)
-
-
-
-
-if __name__ == "__main__":
-    from omegaconf import OmegaConf
-    import debugpy
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config_yaml", type=str, default="./starVLA/config/training/starvla_cotrain_oxe.yaml", help="Path to YAML config")
-    args, clipargs = parser.parse_known_args()
-
-    debugpy.listen(("0.0.0.0", 10092))
-    print("🔍 Rank 0 waiting for debugger attach on port 10092...")
-    debugpy.wait_for_client()
-
-    cfg = OmegaConf.load(args.config_yaml)
-    
-    cfg.framework.qwenvl.base_vlm = "./playground/Pretrained_models/Qwen3-VL-4B-Instruct"
-    qwen_vl = _QWen3_VL_Interface(cfg)
-    pass

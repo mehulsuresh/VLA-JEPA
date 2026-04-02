@@ -41,6 +41,7 @@ class VisionTransformerPredictorAC(nn.Module):
         is_frame_causal=True,
         use_activation_checkpointing=False,
         use_rope=True,
+        use_legacy_rope_bug=True,
         action_embed_dim=7,
         use_extrinsics=False,
         # added
@@ -78,10 +79,12 @@ class VisionTransformerPredictorAC(nn.Module):
 
         # Attention Blocks
         self.use_rope = use_rope
+        self.use_legacy_rope_bug = use_legacy_rope_bug
         self.predictor_blocks = nn.ModuleList(
             [
                 Block(
                     use_rope=use_rope,
+                    use_legacy_rope_bug=use_legacy_rope_bug,
                     grid_size=self.grid_height,
                     dim=predictor_embed_dim,
                     num_heads=num_heads,
@@ -108,7 +111,6 @@ class VisionTransformerPredictorAC(nn.Module):
         self.apply(self._init_weights)
         self._rescale_blocks()
 
-        attn_mask = None
         if self.is_frame_causal:
             grid_depth = self.num_frames // self.tubelet_size
             grid_height = self.img_height // self.patch_size
@@ -116,7 +118,9 @@ class VisionTransformerPredictorAC(nn.Module):
             attn_mask = build_action_block_causal_attention_mask(
                 grid_depth, grid_height, grid_width, add_tokens=num_add_tokens
             )
-        self.attn_mask = attn_mask
+            self.register_buffer("attn_mask", attn_mask, persistent=False)
+        else:
+            self.attn_mask = None
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -159,7 +163,7 @@ class VisionTransformerPredictorAC(nn.Module):
         else:
             x = torch.cat([a, x], dim=2).flatten(1, 2)  # [B, T*(H*W+2), D]
 
-        attn_mask = self.attn_mask[: x.size(1), : x.size(1)].to(x.device, non_blocking=True)
+        attn_mask = self.attn_mask[: x.size(1), : x.size(1)]
 
         # Fwd prop
         for i, blk in enumerate(self.predictor_blocks):

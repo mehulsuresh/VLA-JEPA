@@ -5,9 +5,12 @@
 import logging
 import socket
 import argparse
+import os
+
+import torch
+
 from deployment.model_server.tools.websocket_policy_server import WebsocketPolicyServer
 from starVLA.model.framework.base_framework import baseframework
-import torch, os
 
 
 def main(args) -> None:
@@ -16,13 +19,18 @@ def main(args) -> None:
     # server = WebsocketPolicyServer(policy, host="localhost", port=10091)
     # server.serve_forever()
 
-    vla = baseframework.from_pretrained( # TODO should auto detect framework from model path
+    vla = baseframework.from_pretrained(  # TODO should auto detect framework from model path
         args.ckpt_path,
     )
 
-    device = torch.device(f"cuda:{str(args.cuda)}")
+    if torch.cuda.is_available():
+        device = torch.device(f"cuda:{int(args.cuda)}")
+    else:
+        device = torch.device("cpu")
+        if args.use_bf16:
+            logging.warning("Ignoring --use_bf16 because CUDA is not available")
 
-    if args.use_bf16: # False
+    if args.use_bf16 and device.type == "cuda":
         vla = vla.to(torch.bfloat16)
     vla = vla.to(device).eval()
 
@@ -46,17 +54,18 @@ def build_argparser():
     parser.add_argument("--ckpt_path", type=str, default="Qwen/Qwen2.5-VL-3B-Instruct")
     parser.add_argument("--port", type=int, default=10093)
     parser.add_argument("--use_bf16", action="store_true")
-    parser.add_argument("--cuda", default=0)
+    parser.add_argument("--cuda", type=int, default=0)
     return parser
 
 
 def start_debugpy_once():
     """start debugpy once"""
     import debugpy
+
     if getattr(start_debugpy_once, "_started", False):
         return
     debugpy.listen(("0.0.0.0", 10091))
-    print("🔍 Waiting for VSCode attach on 0.0.0.0:10091 ...")
+    logging.info("Waiting for VSCode attach on 0.0.0.0:10091")
     debugpy.wait_for_client()
     start_debugpy_once._started = True
 
@@ -66,6 +75,6 @@ if __name__ == "__main__":
     parser = build_argparser()
     args = parser.parse_args()
     if os.getenv("DEBUG", False):
-        print("🔍 DEBUGPY is enabled")
+        logging.info("DEBUGPY is enabled")
         start_debugpy_once()
     main(args)
