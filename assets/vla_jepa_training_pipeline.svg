@@ -1,303 +1,371 @@
-<svg width="1900" height="1140" viewBox="0 0 1900 1140" fill="none" xmlns="http://www.w3.org/2000/svg">
+<svg width="2000" height="1220" viewBox="0 0 2000 1220" fill="none" xmlns="http://www.w3.org/2000/svg">
   <defs>
     <style>
-      @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&amp;display=swap');
-      .title      { font: 700 32px 'Helvetica Neue', Arial, sans-serif; fill: #0F1F32; letter-spacing: -0.3px; }
-      .subtitle   { font: 400 15px 'Helvetica Neue', Arial, sans-serif; fill: #5A6E82; }
-      .col-hdr    { font: 700 11px 'Helvetica Neue', Arial, sans-serif; fill: #7B92A8; letter-spacing: 0.14em; text-transform: uppercase; }
-      .box-title  { font: 700 15px 'Helvetica Neue', Arial, sans-serif; fill: #0F2236; }
-      .box-body   { font: 400 12.5px 'Helvetica Neue', Arial, sans-serif; fill: #3C5060; }
-      .box-small  { font: 400 11px 'Helvetica Neue', Arial, sans-serif; fill: #607080; }
-      .chip       { font: 700 10px 'Helvetica Neue', Arial, sans-serif; letter-spacing: 0.09em; }
-      .edge-lbl   { font: 400 11px 'Helvetica Neue', Arial, sans-serif; fill: #5A6E82; }
-      .loss-formula { font: 700 13px 'Helvetica Neue', Arial, sans-serif; fill: #7A1F1F; }
-      .total-formula { font: 700 14px 'Helvetica Neue', Arial, sans-serif; fill: #5A0D0D; }
-      .infer-note { font: 400 12px 'Helvetica Neue', Arial, sans-serif; fill: #3C5060; }
-      .infer-label { font: 700 11px 'Helvetica Neue', Arial, sans-serif; fill: #1B3A5C; letter-spacing: 0.08em; }
+      .title    { font: 700 30px 'Helvetica Neue', Arial, sans-serif; fill: #0D1E30; letter-spacing:-0.4px }
+      .subtitle { font: 400 14px 'Helvetica Neue', Arial, sans-serif; fill: #5A6C80 }
+      .colhdr   { font: 700 10.5px 'Helvetica Neue', Arial, sans-serif; letter-spacing:0.14em }
+      .bxtitle  { font: 700 14px 'Helvetica Neue', Arial, sans-serif; fill: #0D1E30 }
+      .bxbody   { font: 400 12px 'Helvetica Neue', Arial, sans-serif; fill: #3A5065 }
+      .bxsmall  { font: 400 10.5px 'Helvetica Neue', Arial, sans-serif; fill: #5C7080 }
+      .chip     { font: 700 9.5px 'Helvetica Neue', Arial, sans-serif; letter-spacing:0.1em }
+      .arrlbl   { font: 400 10px 'Helvetica Neue', Arial, sans-serif; fill: #4A6075 }
+      .arrlbl2  { font: 400 10px 'Helvetica Neue', Arial, sans-serif; fill: #3A2870 }
+      .arrlbl3  { font: 400 10px 'Helvetica Neue', Arial, sans-serif; fill: #204E30 }
+      .formulaS { font: 700 12.5px 'Helvetica Neue', Arial, sans-serif; fill: #7A1A1A }
+      .formulaL { font: 700 14px 'Helvetica Neue', Arial, sans-serif; fill: #5A0808 }
+      .infnote  { font: 400 11.5px 'Helvetica Neue', Arial, sans-serif; fill: #3A5065 }
+      .infhdr   { font: 700 10.5px 'Helvetica Neue', Arial, sans-serif; fill: #1B3A5C; letter-spacing:0.1em }
     </style>
 
     <!-- Arrow markers -->
-    <marker id="aSlate"  viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
-      <path d="M0 1 L9 5 L0 9 Z" fill="#607080"/>
-    </marker>
-    <marker id="aBlue"   viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
-      <path d="M0 1 L9 5 L0 9 Z" fill="#2E5FA3"/>
-    </marker>
-    <marker id="aGreen"  viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
-      <path d="M0 1 L9 5 L0 9 Z" fill="#2E7D52"/>
-    </marker>
-    <marker id="aRed"    viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
-      <path d="M0 1 L9 5 L0 9 Z" fill="#B03030"/>
-    </marker>
-    <marker id="aPurple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
-      <path d="M0 1 L9 5 L0 9 Z" fill="#6040A0"/>
-    </marker>
-    <marker id="aAmber"  viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
-      <path d="M0 1 L9 5 L0 9 Z" fill="#A07020"/>
-    </marker>
+    <marker id="mAmber"  viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 1.5 L9 5 L0 8.5Z" fill="#B08020"/></marker>
+    <marker id="mBlue"   viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 1.5 L9 5 L0 8.5Z" fill="#2D5EA0"/></marker>
+    <marker id="mPurple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 1.5 L9 5 L0 8.5Z" fill="#5C3DA0"/></marker>
+    <marker id="mGreen"  viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 1.5 L9 5 L0 8.5Z" fill="#2D7D52"/></marker>
+    <marker id="mRed"    viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 1.5 L9 5 L0 8.5Z" fill="#B03030"/></marker>
 
-    <!-- Drop shadow -->
-    <filter id="shadow" x="-15%" y="-15%" width="130%" height="130%">
-      <feDropShadow dx="0" dy="4" stdDeviation="10" flood-color="#A0B4C4" flood-opacity="0.18"/>
+    <filter id="card" x="-8%" y="-8%" width="116%" height="116%">
+      <feDropShadow dx="0" dy="3" stdDeviation="8" flood-color="#A4B4C4" flood-opacity="0.15"/>
     </filter>
-    <filter id="shadowMd" x="-10%" y="-10%" width="120%" height="120%">
-      <feDropShadow dx="0" dy="3" stdDeviation="7" flood-color="#A0B4C4" flood-opacity="0.14"/>
+    <filter id="col" x="-4%" y="-2%" width="108%" height="104%">
+      <feDropShadow dx="0" dy="2" stdDeviation="5" flood-color="#A4B4C4" flood-opacity="0.10"/>
     </filter>
-
-    <!-- Column bg gradient -->
-    <linearGradient id="gradBg" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0%" stop-color="#F4F7FA"/>
-      <stop offset="100%" stop-color="#ECF0F5"/>
-    </linearGradient>
   </defs>
 
-  <!-- ─── Page background ─── -->
-  <rect width="1900" height="1140" fill="#F0F4F8"/>
-  <rect x="22" y="18" width="1856" height="1104" rx="28" fill="#FAFCFE" stroke="#D4DDE8" stroke-width="1.5"/>
+  <!-- ── Page ── -->
+  <rect width="2000" height="1220" fill="#EEF2F7"/>
+  <rect x="20" y="14" width="1960" height="1192" rx="26" fill="#F8FAFD" stroke="#D2DCE8" stroke-width="1.5"/>
 
-  <!-- ─── Title block ─── -->
-  <text x="60" y="74" class="title">VLA-JEPA 2.1 with Qwen 3.5 VL — Training Pipeline</text>
-  <text x="60" y="102" class="subtitle">Frozen perception (Qwen 3.5 VL · V-JEPA 2.1 ViT-B/384) feeds two jointly-trained heads: a latent world-model predictor and a flow-matching diffusion policy.</text>
+  <!-- ── Title ── -->
+  <text x="54" y="68" class="title">VLA-JEPA 2.1 with Qwen 3.5 VL — Training Pipeline</text>
+  <text x="54" y="94" class="subtitle">Frozen perception (Qwen 3.5 VL · V-JEPA 2.1 ViT-B/384) provides conditioning for two jointly-trained heads: a latent world-model predictor and a flow-matching diffusion policy.</text>
 
-  <!-- ════════════════════════════════════════════
-       COLUMN BACKGROUNDS + HEADERS
-  ════════════════════════════════════════════ -->
+  <!-- ════════════════════════════════
+       COLUMN BACKGROUNDS  y=160–845
+  ════════════════════════════════ -->
+  <!-- Col1 Inputs x=42–308 -->
+  <rect x="42"   y="160" width="266" height="685" rx="18" fill="#FFF9EA" stroke="#E0C055" stroke-width="1.3" filter="url(#col)"/>
+  <text x="175"  y="184" class="colhdr" fill="#9A7010" text-anchor="middle">INPUTS</text>
 
-  <!-- Col 1 – Inputs (x 42–310) -->
-  <rect x="42"  y="128" width="272" height="780" rx="18" fill="#FFF9EE" stroke="#E8CC88" stroke-width="1.2"/>
-  <text x="178" y="155" class="col-hdr" text-anchor="middle" fill="#957020">INPUTS</text>
+  <!-- Col2 Frozen x=324–844 -->
+  <rect x="324"  y="160" width="520" height="685" rx="18" fill="#EDF1FF" stroke="#8AAAD5" stroke-width="1.3" filter="url(#col)"/>
+  <text x="584"  y="184" class="colhdr" fill="#2A508A" text-anchor="middle">FROZEN PERCEPTION</text>
 
-  <!-- Col 2 – Frozen perception (x 330–870) -->
-  <rect x="330" y="128" width="544" height="780" rx="18" fill="#EDF2FF" stroke="#8AAAD8" stroke-width="1.2"/>
-  <text x="602" y="155" class="col-hdr" text-anchor="middle" fill="#2A508A">FROZEN PERCEPTION</text>
+  <!-- Col3 Trainable x=902–1446 -->
+  <rect x="902"  y="160" width="544" height="685" rx="18" fill="#EDF8F2" stroke="#7CC49A" stroke-width="1.3" filter="url(#col)"/>
+  <text x="1174" y="184" class="colhdr" fill="#1E6040" text-anchor="middle">TRAINABLE HEADS</text>
 
-  <!-- Col 3 – Trainable heads (x 892–1430) -->
-  <rect x="892" y="128" width="540" height="780" rx="18" fill="#EDFAF2" stroke="#7FC49A" stroke-width="1.2"/>
-  <text x="1162" y="155" class="col-hdr" text-anchor="middle" fill="#1E6E45">TRAINABLE HEADS</text>
+  <!-- Col4 Objectives x=1464–1882 -->
+  <rect x="1464" y="160" width="418" height="685" rx="18" fill="#FFF1F1" stroke="#D09090" stroke-width="1.3" filter="url(#col)"/>
+  <text x="1673" y="184" class="colhdr" fill="#8A2020" text-anchor="middle">TRAINING OBJECTIVES</text>
 
-  <!-- Col 4 – Objectives (x 1450–1870) -->
-  <rect x="1452" y="128" width="408" height="780" rx="18" fill="#FFF1F1" stroke="#D89090" stroke-width="1.2"/>
-  <text x="1656" y="155" class="col-hdr" text-anchor="middle" fill="#8B2020">TRAINING OBJECTIVES</text>
+  <!-- ════════════════════════════════
+       COL 1 — INPUT BOXES
+  ════════════════════════════════ -->
 
-  <!-- ════════════════════════════════════════════
-       COL 1 – INPUT BOXES
-  ════════════════════════════════════════════ -->
+  <!-- Lang+Images -->
+  <rect x="58" y="192" width="234" height="114" rx="14" fill="#FFFDF0" stroke="#D8B840" stroke-width="1.8" filter="url(#card)"/>
+  <text x="78" y="218" class="bxtitle">Language + Images</text>
+  <text x="78" y="237" class="bxbody">Instruction / CoT prompt</text>
+  <text x="78" y="254" class="bxbody">3 camera views (224 px)</text>
+  <text x="78" y="298" class="bxsmall">cam_high · cam_left_wrist · cam_right_wrist</text>
 
-  <!-- Input 1: Language + Images -->
-  <rect x="56"  y="172" width="244" height="124" rx="16" fill="#FFFCF2" stroke="#DEB84A" stroke-width="1.8" filter="url(#shadowMd)"/>
-  <text x="80"  y="200" class="box-title">Language + Images</text>
-  <text x="80"  y="222" class="box-body">Instruction / CoT prompt</text>
-  <text x="80"  y="240" class="box-body">3 camera views (224 px)</text>
-  <text x="80"  y="264" class="box-small">cam_high · cam_left_wrist · cam_right_wrist</text>
+  <!-- Video Clip -->
+  <rect x="58" y="322" width="234" height="128" rx="14" fill="#FFFDF0" stroke="#D8B840" stroke-width="1.8" filter="url(#card)"/>
+  <text x="78" y="348" class="bxtitle">Video Clip</text>
+  <text x="78" y="368" class="bxbody">3 views × 8 frames · 384 × 384</text>
+  <text x="78" y="386" class="bxbody">B × V × T × C × H × W</text>
+  <text x="78" y="404" class="bxsmall">V=3  T=8  C=3  H=W=384  uint8/float</text>
+  <text x="78" y="422" class="bxsmall">channels_last_3d format</text>
+  <text x="78" y="440" class="bxsmall">normalized: mean=[0.485,0.456,0.406]</text>
 
-  <!-- Input 2: Video Clip -->
-  <rect x="56"  y="316" width="244" height="124" rx="16" fill="#FFFCF2" stroke="#DEB84A" stroke-width="1.8" filter="url(#shadowMd)"/>
-  <text x="80"  y="344" class="box-title">Video Clip</text>
-  <text x="80"  y="366" class="box-body">3 views × 8 frames</text>
-  <text x="80"  y="384" class="box-body">384 × 384 resolution</text>
-  <text x="80"  y="406" class="box-small">B × V × T × C × H × W</text>
-  <text x="80"  y="424" class="box-small">V=3  T=8  C=3  H=W=384</text>
+  <!-- Robot State -->
+  <rect x="58" y="466" width="234" height="92" rx="14" fill="#FFFDF0" stroke="#D8B840" stroke-width="1.8" filter="url(#card)"/>
+  <text x="78" y="492" class="bxtitle">Robot State</text>
+  <text x="78" y="512" class="bxbody">Proprioceptive joint state</text>
+  <text x="78" y="529" class="bxsmall">state_dim=14  ·  delta_qpos format</text>
+  <text x="78" y="547" class="bxsmall">directly conditions action head</text>
 
-  <!-- Input 3: Robot State -->
-  <rect x="56"  y="460" width="244" height="100" rx="16" fill="#FFFCF2" stroke="#DEB84A" stroke-width="1.8" filter="url(#shadowMd)"/>
-  <text x="80"  y="488" class="box-title">Robot State</text>
-  <text x="80"  y="510" class="box-body">Proprioceptive joint state</text>
-  <text x="80"  y="530" class="box-small">state_dim = 14</text>
-  <text x="80"  y="548" class="box-small">delta_qpos format</text>
+  <!-- Supervision -->
+  <rect x="58" y="574" width="234" height="175" rx="14" fill="#FFFDF0" stroke="#D8B840" stroke-width="1.8" filter="url(#card)"/>
+  <text x="78" y="600" class="bxtitle">Supervision Signals</text>
+  <text x="78" y="620" class="bxbody">Future action chunk target</text>
+  <text x="78" y="638" class="bxsmall">action_horizon=7  ·  action_dim=14</text>
+  <text x="78" y="658" class="bxbody">RA-BC labels</text>
+  <text x="78" y="676" class="bxsmall">rabc_progress_delta (primary)</text>
+  <text x="78" y="693" class="bxsmall">rabc_global_progress_delta (fallback)</text>
+  <text x="78" y="710" class="bxsmall">κ=0.01  mistake_weight=0.25</text>
+  <text x="78" y="727" class="bxsmall">directly conditions action head</text>
 
-  <!-- Input 4: Supervision -->
-  <rect x="56"  y="580" width="244" height="160" rx="16" fill="#FFFCF2" stroke="#DEB84A" stroke-width="1.8" filter="url(#shadowMd)"/>
-  <text x="80"  y="608" class="box-title">Supervision</text>
-  <text x="80"  y="630" class="box-body">Future action chunk</text>
-  <text x="80"  y="648" class="box-small">action_horizon = 7 steps</text>
-  <text x="80"  y="668" class="box-small">action_dim = 14</text>
-  <text x="80"  y="692" class="box-body">RA-BC labels</text>
-  <text x="80"  y="710" class="box-small">progress + mistake weights</text>
-  <text x="80"  y="728" class="box-small">κ=0.01  mistake_w=0.25</text>
+  <!-- ════════════════════════════════
+       COL 2 — FROZEN PERCEPTION
+  ════════════════════════════════ -->
 
-  <!-- ════════════════════════════════════════════
-       COL 2 – FROZEN PERCEPTION
-  ════════════════════════════════════════════ -->
+  <!-- Qwen 3.5 VL box -->
+  <rect x="342" y="192" width="486" height="194" rx="14" fill="#F5F8FF" stroke="#7098CC" stroke-width="2" filter="url(#card)"/>
+  <rect x="718" y="200" width="96" height="22" rx="11" fill="#D0DEFF"/>
+  <text x="732" y="215" class="chip" fill="#1A3E80">FROZEN</text>
+  <text x="362" y="220" class="bxtitle">Qwen 3.5 VL — 0.8B</text>
+  <text x="362" y="240" class="bxbody">SDPA multimodal feature extractor  ·  bfloat16 autocast</text>
+  <text x="362" y="258" class="bxbody">Inserts special tokens into the prompt sequence:</text>
+  <!-- sub-boxes for token types -->
+  <rect x="362" y="266" width="210" height="44" rx="10" fill="#EAF0FF" stroke="#9AB5E0" stroke-width="1.2"/>
+  <text x="382" y="284" class="bxsmall" fill="#1A3E80">〈action_{}〉 tokens</text>
+  <text x="382" y="299" class="bxsmall" fill="#1A3E80">8 per step × 7 steps = 56 total</text>
+  <rect x="584" y="266" width="230" height="44" rx="10" fill="#EAF0FF" stroke="#9AB5E0" stroke-width="1.2"/>
+  <text x="604" y="284" class="bxsmall" fill="#1A3E80">〈embodied_action〉 tokens</text>
+  <text x="604" y="299" class="bxsmall" fill="#1A3E80">32 tokens / instruction</text>
+  <text x="362" y="329" class="bxsmall">hidden_dim=1024  ·  output: last_hidden [B, L, 1024]  ·  torch.no_grad()</text>
+  <text x="362" y="346" class="bxsmall">vl_hidden_dim=1024  ·  attn_implementation=sdpa</text>
+  <text x="362" y="363" class="bxsmall">resize_token_embeddings for special action tokens</text>
+  <text x="362" y="380" class="bxsmall">compile_qwen_model=false  ·  CoT prompt template</text>
 
-  <!-- Qwen 3.5 VL block -->
-  <rect x="348" y="172" width="508" height="184" rx="16" fill="#F6F9FF" stroke="#7098D0" stroke-width="2" filter="url(#shadowMd)"/>
-  <!-- FROZEN chip -->
-  <rect x="756" y="182" width="84" height="24" rx="12" fill="#D0DCFF"/>
-  <text x="770" y="199" class="chip" fill="#1A3E80">FROZEN</text>
-  <text x="372" y="204" class="box-title">Qwen 3.5 VL  —  0.8B</text>
-  <text x="372" y="226" class="box-body">SDPA multimodal feature extractor</text>
-  <text x="372" y="248" class="box-body">Inserts special tokens into the prompt sequence:</text>
-  <!-- Token slots sub-boxes -->
-  <rect x="372" y="260" width="198" height="48" rx="10" fill="#EEF3FF" stroke="#A0B8E8" stroke-width="1.2"/>
-  <text x="392" y="280" class="box-small" fill="#223A70">action tokens  〈action_{}〉</text>
-  <text x="392" y="297" class="box-small" fill="#223A70">8 per step × 7 timesteps = 56 total</text>
-  <rect x="582" y="260" width="254" height="48" rx="10" fill="#EEF3FF" stroke="#A0B8E8" stroke-width="1.2"/>
-  <text x="602" y="280" class="box-small" fill="#223A70">embodied action tokens  〈e_action〉</text>
-  <text x="602" y="297" class="box-small" fill="#223A70">32 tokens / instruction</text>
-  <text x="372" y="342" class="box-small">hidden_dim = 1024  ·  output: last_hidden [B, L, 1024]</text>
+  <!-- V-JEPA 2.1 box -->
+  <rect x="342" y="402" width="486" height="178" rx="14" fill="#F5F8FF" stroke="#7098CC" stroke-width="2" filter="url(#card)"/>
+  <rect x="718" y="410" width="96" height="22" rx="11" fill="#D0DEFF"/>
+  <text x="732" y="425" class="chip" fill="#1A3E80">FROZEN</text>
+  <text x="362" y="430" class="bxtitle">V-JEPA 2.1 — ViT-B / 384</text>
+  <text x="362" y="450" class="bxbody">Multi-view spatio-temporal patch encoder</text>
+  <text x="362" y="468" class="bxbody">Encodes each view independently → cat along token dim</text>
+  <text x="362" y="486" class="bxsmall">tubelet_size=2  ·  depth=12  ·  heads=8  ·  embed_dim=768 / view</text>
+  <text x="362" y="502" class="bxsmall">output: [B, V×(T/2)×spatial_tokens, 768] → cat → [B, N, 768×3]</text>
+  <!-- past / future sub-boxes -->
+  <rect x="362" y="510" width="210" height="44" rx="10" fill="#E5EEFF" stroke="#9AB5E0" stroke-width="1.2"/>
+  <text x="382" y="528" class="bxsmall" fill="#1A3E80">past latents</text>
+  <text x="382" y="543" class="bxsmall" fill="#1A3E80">first T−1 frames → VJ Predictor</text>
+  <rect x="584" y="510" width="230" height="44" rx="10" fill="#E5EEFF" stroke="#9AB5E0" stroke-width="1.2"/>
+  <text x="604" y="528" class="bxsmall" fill="#1A3E80">target future latents  (GT)</text>
+  <text x="604" y="543" class="bxsmall" fill="#1A3E80">last 1 frame → wm_loss supervision</text>
+  <text x="362" y="572" class="bxsmall">pretrained=true  ·  source=torchhub  ·  freeze_encoder=true</text>
 
-  <!-- V-JEPA 2.1 Encoder block -->
-  <rect x="348" y="378" width="508" height="188" rx="16" fill="#F6F9FF" stroke="#7098D0" stroke-width="2" filter="url(#shadowMd)"/>
-  <rect x="756" y="388" width="84" height="24" rx="12" fill="#D0DCFF"/>
-  <text x="770" y="405" class="chip" fill="#1A3E80">FROZEN</text>
-  <text x="372" y="408" class="box-title">V-JEPA 2.1  —  ViT-B / 384</text>
-  <text x="372" y="430" class="box-body">Multi-view spatio-temporal patch encoder</text>
-  <text x="372" y="452" class="box-body">Encodes each view independently → concatenates along token dim</text>
-  <text x="372" y="474" class="box-small">tubelet_size=2  depth=12  heads=8  embed_dim=768/view</text>
-  <text x="372" y="494" class="box-small">Output: [B, V×T/2 × spatial_tokens, 768] → cat → [B, N, 768×3]</text>
-  <!-- Past / Future split -->
-  <rect x="372" y="506" width="198" height="44" rx="10" fill="#E8EFFF" stroke="#A0B8E8" stroke-width="1.2"/>
-  <text x="392" y="524" class="box-small" fill="#1B3A6A">past latents</text>
-  <text x="392" y="540" class="box-small" fill="#1B3A6A">first T−1 frames</text>
-  <rect x="582" y="506" width="254" height="44" rx="10" fill="#E8EFFF" stroke="#A0B8E8" stroke-width="1.2"/>
-  <text x="602" y="524" class="box-small" fill="#1B3A6A">target future latents</text>
-  <text x="602" y="540" class="box-small" fill="#1B3A6A">last 1 frame  (GT for wm_loss)</text>
+  <!-- Token Extraction box -->
+  <rect x="342" y="602" width="486" height="120" rx="14" fill="#F0EAFF" stroke="#9070CC" stroke-width="1.8" filter="url(#card)"/>
+  <text x="362" y="628" class="bxtitle" fill="#2E0D70">Token Extraction  (index into last_hidden)</text>
+  <text x="362" y="648" class="bxbody">action_token_ids  →  WM conditioning   [B, 56, 1024]</text>
+  <text x="362" y="666" class="bxbody">embodied_action_token_id  →  policy conditioning   [B, 32, 1024]</text>
+  <text x="362" y="684" class="bxsmall">torch.isin() indexing  ·  both under bfloat16 autocast</text>
+  <text x="362" y="700" class="bxsmall">Qwen is frozen  →  torch.no_grad() wraps full Qwen forward pass</text>
+  <text x="362" y="715" class="bxsmall">cross_attn_dim patched to qwen.hidden_size before action model init</text>
 
-  <!-- Qwen outputs / extraction note -->
-  <rect x="348" y="588" width="508" height="108" rx="16" fill="#F3EEFF" stroke="#9878CC" stroke-width="1.8" filter="url(#shadowMd)"/>
-  <text x="372" y="616" class="box-title" fill="#3D1A6A">Token Extraction  (index into last_hidden)</text>
-  <text x="372" y="638" class="box-body">action_token_ids → WM conditioning  [B, 56, 1024]</text>
-  <text x="372" y="658" class="box-body">embodied_action_token_id → policy conditioning  [B, 32, 1024]</text>
-  <text x="372" y="678" class="box-small">Both run under bfloat16 autocast. Qwen is frozen → torch.no_grad().</text>
-
-  <!-- ════════════════════════════════════════════
-       COL 3 – TRAINABLE HEADS
-  ════════════════════════════════════════════ -->
+  <!-- ════════════════════════════════
+       COL 3 — TRAINABLE HEADS
+  ════════════════════════════════ -->
 
   <!-- VJ Predictor -->
-  <rect x="908" y="172" width="508" height="196" rx="16" fill="#F2FBF5" stroke="#5EAD7E" stroke-width="2" filter="url(#shadowMd)"/>
-  <rect x="1302" y="182" width="98" height="24" rx="12" fill="#C8EED6"/>
-  <text x="1318" y="199" class="chip" fill="#175E30">TRAINABLE</text>
-  <text x="932" y="204" class="box-title">VJ Predictor  —  VisionTransformerPredictorAC</text>
-  <text x="932" y="226" class="box-body">Action-conditioned latent world model</text>
-  <text x="932" y="248" class="box-body">Predicts future video latents from past context + action tokens</text>
-  <text x="932" y="270" class="box-small">depth=12  heads=8  embed_dim=768×3=2304</text>
-  <text x="932" y="290" class="box-small">action_embed_dim=1024  num_add_tokens=8/step</text>
-  <text x="932" y="310" class="box-small">gradient checkpointing enabled  ·  bfloat16</text>
-  <!-- I/O labels -->
-  <rect x="932" y="320" width="214" height="36" rx="9" fill="#E2F5E9" stroke="#88C8A0" stroke-width="1.2"/>
-  <text x="952" y="343" class="box-small" fill="#1B5E35">in: past latents + action tokens</text>
-  <rect x="1160" y="320" width="214" height="36" rx="9" fill="#E2F5E9" stroke="#88C8A0" stroke-width="1.2"/>
-  <text x="1180" y="343" class="box-small" fill="#1B5E35">out: predicted future latents</text>
+  <rect x="920" y="192" width="508" height="196" rx="14" fill="#F0FBF4" stroke="#60A880" stroke-width="2" filter="url(#card)"/>
+  <rect x="1310" y="200" width="102" height="22" rx="11" fill="#C5ECCE"/>
+  <text x="1326" y="215" class="chip" fill="#165830">TRAINABLE</text>
+  <text x="940" y="220" class="bxtitle">VJ Predictor — VisionTransformerPredictorAC</text>
+  <text x="940" y="240" class="bxbody">Action-conditioned latent world model predictor</text>
+  <text x="940" y="258" class="bxbody">Predicts future video latents from past context + action tokens</text>
+  <text x="940" y="276" class="bxsmall">depth=12  ·  heads=8  ·  embed_dim=768×3=2304</text>
+  <text x="940" y="292" class="bxsmall">action_embed_dim=1024  ·  num_add_tokens=8/step</text>
+  <text x="940" y="308" class="bxsmall">gradient_checkpointing=on  ·  bfloat16  ·  compile=off</text>
+  <!-- I/O sub-boxes -->
+  <rect x="940" y="318" width="218" height="38" rx="9" fill="#DFF2E6" stroke="#82C4A0" stroke-width="1.2"/>
+  <text x="960" y="332" class="bxsmall" fill="#165830">in: past latents [B, N×(T-1), 2304]</text>
+  <text x="960" y="346" class="bxsmall" fill="#165830">     + action tokens [B, 56, 1024]</text>
+  <rect x="1172" y="318" width="234" height="38" rx="9" fill="#DFF2E6" stroke="#82C4A0" stroke-width="1.2"/>
+  <text x="1192" y="332" class="bxsmall" fill="#165830">out: predicted future latents</text>
+  <text x="1192" y="346" class="bxsmall" fill="#165830">     [B, N_spatial, 2304]</text>
+  <text x="940" y="376" class="bxsmall">lr=3×10⁻⁵  ·  use_legacy_rope_bug=false</text>
 
   <!-- GR00T Action Head -->
-  <rect x="908" y="390" width="508" height="240" rx="16" fill="#F2FBF5" stroke="#5EAD7E" stroke-width="2" filter="url(#shadowMd)"/>
-  <rect x="1302" y="400" width="98" height="24" rx="12" fill="#C8EED6"/>
-  <text x="1318" y="417" class="chip" fill="#175E30">TRAINABLE</text>
-  <text x="932" y="422" class="box-title">GR00T Action Head  —  DiT-B Flow Matching</text>
-  <text x="932" y="444" class="box-body">State encoder + action encoder + cross-attention DiT</text>
-  <text x="932" y="466" class="box-body">Learns the velocity field for flow-matching denoising</text>
-  <text x="932" y="488" class="box-small">DiT: 16 layers  ·  hidden=1024  ·  cross_attn_dim=1024</text>
-  <text x="932" y="506" class="box-small">dropout=0.2  ·  norm=ada_norm  ·  interleaved self-attn</text>
-  <text x="932" y="526" class="box-small">noise: Beta(α=1.5, β=1.0)  s=0.999  ·  1000 timestep buckets</text>
-  <!-- Training: repeated draws -->
-  <rect x="932" y="538" width="468" height="42" rx="10" fill="#DCEEE2" stroke="#78B890" stroke-width="1.2"/>
-  <text x="952" y="556" class="box-small" fill="#1B5E35">Training:  actions_target repeated × 2  (repeated_diffusion_steps=2)</text>
-  <text x="952" y="572" class="box-small" fill="#1B5E35">embodied_action_tokens + state repeated accordingly</text>
-  <!-- Inference: denoising -->
-  <rect x="932" y="590" width="468" height="32" rx="10" fill="#E8F5ED" stroke="#90C8A8" stroke-width="1.2"/>
-  <text x="952" y="611" class="box-small" fill="#1B5E35">Inference:  4 Euler steps  ·  Gaussian noise → action chunk</text>
+  <rect x="920" y="408" width="508" height="330" rx="14" fill="#F0FBF4" stroke="#60A880" stroke-width="2" filter="url(#card)"/>
+  <rect x="1310" y="416" width="102" height="22" rx="11" fill="#C5ECCE"/>
+  <text x="1326" y="431" class="chip" fill="#165830">TRAINABLE</text>
+  <text x="940" y="436" class="bxtitle">GR00T Action Head — DiT-B Flow Matching</text>
+  <text x="940" y="456" class="bxbody">State encoder + action encoder + cross-attention DiT</text>
+  <text x="940" y="474" class="bxbody">Learns the velocity field for flow-matching denoising</text>
+  <text x="940" y="492" class="bxsmall">DiT: 16 layers  ·  hidden=1024  ·  cross_attn_dim=1024  ·  output_dim=1024</text>
+  <text x="940" y="508" class="bxsmall">dropout=0.2  ·  final_dropout=true  ·  norm=ada_norm</text>
+  <text x="940" y="524" class="bxsmall">interleaved_self_attention=true  ·  positional_embeddings=null</text>
+  <text x="940" y="540" class="bxsmall">noise: Beta(α=1.5, β=1.0)  s=0.999  ·  1000 timestep buckets</text>
+  <text x="940" y="556" class="bxsmall">action_dim=14  ·  state_dim=14  ·  num_target_vision_tokens=32</text>
+  <!-- Training block -->
+  <rect x="940" y="566" width="470" height="54" rx="10" fill="#D8F0E2" stroke="#80C098" stroke-width="1.2"/>
+  <text x="960" y="582" class="bxsmall" fill="#165830">Training:  actions_target.repeat(2)  (repeated_diffusion_steps=2)</text>
+  <text x="960" y="598" class="bxsmall" fill="#165830">embodied_action_tokens + state repeated accordingly  ·  bfloat16</text>
+  <text x="960" y="613" class="bxsmall" fill="#165830">per-sample flow-matching MSE loss  (reduction="none")</text>
+  <!-- Inference block -->
+  <rect x="940" y="630" width="470" height="34" rx="10" fill="#E4F6EB" stroke="#88C4A2" stroke-width="1.2"/>
+  <text x="960" y="652" class="bxsmall" fill="#165830">Inference:  4 Euler denoising steps  ·  Gaussian noise → action chunk [B, 7, 14]</text>
+  <!-- lr note -->
+  <text x="940" y="688" class="bxsmall">lr=1×10⁻⁴  ·  compile=off  ·  channels_last=on</text>
+  <text x="940" y="704" class="bxsmall">future_action_window_size=6  ·  action_horizon=7  ·  num_inference_timesteps=4</text>
+  <text x="940" y="720" class="bxsmall">add_pos_embed=true  ·  max_seq_len=1024</text>
 
-  <!-- ════════════════════════════════════════════
-       COL 4 – OBJECTIVES
-  ════════════════════════════════════════════ -->
+  <!-- ════════════════════════════════
+       COL 4 — TRAINING OBJECTIVES
+  ════════════════════════════════ -->
 
-  <!-- WM Loss -->
-  <rect x="1468" y="172" width="376" height="152" rx="16" fill="#FFF5F5" stroke="#CC7878" stroke-width="2" filter="url(#shadowMd)"/>
-  <text x="1492" y="202" class="box-title" fill="#7A1A1A">World-Model Loss</text>
-  <text x="1492" y="226" class="box-body">Predicted future video latents</text>
-  <text x="1492" y="246" class="box-body">vs. ground-truth future latents</text>
-  <text x="1492" y="266" class="box-small">teacher-forcing  ·  bfloat16</text>
-  <line x1="1492" y1="280" x2="1824" y2="280" stroke="#DDA0A0" stroke-width="1"/>
-  <text x="1492" y="306" class="loss-formula">wm_loss = L1( ŷ_future , y_future )</text>
+  <!-- wm_loss -->
+  <rect x="1480" y="192" width="386" height="152" rx="14" fill="#FFF5F5" stroke="#CC7878" stroke-width="2" filter="url(#card)"/>
+  <text x="1500" y="220" class="bxtitle" fill="#7A1A1A">World-Model Loss</text>
+  <text x="1500" y="240" class="bxbody">Predicted future video latents</text>
+  <text x="1500" y="258" class="bxbody">vs. target future video latents (GT)</text>
+  <text x="1500" y="276" class="bxsmall">teacher-forcing  ·  bfloat16</text>
+  <line x1="1500" y1="288" x2="1848" y2="288" stroke="#E0A0A0" stroke-width="1"/>
+  <text x="1500" y="310" class="formulaS">wm_loss = L1( ŷ_future ,  y_future )</text>
+  <text x="1500" y="334" class="bxsmall">scale weight = 0.1  in joint objective</text>
 
-  <!-- Action Loss -->
-  <rect x="1468" y="346" width="376" height="188" rx="16" fill="#FFF5F5" stroke="#CC7878" stroke-width="2" filter="url(#shadowMd)"/>
-  <text x="1492" y="376" class="box-title" fill="#7A1A1A">Policy Loss — Flow Matching</text>
-  <text x="1492" y="400" class="box-body">Per-sample flow-matching MSE on</text>
-  <text x="1492" y="420" class="box-body">predicted vs. target action velocity</text>
-  <text x="1492" y="444" class="box-small">future_action_window_size = 6  ·  action_dim = 14</text>
-  <line x1="1492" y1="458" x2="1824" y2="458" stroke="#DDA0A0" stroke-width="1"/>
-  <text x="1492" y="480" class="loss-formula">action_loss = mean( FM_loss )</text>
-  <text x="1492" y="502" class="box-small">— or, with RA-BC weights:</text>
-  <text x="1492" y="520" class="loss-formula">= Σ( w_i · FM_i ) / Σ w_i</text>
+  <!-- action_loss -->
+  <rect x="1480" y="360" width="386" height="200" rx="14" fill="#FFF5F5" stroke="#CC7878" stroke-width="2" filter="url(#card)"/>
+  <text x="1500" y="388" class="bxtitle" fill="#7A1A1A">Policy Loss — Flow Matching</text>
+  <text x="1500" y="408" class="bxbody">Per-sample flow-matching MSE on</text>
+  <text x="1500" y="426" class="bxbody">predicted vs. target action velocity</text>
+  <text x="1500" y="444" class="bxsmall">future_action_window_size=6  ·  action_dim=14</text>
+  <line x1="1500" y1="456" x2="1848" y2="456" stroke="#E0A0A0" stroke-width="1"/>
+  <text x="1500" y="478" class="formulaS">action_loss = mean( FM_loss )</text>
+  <text x="1500" y="498" class="bxsmall">— or with RA-BC weights:</text>
+  <text x="1500" y="516" class="formulaS">= Σ(w_i · FM_i) / Σ w_i</text>
+  <text x="1500" y="536" class="bxsmall">scale weight = 1.0  in joint objective</text>
+  <text x="1500" y="551" class="bxsmall">warmup_ratio=0.01  ·  lr=1×10⁻⁴</text>
 
-  <!-- Total Loss -->
-  <rect x="1468" y="556" width="376" height="120" rx="16" fill="#FFEAEA" stroke="#B84040" stroke-width="2.5" filter="url(#shadow)"/>
-  <text x="1492" y="588" class="box-title" fill="#6A0E0E">Joint Objective</text>
-  <line x1="1492" y1="600" x2="1824" y2="600" stroke="#CC8080" stroke-width="1"/>
-  <text x="1656" y="638" class="total-formula" text-anchor="middle">total_loss =</text>
-  <text x="1656" y="662" class="total-formula" text-anchor="middle">action_loss  +  0.1 × wm_loss</text>
+  <!-- total_loss -->
+  <rect x="1480" y="578" width="386" height="110" rx="14" fill="#FFEAEA" stroke="#BC4040" stroke-width="2.2" filter="url(#card)"/>
+  <text x="1500" y="608" class="bxtitle" fill="#6A0E0E">Joint Objective</text>
+  <line x1="1500" y1="620" x2="1848" y2="620" stroke="#D09090" stroke-width="1"/>
+  <text x="1673" y="650" class="formulaL" text-anchor="middle">total_loss  =  action_loss  +  0.1 × wm_loss</text>
+  <text x="1673" y="673" class="bxsmall" text-anchor="middle" fill="#8A2020">gradient_clipping=1.0  ·  gradient_accumulation_steps=1</text>
 
-  <!-- Learning rates annotation -->
-  <rect x="1468" y="698" width="376" height="104" rx="16" fill="#FFF8F0" stroke="#D0A060" stroke-width="1.5"/>
-  <text x="1492" y="722" class="box-title" fill="#6A3800">Optimizer  —  AdamW 8-bit</text>
-  <text x="1492" y="744" class="box-small">lr  Qwen interface:  1 × 10⁻⁵</text>
-  <text x="1492" y="762" class="box-small">lr  action head:     1 × 10⁻⁴</text>
-  <text x="1492" y="780" class="box-small">lr  base:            3 × 10⁻⁵   ·   cosine decay  min=1e-6</text>
-  <text x="1492" y="798" class="box-small">β=(0.9, 0.95)  ε=1e-8  wd=1e-4  grad_clip=1.0</text>
+  <!-- optimizer -->
+  <rect x="1480" y="706" width="386" height="124" rx="14" fill="#FFF8EE" stroke="#CCA040" stroke-width="1.8" filter="url(#card)"/>
+  <text x="1500" y="734" class="bxtitle" fill="#5C3000">Optimizer — AdamW 8-bit</text>
+  <text x="1500" y="754" class="bxsmall">lr Qwen interface:  1 × 10⁻⁵</text>
+  <text x="1500" y="771" class="bxsmall">lr action head:     1 × 10⁻⁴</text>
+  <text x="1500" y="788" class="bxsmall">lr base:            3 × 10⁻⁵   cosine min=1e-6  ·  β=(0.9,0.95)  ε=1e-8</text>
+  <text x="1500" y="804" class="bxsmall">wd=1e-4  ·  fused=true  ·  warmup=1%  ·  freeze: qwen_vl_interface.model, vj_encoder</text>
+  <text x="1500" y="820" class="bxsmall">enable_gradient_checkpointing=true  ·  save_best_only(mae_score)</text>
 
-  <!-- ════════════════════════════════════════════
-       EDGES — DATA FLOW ARROWS
-  ════════════════════════════════════════════ -->
+  <!-- ════════════════════════════════
+       ARROWS — ALL ORTHOGONAL PATHS
+       Color legend:
+         amber  = raw input signals
+         blue   = frozen backbone signals
+         purple = Qwen-extracted tokens
+         green  = trainable head outputs
+         red    = loss signals
+  ════════════════════════════════ -->
 
-  <!-- Input 1 → Qwen -->
-  <path d="M300 234 H348" stroke="#A08030" stroke-width="2.8" marker-end="url(#aAmber)"/>
-  <!-- Input 2 → V-JEPA -->
-  <path d="M300 378 H348" stroke="#A08030" stroke-width="2.8" marker-end="url(#aAmber)"/>
-  <!-- Input 3 → Action head (robot state) -->
-  <path d="M300 510 C320 510 320 550 340 555 C860 600 880 600 908 600" stroke="#A08030" stroke-width="2.2" fill="none" marker-end="url(#aAmber)" stroke-dasharray="5,3"/>
-  <text x="590" y="572" class="edge-lbl" text-anchor="middle">state [B,1,14]</text>
-  <!-- Input 4 (supervision) → Action head -->
-  <path d="M300 660 C320 660 320 660 340 660 C860 660 880 640 908 640" stroke="#A08030" stroke-width="2.2" fill="none" marker-end="url(#aAmber)" stroke-dasharray="5,3"/>
-  <text x="590" y="646" class="edge-lbl" text-anchor="middle">action chunk target</text>
+  <!-- 1. Lang+Images → Qwen  (amber) -->
+  <path d="M292 249 H342" stroke="#B08020" stroke-width="2.8" marker-end="url(#mAmber)"/>
+  <!-- 2. Video Clip → V-JEPA  (amber, routed through col2 left margin) -->
+  <path d="M292 386 H327 V491 H342" stroke="#B08020" stroke-width="2.8" fill="none" marker-end="url(#mAmber)"/>
 
-  <!-- Qwen → Token extraction -->
-  <path d="M602 356 V588" stroke="#6040A0" stroke-width="2.6" marker-end="url(#aPurple)"/>
+  <!-- 3. Qwen → Token Extraction  (purple, vertical in col2) -->
+  <path d="M585 386 V602" stroke="#5C3DA0" stroke-width="2.6" marker-end="url(#mPurple)"/>
 
-  <!-- V-JEPA past latents → VJ Predictor -->
-  <path d="M856 525 H908" stroke="#2E5FA3" stroke-width="2.8" marker-end="url(#aBlue)"/>
-  <text x="882" y="518" class="edge-lbl" text-anchor="middle">past latents</text>
+  <!-- ─── GAP ROUTING CORRIDOR (x=844–902) ─── -->
 
-  <!-- V-JEPA future latents → wm_loss -->
-  <path d="M856 532 C870 532 880 540 890 560 C910 610 1440 450 1468 380" stroke="#2E5FA3" stroke-width="2.2" fill="none" marker-end="url(#aBlue)" stroke-dasharray="6,3"/>
-  <text x="1200" y="568" class="edge-lbl">target future latents (GT)</text>
+  <!-- 4. V-JEPA past latents → VJ Predictor  (blue, via gap at x=848 going UP) -->
+  <path d="M828 472 H848 V289 H902" stroke="#2D5EA0" stroke-width="2.6" fill="none" marker-end="url(#mBlue)"/>
+  <!-- label at top of vertical segment -->
+  <text transform="translate(841,430) rotate(-90)" class="arrlbl" text-anchor="middle">past latents</text>
 
-  <!-- Action tokens → VJ Predictor -->
-  <path d="M856 625 C876 625 890 580 908 360" stroke="#6040A0" stroke-width="2.6" fill="none" marker-end="url(#aPurple)"/>
-  <text x="898" y="540" class="edge-lbl" text-anchor="end">action tokens [B,56,1024]</text>
+  <!-- 5. Action tokens → VJ Predictor  (purple, via gap at x=866 going UP) -->
+  <path d="M828 634 H866 V306 H902" stroke="#5C3DA0" stroke-width="2.6" fill="none" marker-end="url(#mPurple)"/>
+  <!-- label at mid of vertical segment -->
+  <text transform="translate(859,510) rotate(-90)" class="arrlbl2" text-anchor="middle">action tokens [B,56,1024]</text>
 
-  <!-- Embodied tokens → Action Head -->
-  <path d="M856 645 H908" stroke="#6040A0" stroke-width="2.6" marker-end="url(#aPurple)"/>
-  <text x="882" y="640" class="edge-lbl" text-anchor="middle">emb. action tokens [B,32,1024]</text>
+  <!-- 6. Embodied tokens → GR00T  (purple, direct horizontal through gap at y=668) -->
+  <path d="M828 668 H920" stroke="#5C3DA0" stroke-width="2.6" fill="none" marker-end="url(#mPurple)"/>
+  <text x="866" y="662" class="arrlbl2" text-anchor="middle">embodied [B,32,1024]</text>
 
-  <!-- VJ Predictor → wm_loss -->
-  <path d="M1416 270 H1468" stroke="#2E7D52" stroke-width="2.8" marker-end="url(#aGreen)"/>
-  <text x="1442" y="262" class="edge-lbl" text-anchor="middle">predicted</text>
-  <text x="1442" y="276" class="edge-lbl" text-anchor="middle">future latents</text>
+  <!-- ─── TOP CORRIDOR (y=145) for GT future latents → wm_loss ─── -->
+  <!-- Exit V-JEPA right at (828,462) → right margin of col2 at (840,462) →
+       go UP to top corridor at (840,145) → right to (1876,145) →
+       down into wm_loss from right at (1876,268) → (1866,268) -->
+  <path d="M828 462 H840 V145 H1876 V268 H1866" stroke="#2D5EA0" stroke-width="2.2" stroke-dasharray="7,4" fill="none" marker-end="url(#mBlue)"/>
+  <!-- label along top corridor -->
+  <rect x="1080" y="133" width="236" height="18" rx="9" fill="#E8F0FF"/>
+  <text x="1198" y="146" class="arrlbl" text-anchor="middle" fill="#1A3E80">GT future video latents  (supervision)</text>
 
-  <!-- Action Head → action_loss -->
-  <path d="M1416 510 H1468" stroke="#2E7D52" stroke-width="2.8" marker-end="url(#aGreen)"/>
-  <text x="1442" y="500" class="edge-lbl" text-anchor="middle">per-sample FM loss</text>
+  <!-- ─── BOTTOM BYPASS CORRIDOR ─── -->
+  <!-- Robot State → GR00T  (amber dashed, via inter-col gap1 at x=314, then y=768) -->
+  <!-- Exit Robot State right (292,512) → inter-col gap (314,512) → down to y=768 → right to GR00T bottom (1100,768) → up to GR00T bottom edge (1100,738) -->
+  <path d="M292 512 H314 V768 H1110 V738" stroke="#B08020" stroke-width="2.2" stroke-dasharray="7,4" fill="none" marker-end="url(#mAmber)"/>
+  <rect x="620" y="758" width="140" height="16" rx="8" fill="#FFF5D0"/>
+  <text x="690" y="770" class="arrlbl" text-anchor="middle">state [B, 1, 14]</text>
 
-  <!-- wm_loss → total_loss -->
-  <path d="M1656 324 V556" stroke="#B03030" stroke-width="2.5" marker-end="url(#aRed)"/>
+  <!-- Supervision → GR00T  (amber dashed, exit right at y=665, via x=318, then y=788) -->
+  <path d="M292 665 H318 V788 H1260 V738" stroke="#B08020" stroke-width="2.2" stroke-dasharray="7,4" fill="none" marker-end="url(#mAmber)"/>
+  <rect x="580" y="778" width="202" height="16" rx="8" fill="#FFF5D0"/>
+  <text x="681" y="790" class="arrlbl" text-anchor="middle">action target + RA-BC labels</text>
 
-  <!-- action_loss → total_loss -->
-  <path d="M1656 534 V556" stroke="#B03030" stroke-width="2.5" marker-end="url(#aRed)"/>
+  <!-- ─── OUTPUTS FROM TRAINABLE HEADS ─── -->
 
-  <!-- ════════════════════════════════════════════
+  <!-- VJ Predictor → wm_loss  (green) -->
+  <path d="M1428 293 H1450 V264 H1480" stroke="#2D7D52" stroke-width="2.6" fill="none" marker-end="url(#mGreen)"/>
+  <text x="1438" y="260" class="arrlbl3" text-anchor="middle">predicted</text>
+
+  <!-- GR00T → action_loss  (green, exit at y=455 = action_loss cy) -->
+  <path d="M1428 460 H1480" stroke="#2D7D52" stroke-width="2.6" fill="none" marker-end="url(#mGreen)"/>
+  <text x="1452" y="450" class="arrlbl3" text-anchor="middle">FM loss</text>
+
+  <!-- ─── LOSS SIGNALS → TOTAL ─── -->
+
+  <!-- wm_loss → total_loss  (red, exit bottom-left at x=1590) -->
+  <path d="M1600 344 V578" stroke="#B03030" stroke-width="2.4" marker-end="url(#mRed)"/>
+
+  <!-- action_loss → total_loss  (red, exit bottom-right at x=1748) -->
+  <path d="M1750 560 V578" stroke="#B03030" stroke-width="2.4" marker-end="url(#mRed)"/>
+
+  <!-- total_loss → optimizer  (small connector) -->
+  <path d="M1673 688 V706" stroke="#B03030" stroke-width="2" marker-end="url(#mRed)"/>
+
+  <!-- ════════════════════════════════
        INFERENCE BANNER
-  ════════════════════════════════════════════ -->
-  <rect x="42" y="922" width="1818" height="80" rx="18" fill="#EDF3FF" stroke="#8AAAD8" stroke-width="1.5"/>
-  <text x="68" y="952" class="infer-label">INFERENCE  (V-JEPA branch inactive)</text>
-  <text x="68" y="976" class="infer-note">Images + instruction → Qwen 3.5 VL → extract embodied_action_tokens [B, 32, 1024] → GR00T DiT-B: 4 Euler denoising steps from Gaussian noise → predicted action chunk [B, 7, 14]</text>
+  ════════════════════════════════ -->
+  <rect x="42" y="862" width="1838" height="76" rx="16" fill="#EDF2FF" stroke="#8AAAD5" stroke-width="1.4"/>
+  <text x="68" y="890" class="infhdr">INFERENCE  (V-JEPA + VJ Predictor branches inactive)</text>
+  <text x="68" y="914" class="infnote">Images + instruction  →  Qwen 3.5 VL  →  extract embodied_action_tokens [B, 32, 1024]  →  GR00T DiT-B: 4 Euler denoising steps from Gaussian noise  →  predicted action chunk [B, 7, 14]</text>
 
-  <!-- ════════════════════════════════════════════
-       TRAINING CONFIG PILL
-  ════════════════════════════════════════════ -->
-  <rect x="42" y="1018" width="1818" height="80" rx="18" fill="#F5F7FA" stroke="#C8D4DF" stroke-width="1.2"/>
-  <text x="68" y="1048" class="infer-label">KEY CONFIG</text>
-  <text x="68" y="1072" class="infer-note">batch=80  ·  repeated_diffusion_steps=2  ·  gradient_checkpointing=on  ·  channels_last=on  ·  mixed_precision=off (bfloat16 autocast)  ·  use_rabc=on  ·  AdamW-8bit  ·  cosine LR w/ warmup 1%  ·  grad_clip=1.0</text>
+  <!-- ════════════════════════════════
+       CONFIG BANNER
+  ════════════════════════════════ -->
+  <rect x="42" y="952" width="1838" height="72" rx="16" fill="#F4F7FA" stroke="#C4D0DC" stroke-width="1.2"/>
+  <text x="68" y="980" class="infhdr">KEY TRAINING CONFIG  (vlajepa_robot_ft_trossen_vjepa21_small_5090)</text>
+  <text x="68" y="1003" class="infnote">batch=80  ·  repeated_diffusion_steps=2  ·  gradient_checkpointing=on  ·  channels_last=on  ·  mixed_precision=off (bfloat16 autocast per block)  ·  use_rabc=on  ·  AdamW-8bit  ·  cosine LR  ·  grad_clip=1.0  ·  compile=off</text>
+
+  <!-- ════════════════════════════════
+       LEGEND
+  ════════════════════════════════ -->
+  <rect x="42" y="1038" width="1838" height="52" rx="14" fill="#F8F9FB" stroke="#C8D4DF" stroke-width="1"/>
+  <text x="68" y="1056" class="infhdr">LEGEND</text>
+  <!-- amber solid -->
+  <line x1="150" y1="1057" x2="190" y2="1057" stroke="#B08020" stroke-width="2.5"/>
+  <path d="M186 1053 L194 1057 L186 1061Z" fill="#B08020"/>
+  <text x="198" y="1062" class="bxsmall">raw input signal</text>
+  <!-- blue solid -->
+  <line x1="330" y1="1057" x2="370" y2="1057" stroke="#2D5EA0" stroke-width="2.5"/>
+  <path d="M366 1053 L374 1057 L366 1061Z" fill="#2D5EA0"/>
+  <text x="378" y="1062" class="bxsmall">frozen backbone feature</text>
+  <!-- blue dashed -->
+  <line x1="530" y1="1057" x2="570" y2="1057" stroke="#2D5EA0" stroke-width="2.5" stroke-dasharray="6,3"/>
+  <path d="M566 1053 L574 1057 L566 1061Z" fill="#2D5EA0"/>
+  <text x="578" y="1062" class="bxsmall">GT supervision (bypasses frozen modules)</text>
+  <!-- purple -->
+  <line x1="780" y1="1057" x2="820" y2="1057" stroke="#5C3DA0" stroke-width="2.5"/>
+  <path d="M816 1053 L824 1057 L816 1061Z" fill="#5C3DA0"/>
+  <text x="828" y="1062" class="bxsmall">Qwen-extracted token conditioning</text>
+  <!-- amber dashed -->
+  <line x1="1040" y1="1057" x2="1080" y2="1057" stroke="#B08020" stroke-width="2.5" stroke-dasharray="6,3"/>
+  <path d="M1076 1053 L1084 1057 L1076 1061Z" fill="#B08020"/>
+  <text x="1088" y="1062" class="bxsmall">direct state/action input (bypasses frozen modules)</text>
+  <!-- green -->
+  <line x1="1360" y1="1057" x2="1400" y2="1057" stroke="#2D7D52" stroke-width="2.5"/>
+  <path d="M1396 1053 L1404 1057 L1396 1061Z" fill="#2D7D52"/>
+  <text x="1408" y="1062" class="bxsmall">trainable head output</text>
+  <!-- red -->
+  <line x1="1570" y1="1057" x2="1610" y2="1057" stroke="#B03030" stroke-width="2.5"/>
+  <path d="M1606 1053 L1614 1057 L1606 1061Z" fill="#B03030"/>
+  <text x="1618" y="1062" class="bxsmall">loss / gradient signal</text>
+
+  <!-- frozen chip legend -->
+  <rect x="1720" y="1044" width="74" height="20" rx="10" fill="#D0DEFF"/>
+  <text x="1734" y="1058" class="chip" fill="#1A3E80">FROZEN</text>
+  <rect x="1806" y="1044" width="64" height="20" rx="10" fill="#C5ECCE"/>
+  <text x="1818" y="1058" class="chip" fill="#165830">TRAINABLE</text>
 
 </svg>
