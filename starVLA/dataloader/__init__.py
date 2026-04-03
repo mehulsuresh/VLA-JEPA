@@ -58,7 +58,9 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe", model=None): # TODO
         vla_dataset = get_vla_dataset(
             data_cfg=vla_dataset_cfg,
             action_horizon=cfg.framework.action_model.action_horizon,
-            video_horizon=cfg.framework.vj2_model.num_frames)
+            video_horizon=cfg.framework.vj2_model.num_frames,
+            video_frame_stride=vla_dataset_cfg.get("video_frame_stride", 1),
+        )
 
         loader_kwargs = dict(
             dataset=vla_dataset,
@@ -96,6 +98,12 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe", model=None): # TODO
             data_root_dir=vla_dataset_cfg.data_root_dir,
             action_horizon=cfg.framework.action_model.action_horizon,
             video_horizon=cfg.framework.vj2_model.num_frames,
+            video_frame_stride=vla_dataset_cfg.get("video_frame_stride", 1),
+            video_target_shift_steps=(
+                int(getattr(model.vj_encoder, "tubelet_size", 0))
+                if model is not None and hasattr(model, "vj_encoder")
+                else int(vla_dataset_cfg.get("video_target_shift_steps", cfg.framework.vj2_model.get("tubelet_size", 2)))
+            ),
             resolution_size=vla_dataset_cfg.get("resolution_size", 224),
             video_resolution_size=vla_dataset_cfg.get("video_resolution_size", 384),
             instruction_text=vla_dataset_cfg.get("instruction_text", "Complete the task successfully."),

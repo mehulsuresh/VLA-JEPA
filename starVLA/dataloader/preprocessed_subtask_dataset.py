@@ -77,9 +77,11 @@ class PreprocessedSubtaskCollator:
         )
 
         videos = np.stack([sample["video"] for sample in batch]).transpose(0, 1, 2, 5, 3, 4)
+        target_videos = np.stack([sample["video_target"] for sample in batch]).transpose(0, 1, 2, 5, 3, 4)
         collated = {
             "qwen_inputs": qwen_inputs,
             "video": torch.from_numpy(np.ascontiguousarray(videos)),
+            "video_target": torch.from_numpy(np.ascontiguousarray(target_videos)),
             "action": torch.from_numpy(
                 np.asarray([sample["action"] for sample in batch], dtype=np.float32)
             ),
@@ -119,6 +121,8 @@ class PreprocessedSubtaskVLADataset(Dataset):
         data_root_dir: str | Path,
         action_horizon: int,
         video_horizon: int,
+        video_frame_stride: int = 1,
+        video_target_shift_steps: int = 2,
         resolution_size: int = 224,
         video_resolution_size: int = 384,
         instruction_text: str = "Complete the task successfully.",
@@ -128,6 +132,13 @@ class PreprocessedSubtaskVLADataset(Dataset):
         self.root = Path(data_root_dir)
         self.action_horizon = int(action_horizon)
         self.video_horizon = int(video_horizon)
+        self.video_frame_stride = max(int(video_frame_stride), 1)
+        self.video_target_shift_steps = max(int(video_target_shift_steps), 1)
+        if self.video_horizon <= self.video_target_shift_steps:
+            raise ValueError(
+                "video_horizon must be greater than video_target_shift_steps so the context clip is non-empty"
+            )
+        self.video_context_horizon = self.video_horizon - self.video_target_shift_steps
         self.resolution_size = int(resolution_size)
         self.video_resolution_size = int(video_resolution_size)
         self.instruction_text = instruction_text
@@ -212,6 +223,10 @@ class PreprocessedSubtaskVLADataset(Dataset):
     def __len__(self) -> int:
         return len(self.records)
 
+    def _resolve_sampled_frame_index(self, row_idx: int, offset: int, frame_indices: np.ndarray) -> int:
+        sampled_row_idx = min(max(row_idx + offset * self.video_frame_stride, 0), len(frame_indices) - 1)
+        return int(frame_indices[sampled_row_idx])
+
     def _load_rgb(self, episode_name: str, camera: str, frame_index: int) -> np.ndarray:
         cache_key = (episode_name, camera, int(frame_index))
         if self.frame_cache_size > 0:
@@ -281,25 +296,36 @@ class PreprocessedSubtaskVLADataset(Dataset):
 
         current_frame_idx = int(frame_indices[row_idx])
         image_list = []
+        context_offsets = list(range(-(self.video_context_horizon - 1), 1))
+        target_offsets = [offset + self.video_target_shift_steps for offset in context_offsets]
         video_views = []
+        target_video_views = []
         for camera in self.current_cameras:
             current_rgb = self._load_rgb(episode_name, camera, current_frame_idx)
             image_list.append(
                 Image.fromarray(self._resize_rgb(current_rgb, self.resolution_size))
             )
 
-            frames = []
-            # Reuse already-loaded current frame for offset=0
-            frames.append(self._resize_rgb(current_rgb, self.video_resolution_size))
-            for offset in range(1, self.video_horizon):
-                future_idx = min(row_idx + offset, len(frame_indices) - 1)
-                future_frame = int(frame_indices[future_idx])
-                rgb = self._load_rgb(episode_name, camera, future_frame)
-                frames.append(self._resize_rgb(rgb, self.video_resolution_size))
-            video_views.append(np.stack(frames, axis=0))
+            context_frames = []
+            target_frames = []
+            for offset in context_offsets:
+                sampled_frame_idx = self._resolve_sampled_frame_index(row_idx, offset, frame_indices)
+                rgb = current_rgb if sampled_frame_idx == current_frame_idx else self._load_rgb(
+                    episode_name, camera, sampled_frame_idx
+                )
+                context_frames.append(self._resize_rgb(rgb, self.video_resolution_size))
+            for offset in target_offsets:
+                sampled_frame_idx = self._resolve_sampled_frame_index(row_idx, offset, frame_indices)
+                rgb = current_rgb if sampled_frame_idx == current_frame_idx else self._load_rgb(
+                    episode_name, camera, sampled_frame_idx
+                )
+                target_frames.append(self._resize_rgb(rgb, self.video_resolution_size))
+            video_views.append(np.stack(context_frames, axis=0))
+            target_video_views.append(np.stack(target_frames, axis=0))
 
         if len(video_views) == 1:
             video_views = [video_views[0], video_views[0].copy()]
+            target_video_views = [target_video_views[0], target_video_views[0].copy()]
             image_list = [image_list[0], image_list[0].copy()]
 
         action_rows = []
@@ -336,6 +362,7 @@ class PreprocessedSubtaskVLADataset(Dataset):
             "image": image_list,
             "lang": self.instruction_text,
             "video": np.stack(video_views, axis=0),
+            "video_target": np.stack(target_video_views, axis=0),
             "state": state,
             "frame_index": current_frame_idx,
             "task_id": current_task,

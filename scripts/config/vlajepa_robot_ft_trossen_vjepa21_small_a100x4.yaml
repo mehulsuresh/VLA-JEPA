@@ -63,12 +63,14 @@ framework:
 datasets:
   vla_data:
     dataset_py: lerobot_datasets
-    data_root_dir: playground/Datasets/TROSSEN_SUBTASK_COMBINED
+    data_root_dir: /home/mehul/work/reward_model_small/Subtask_dataset
     data_mix: trossen_subtask_combined
     action_type: delta_qpos
     CoT_prompt: "Your task is {instruction}. Infer the temporal dynamics from frames {actions} and produce the corresponding policy actions {e_actions}."
     resolution_size: 224
     video_resolution_size: 384
+    video_frame_stride: 10
+    video_target_shift_steps: 2
     per_device_batch_size: 104
     num_workers: 2
     prefetch_factor: 2

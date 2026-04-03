@@ -66,8 +66,10 @@ datasets:
     instruction_text: "Complete the robot task successfully."
     resolution_size: 224
     video_resolution_size: 384
+    video_frame_stride: 10
+    video_target_shift_steps: 2
     per_device_batch_size: 80
-    num_workers: 2
+    num_workers: 8
     safe_num_workers_cap: 2
     frame_cache_size: 256
     prefetch_factor: 2
@@ -123,9 +125,16 @@ trainer:
   enable_mixed_precision_training: false
   mixed_precision: no
   channels_last: true
-  compile_qwen_model: false
-  compile_action_model: false
-  compile_vj_predictor: false
+  compile_qwen_model: true
+  compile_qwen_model_dynamic: false
+  compile_action_model: true
+  compile_action_model_dynamic: false
+  compile_vj_predictor: true
+  compile_vj_predictor_dynamic: true
+  compile_vj_encoder: true
+  compile_vj_encoder_dynamic: true
+  compile_full_model: true
+  compile_full_model_dynamic: false
   compile_mode: default
   compile_dynamic: true
   use_rabc: true

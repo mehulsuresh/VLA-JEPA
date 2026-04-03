@@ -22,8 +22,9 @@ import os
 import sys
 import logging
 from pathlib import Path
+from collections import deque
 from collections.abc import Mapping, Sequence
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
 import time
@@ -90,6 +91,198 @@ if torch.cuda.is_available():
 
 
 logger = get_logger(__name__)
+
+
+def _is_torch_compile_exception(exc: BaseException) -> bool:
+    compile_modules = ("torch._dynamo", "torch._inductor", "triton")
+    pending = [exc]
+    visited = set()
+    while pending:
+        current = pending.pop()
+        if current is None:
+            continue
+        current_id = id(current)
+        if current_id in visited:
+            continue
+        visited.add(current_id)
+        current_module = type(current).__module__
+        current_name = type(current).__name__
+        if current_module.startswith(compile_modules):
+            return True
+        if current_name in {"BackendCompilerFailed", "InductorError", "TorchRuntimeError"}:
+            return True
+        pending.extend((getattr(current, "__cause__", None), getattr(current, "__context__", None)))
+    return False
+
+
+def _resolve_compile_dynamic(trainer_cfg, key: str, default: bool) -> bool:
+    value = trainer_cfg.get(key, default)
+    if isinstance(value, str):
+        return value.lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _install_compiled_forward(
+    module: torch.nn.Module,
+    module_name: str,
+    compile_mode: str,
+    dynamic_attempts: list[bool],
+) -> None:
+    eager_forward = module.forward
+    attempted_compile_labels: set[str] = set()
+    dynamic_attempts = list(dict.fromkeys(dynamic_attempts))
+    active_dynamic: Optional[bool] = None
+    active_impl = "uninitialized"
+    compiled_forward_cache: dict[bool, Callable] = {}
+
+    def _compile_forward(dynamic: bool):
+        if dynamic not in compiled_forward_cache:
+            compiled_forward_cache[dynamic] = torch.compile(
+                eager_forward,
+                dynamic=dynamic,
+                mode=compile_mode,
+            )
+        return compiled_forward_cache[dynamic]
+
+    def _log_compile_failure(dynamic: bool, exc: BaseException) -> None:
+        compile_label = f"torch.compile(dynamic={dynamic}, mode='{compile_mode}')"
+        if compile_label in attempted_compile_labels:
+            return
+        attempted_compile_labels.add(compile_label)
+        logger.warning(
+            f"{compile_label} failed for {module_name}; trying next fallback: {exc}"
+        )
+
+    def compiled_forward(*args, **kwargs):
+        nonlocal active_dynamic, active_impl
+
+        if active_impl == "eager":
+            return eager_forward(*args, **kwargs)
+
+        if active_impl == "compiled" and active_dynamic is not None:
+            try:
+                return _compile_forward(active_dynamic)(*args, **kwargs)
+            except Exception as exc:
+                if not _is_torch_compile_exception(exc):
+                    raise
+                _log_compile_failure(active_dynamic, exc)
+                active_impl = "retry"
+
+        attempted_dynamics = set()
+        if active_dynamic is not None:
+            attempted_dynamics.add(active_dynamic)
+
+        for dynamic in dynamic_attempts:
+            if dynamic in attempted_dynamics:
+                continue
+            try:
+                output = _compile_forward(dynamic)(*args, **kwargs)
+                active_dynamic = dynamic
+                active_impl = "compiled"
+                module._starvla_active_compile_impl = "compiled"
+                module._starvla_active_compile_dynamic = dynamic
+                logger.info(
+                    f"Compiled {module_name} with torch.compile(dynamic={dynamic}, mode='{compile_mode}')"
+                )
+                return output
+            except Exception as exc:
+                if not _is_torch_compile_exception(exc):
+                    raise
+                _log_compile_failure(dynamic, exc)
+                attempted_dynamics.add(dynamic)
+
+        active_dynamic = None
+        active_impl = "eager"
+        module._starvla_active_compile_impl = "eager"
+        module._starvla_active_compile_dynamic = None
+        logger.warning(f"Falling back to eager forward for {module_name}")
+        return eager_forward(*args, **kwargs)
+
+    module._starvla_eager_forward = eager_forward
+    module._starvla_compile_mode = compile_mode
+    module._starvla_compile_dynamic_attempts = tuple(dynamic_attempts)
+    module._starvla_active_compile_impl = "uninitialized"
+    module._starvla_active_compile_dynamic = None
+    module.forward = compiled_forward
+
+
+def _install_compiled_callable_attr(
+    owner,
+    attr_name: str,
+    target_name: str,
+    compile_mode: str,
+    dynamic_attempts: list[bool],
+) -> None:
+    eager_callable = getattr(owner, attr_name)
+    if not callable(eager_callable):
+        raise TypeError(f"`{target_name}` is not callable")
+
+    attempted_compile_labels: set[str] = set()
+    dynamic_attempts = list(dict.fromkeys(dynamic_attempts))
+    active_dynamic: Optional[bool] = None
+    active_impl = "uninitialized"
+    compiled_callable_cache: dict[bool, Callable] = {}
+
+    def _compile_callable(dynamic: bool):
+        if dynamic not in compiled_callable_cache:
+            compiled_callable_cache[dynamic] = torch.compile(
+                eager_callable,
+                dynamic=dynamic,
+                mode=compile_mode,
+            )
+        return compiled_callable_cache[dynamic]
+
+    def _log_compile_failure(dynamic: bool, exc: BaseException) -> None:
+        compile_label = f"torch.compile(dynamic={dynamic}, mode='{compile_mode}')"
+        if compile_label in attempted_compile_labels:
+            return
+        attempted_compile_labels.add(compile_label)
+        logger.warning(
+            f"{compile_label} failed for {target_name}; trying next fallback: {exc}"
+        )
+
+    def compiled_callable(*args, **kwargs):
+        nonlocal active_dynamic, active_impl
+
+        if active_impl == "eager":
+            return eager_callable(*args, **kwargs)
+
+        if active_impl == "compiled" and active_dynamic is not None:
+            try:
+                return _compile_callable(active_dynamic)(*args, **kwargs)
+            except Exception as exc:
+                if not _is_torch_compile_exception(exc):
+                    raise
+                _log_compile_failure(active_dynamic, exc)
+                active_impl = "retry"
+
+        attempted_dynamics = set()
+        if active_dynamic is not None:
+            attempted_dynamics.add(active_dynamic)
+
+        for dynamic in dynamic_attempts:
+            if dynamic in attempted_dynamics:
+                continue
+            try:
+                output = _compile_callable(dynamic)(*args, **kwargs)
+                active_dynamic = dynamic
+                active_impl = "compiled"
+                logger.info(
+                    f"Compiled {target_name} with torch.compile(dynamic={dynamic}, mode='{compile_mode}')"
+                )
+                return output
+            except Exception as exc:
+                if not _is_torch_compile_exception(exc):
+                    raise
+                _log_compile_failure(dynamic, exc)
+                attempted_dynamics.add(dynamic)
+
+        active_dynamic = None
+        active_impl = "eager"
+        logger.warning(f"Falling back to eager callable for {target_name}")
+        return eager_callable(*args, **kwargs)
+
+    setattr(owner, attr_name, compiled_callable)
 
 
 def resolve_trackers(cfg):
@@ -243,36 +436,100 @@ def build_model(cfg) -> torch.nn.Module:
                     raise AttributeError("model has no qwen_vl_interface")
                 if hasattr(qwen_iface, "prepare_for_compile"):
                     qwen_iface.prepare_for_compile()
-                qwen_iface.model = torch.compile(
-                    qwen_iface.model, dynamic=compile_dynamic, mode=compile_mode
+                qwen_dynamic = _resolve_compile_dynamic(
+                    trainer_cfg,
+                    "compile_qwen_model_dynamic",
+                    compile_dynamic,
                 )
-                logger.info(
-                    f"Compiled qwen_vl_interface.model with torch.compile(dynamic={compile_dynamic}, mode='{compile_mode}')"
+                _install_compiled_forward(
+                    qwen_iface.model,
+                    "qwen_vl_interface.model",
+                    compile_mode=compile_mode,
+                    dynamic_attempts=[qwen_dynamic] if not qwen_dynamic else [True, False],
                 )
+                if hasattr(qwen_iface, "forward_features"):
+                    _install_compiled_callable_attr(
+                        qwen_iface,
+                        "forward_features",
+                        "qwen_vl_interface.forward_features",
+                        compile_mode=compile_mode,
+                        dynamic_attempts=[qwen_dynamic] if not qwen_dynamic else [True, False],
+                    )
             except Exception as exc:
                 logger.warning(f"torch.compile failed for qwen_vl_interface.model, continuing without it: {exc}")
 
         if trainer_cfg.get("compile_action_model", False):
             try:
-                model.action_model = torch.compile(
-                    model.action_model, dynamic=compile_dynamic, mode=compile_mode
+                action_dynamic = _resolve_compile_dynamic(
+                    trainer_cfg,
+                    "compile_action_model_dynamic",
+                    False,
                 )
-                logger.info(
-                    f"Compiled action_model with torch.compile(dynamic={compile_dynamic}, mode='{compile_mode}')"
+                _install_compiled_forward(
+                    model.action_model,
+                    "action_model",
+                    compile_mode=compile_mode,
+                    dynamic_attempts=[action_dynamic] if not action_dynamic else [True, False],
                 )
             except Exception as exc:
                 logger.warning(f"torch.compile failed for action_model, continuing without it: {exc}")
 
         if trainer_cfg.get("compile_vj_predictor", False):
             try:
-                model.vj_predictor = torch.compile(
-                    model.vj_predictor, dynamic=compile_dynamic, mode=compile_mode
+                vj_dynamic = _resolve_compile_dynamic(
+                    trainer_cfg,
+                    "compile_vj_predictor_dynamic",
+                    compile_dynamic,
                 )
-                logger.info(
-                    f"Compiled vj_predictor with torch.compile(dynamic={compile_dynamic}, mode='{compile_mode}')"
+                _install_compiled_forward(
+                    model.vj_predictor,
+                    "vj_predictor",
+                    compile_mode=compile_mode,
+                    dynamic_attempts=[vj_dynamic] if not vj_dynamic else [True, False],
                 )
             except Exception as exc:
                 logger.warning(f"torch.compile failed for vj_predictor, continuing without it: {exc}")
+
+        if trainer_cfg.get("compile_vj_encoder", False):
+            try:
+                vj_encoder_dynamic = _resolve_compile_dynamic(
+                    trainer_cfg,
+                    "compile_vj_encoder_dynamic",
+                    compile_dynamic,
+                )
+                vj_encoder_attempts = [vj_encoder_dynamic] if not vj_encoder_dynamic else [True, False]
+                _install_compiled_forward(
+                    model.vj_encoder,
+                    "vj_encoder",
+                    compile_mode=compile_mode,
+                    dynamic_attempts=vj_encoder_attempts,
+                )
+                if hasattr(model.vj_encoder, "get_vision_features"):
+                    _install_compiled_callable_attr(
+                        model.vj_encoder,
+                        "get_vision_features",
+                        "vj_encoder.get_vision_features",
+                        compile_mode=compile_mode,
+                        dynamic_attempts=vj_encoder_attempts,
+                    )
+            except Exception as exc:
+                logger.warning(f"torch.compile failed for vj_encoder, continuing without it: {exc}")
+
+        if trainer_cfg.get("compile_full_model", False):
+            try:
+                full_model_dynamic = _resolve_compile_dynamic(
+                    trainer_cfg,
+                    "compile_full_model_dynamic",
+                    False,
+                )
+                _install_compiled_forward(
+                    model,
+                    f"{type(model).__name__}.forward",
+                    compile_mode=compile_mode,
+                    dynamic_attempts=[full_model_dynamic] if not full_model_dynamic else [True, False],
+                )
+            except Exception as exc:
+                logger.warning(f"torch.compile failed for full model forward, continuing without it: {exc}")
 
     return model
 
@@ -491,6 +748,29 @@ class VLATrainer(TrainerUtils):
         self.completed_steps = 0
         self.total_batch_size = self._calculate_total_batch_size()
         self.train_start_time = time.perf_counter()
+        self.progress_eta_window = max(int(self.config.trainer.get("progress_eta_window", 50)), 1)
+        self.progress_eta_warmup_steps = max(int(self.config.trainer.get("progress_eta_warmup_steps", 3)), 0)
+        self._recent_wall_step_times = deque(maxlen=self.progress_eta_window)
+
+    @staticmethod
+    def _format_duration(seconds: Optional[float]) -> str:
+        if seconds is None or not math.isfinite(seconds):
+            return "n/a"
+        total_seconds = max(int(round(seconds)), 0)
+        hours, remainder = divmod(total_seconds, 3600)
+        minutes, secs = divmod(remainder, 60)
+        if hours > 0:
+            return f"{hours:d}:{minutes:02d}:{secs:02d}"
+        return f"{minutes:02d}:{secs:02d}"
+
+    def _estimate_remaining_seconds(self) -> Optional[float]:
+        if not self._recent_wall_step_times:
+            return None
+        remaining_steps = max(int(self.config.trainer.max_train_steps) - self.completed_steps, 0)
+        if remaining_steps <= 0:
+            return 0.0
+        avg_wall_step_time = sum(self._recent_wall_step_times) / len(self._recent_wall_step_times)
+        return avg_wall_step_time * remaining_steps
 
     @staticmethod
     def _to_scalar(value):
@@ -786,6 +1066,7 @@ class VLATrainer(TrainerUtils):
             total=self.config.trainer.max_train_steps,
             initial=min(self.completed_steps, self.config.trainer.max_train_steps),
             disable=not self.accelerator.is_local_main_process,
+            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}{postfix}]",
         )
 
         # main training loop
@@ -803,14 +1084,6 @@ class VLATrainer(TrainerUtils):
                 progress_bar.update(1)
                 self.completed_steps += 1
 
-            if self.accelerator.is_local_main_process:
-                progress_bar.set_postfix(
-                        {
-                            "data_times": f"{t_end_data - t_start_data:.3f}",
-                            "model_times": f"{t_end_model - t_start_model:.3f}",
-                        }
-                    )
-
             # evaluate model
             if self.completed_steps > 0 and self.completed_steps % self.config.trainer.eval_interval == 0:
                 step_metrics = self.eval_action_model(step_metrics)
@@ -825,6 +1098,26 @@ class VLATrainer(TrainerUtils):
                     self._save_checkpoint()
 
             step_metrics["wall_step_time"] = time.perf_counter() - t_start_step
+            if self.accelerator.sync_gradients and self.completed_steps > self.progress_eta_warmup_steps:
+                self._recent_wall_step_times.append(step_metrics["wall_step_time"])
+
+            if self.accelerator.is_local_main_process:
+                eta_seconds = self._estimate_remaining_seconds()
+                avg_wall_step_time = (
+                    sum(self._recent_wall_step_times) / len(self._recent_wall_step_times)
+                    if self._recent_wall_step_times
+                    else None
+                )
+                progress_bar.set_postfix(
+                    {
+                        "data_times": f"{t_end_data - t_start_data:.3f}",
+                        "model_times": f"{t_end_model - t_start_model:.3f}",
+                        "wall_time": f"{step_metrics['wall_step_time']:.3f}",
+                        "avg_wall": f"{avg_wall_step_time:.3f}" if avg_wall_step_time is not None else "warmup",
+                        "eta": self._format_duration(eta_seconds),
+                    }
+                )
+
             self._log_metrics(step_metrics)
 
             # check termination condition

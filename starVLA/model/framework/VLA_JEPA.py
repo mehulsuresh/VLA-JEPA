@@ -363,12 +363,16 @@ class VLA_JEPA(baseframework):
     ) -> Tuple:
         if isinstance(examples, dict):
             batch_videos = examples["video"]
+            batch_target_videos = examples.get("video_target")
             actions = examples.get("action")
             state = examples.get("state")
             qwen_inputs = self._move_qwen_inputs(examples["qwen_inputs"])
             has_actions = actions is not None
         else:
             batch_videos = np.stack([example["video"] for example in examples]).transpose(0, 1, 2, 5, 3, 4)
+            batch_target_videos = None
+            if "video_target" in examples[0]:
+                batch_target_videos = np.stack([example["video_target"] for example in examples]).transpose(0, 1, 2, 5, 3, 4)
             actions = [example["action"] for example in examples] if "action" in examples[0] else None
             state = [example["state"] for example in examples] if "state" in examples[0] else None
             qwen_inputs = self._build_qwen_inputs_from_examples(examples)
@@ -393,13 +397,17 @@ class VLA_JEPA(baseframework):
             encoder_device = next(self.vj_encoder.parameters()).device
             encoder_context = torch.no_grad() if self.vj_freeze_encoder else nullcontext()
             with encoder_context:
-                video_embeddings = self._encode_videos(batch_videos=batch_videos, device=encoder_device)
+                input_states = self._encode_videos(batch_videos=batch_videos, device=encoder_device)
+                if batch_target_videos is not None:
+                    gt_states = self._encode_videos(batch_videos=batch_target_videos, device=encoder_device)
+                else:
+                    video_embeddings = input_states
+                    T = T // self._get_vjepa_attr("tubelet_size")
+                    input_states = video_embeddings[:, :video_embeddings.shape[1] // T * (T-1), :]
+                    gt_states = video_embeddings[:, video_embeddings.shape[1] // T:, :]
 
         # Step 3: VJ Predictor
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            T = T // self._get_vjepa_attr("tubelet_size")
-            input_states = video_embeddings[:, :video_embeddings.shape[1] // T * (T-1), :]
-            gt_states = video_embeddings[:, video_embeddings.shape[1] // T:, :]
             predicted_states = self.vj_predictor(
                 input_states,
                 action_tokens

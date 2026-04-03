@@ -17,6 +17,7 @@ def make_LeRobotSingleDataset(
     delete_pause_frame: bool = False,
     action_horizon: int = 7,
     video_horizon: int = 16,
+    video_frame_stride: int = 1,
 ) -> LeRobotSingleDataset:
     """
     Make a LeRobotSingleDataset object.
@@ -28,8 +29,9 @@ def make_LeRobotSingleDataset(
     :return: A LeRobotSingleDataset object.
     """
     data_config_cls = ROBOT_TYPE_CONFIG_MAP[robot_type]
+    video_frame_stride = max(int(video_frame_stride), 1)
     data_config = data_config_cls(
-        observation_indices=list(range(video_horizon)),
+        observation_indices=[i * video_frame_stride for i in range(video_horizon)],
         action_indices=list(range(action_horizon))
     )
     modality_config = data_config.modality_config()
@@ -58,6 +60,7 @@ def get_vla_dataset(
     delete_pause_frame: bool = True,
     action_horizon: int = 7,
     video_horizon: int = 16,
+    video_frame_stride: int = 1,
     **kwargs: dict,
 ) -> LeRobotMixtureDataset:
     """
@@ -83,7 +86,8 @@ def get_vla_dataset(
                                                           robot_type, 
                                                           delete_pause_frame=delete_pause_frame, 
                                                           action_horizon=action_horizon,
-                                                          video_horizon=video_horizon), d_weight))
+                                                          video_horizon=video_horizon,
+                                                          video_frame_stride=video_frame_stride), d_weight))
 
     return LeRobotMixtureDataset(
         dataset_mixture,
