@@ -37,6 +37,33 @@ LOG_CONFIG = {
 logging.config.dictConfig(LOG_CONFIG)
 
 
+def _suppress_noisy_runtime_loggers() -> None:
+    """Keep optional dependency probes out of normal training logs."""
+    for logger_name in (
+        "deepspeed",
+        "deepspeed.accelerator.real_accelerator",
+        "deepspeed.ops.op_builder",
+    ):
+        logging.getLogger(logger_name).setLevel(logging.WARNING)
+
+    try:
+        import distutils.log as distutils_log
+
+        distutils_log.set_threshold(distutils_log.WARN)
+    except Exception:
+        pass
+
+    try:
+        import setuptools._distutils.log as setuptools_distutils_log
+
+        setuptools_distutils_log.set_threshold(setuptools_distutils_log.WARN)
+    except Exception:
+        pass
+
+
+_suppress_noisy_runtime_loggers()
+
+
 # === Custom Contextual Logging Logic ===
 class ContextAdapter(LoggerAdapter):
     CTX_PREFIXES: ClassVar[Dict[int, str]] = {**{0: "[*] "}, **{idx: "|=> ".rjust(4 + (idx * 4)) for idx in [1, 2, 3]}}

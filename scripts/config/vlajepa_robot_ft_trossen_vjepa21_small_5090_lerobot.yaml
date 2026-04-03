@@ -1,4 +1,4 @@
-run_id: robot_ft_trossen_vjepa21_small_5090_30ep
+run_id: robot_ft_trossen_vjepa21_small_5090_lerobot_30ep
 run_root_dir: checkpoints
 seed: 42
 trackers:
@@ -59,26 +59,21 @@ framework:
 
 datasets:
   vla_data:
-    dataset_py: preprocessed_subtask_dataset
-    data_root_dir: /home/mehul/work/reward_model_small/Subtask_dataset/subtask_labelled_combined_preprocessed
+    dataset_py: lerobot_datasets
+    # Update this path to the local LeRobot export if it lives elsewhere.
+    data_root_dir: playground/Datasets/TROSSEN_SUBTASK_COMBINED
+    data_mix: trossen_subtask_combined
     action_type: delta_qpos
     CoT_prompt: "Your task is {instruction}. Infer the temporal dynamics from frames {actions} and produce the corresponding policy actions {e_actions}."
-    instruction_text: "Complete the robot task successfully."
     resolution_size: 224
     video_resolution_size: 384
     per_device_batch_size: 80
     num_workers: 2
-    safe_num_workers_cap: 2
-    frame_cache_size: 256
     prefetch_factor: 2
     persistent_workers: false
     multiprocessing_context: spawn
     pin_memory: true
     drop_last: true
-    current_cameras:
-      - observation.images.cam_high
-      - observation.images.cam_left_wrist
-      - observation.images.cam_right_wrist
     load_all_data_for_training: true
     with_state: true
 

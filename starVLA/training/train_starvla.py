@@ -20,6 +20,7 @@ import math
 import json
 import os
 import sys
+import logging
 from pathlib import Path
 from collections.abc import Mapping, Sequence
 from typing import Optional, Tuple
@@ -30,6 +31,33 @@ import time
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+
+
+def configure_runtime_logging() -> None:
+    """Reduce noisy import-time probe logs from optional DeepSpeed builders."""
+    for logger_name in (
+        "deepspeed",
+        "deepspeed.accelerator.real_accelerator",
+        "deepspeed.ops.op_builder",
+    ):
+        logging.getLogger(logger_name).setLevel(logging.WARNING)
+
+    try:
+        import distutils.log as distutils_log
+
+        distutils_log.set_threshold(distutils_log.WARN)
+    except Exception:
+        pass
+
+    try:
+        import setuptools._distutils.log as setuptools_distutils_log
+
+        setuptools_distutils_log.set_threshold(setuptools_distutils_log.WARN)
+    except Exception:
+        pass
+
+
+configure_runtime_logging()
 
 # Third-Party Libraries
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
@@ -664,10 +692,22 @@ class VLATrainer(TrainerUtils):
                 )
                 scalar_metrics["samples_seen"] = self.completed_steps * self.total_batch_size
 
-                total_step_time = scalar_metrics.get("data_time", 0.0) + scalar_metrics.get("model_time", 0.0)
-                if total_step_time > 0:
-                    scalar_metrics["samples_per_sec"] = self.total_batch_size / total_step_time
-                    scalar_metrics["steps_per_sec"] = 1.0 / total_step_time
+                compute_step_time = scalar_metrics.get("data_time", 0.0) + scalar_metrics.get("model_time", 0.0)
+                if compute_step_time > 0:
+                    scalar_metrics["compute_step_time"] = compute_step_time
+                    scalar_metrics["compute_samples_per_sec"] = self.total_batch_size / compute_step_time
+                    scalar_metrics["compute_steps_per_sec"] = 1.0 / compute_step_time
+
+                wall_step_time = scalar_metrics.get("wall_step_time", 0.0)
+                if wall_step_time > 0:
+                    scalar_metrics["samples_per_sec"] = self.total_batch_size / wall_step_time
+                    scalar_metrics["steps_per_sec"] = 1.0 / wall_step_time
+                    if compute_step_time > 0:
+                        scalar_metrics["step_overhead_time"] = max(0.0, wall_step_time - compute_step_time)
+                elif compute_step_time > 0:
+                    scalar_metrics["samples_per_sec"] = self.total_batch_size / compute_step_time
+                    scalar_metrics["steps_per_sec"] = 1.0 / compute_step_time
+
                 elapsed = time.perf_counter() - self.train_start_time
                 if elapsed > 0:
                     scalar_metrics["avg_samples_per_sec"] = scalar_metrics["samples_seen"] / elapsed
@@ -750,6 +790,7 @@ class VLATrainer(TrainerUtils):
 
         # main training loop
         while self.completed_steps < self.config.trainer.max_train_steps:
+            t_start_step = time.perf_counter()
             t_start_data = time.perf_counter()
             batch_vla = self._get_next_batch()
             t_end_data = time.perf_counter()
@@ -777,12 +818,14 @@ class VLATrainer(TrainerUtils):
             # record metrics
             step_metrics["data_time"] = t_end_data - t_start_data
             step_metrics["model_time"] = t_end_model - t_start_model
-            self._log_metrics(step_metrics)
 
             # save checkpoint
             if self.completed_steps % self.config.trainer.save_interval == 0 and self.completed_steps > 0:
                 if self._should_save_checkpoint(step_metrics):
                     self._save_checkpoint()
+
+            step_metrics["wall_step_time"] = time.perf_counter() - t_start_step
+            self._log_metrics(step_metrics)
 
             # check termination condition
             if self.completed_steps >= self.config.trainer.max_train_steps:
