@@ -578,6 +578,12 @@ class VLATrainer(TrainerUtils):
     def _load_checkpoint(self, checkpoint_path):
         """load checkpoint"""
         self.accelerator.load_state(checkpoint_path)
+        checkpoint_name = os.path.basename(os.path.normpath(checkpoint_path))
+        if checkpoint_name.startswith("steps_"):
+            try:
+                self.completed_steps = int(checkpoint_name.split("_", 1)[1])
+            except ValueError:
+                logger.warning(f"Unable to parse completed_steps from checkpoint path: {checkpoint_path}")
         self.accelerator.print(f"Resumed from checkpoint: {checkpoint_path}")
 
     def _save_checkpoint(self):
