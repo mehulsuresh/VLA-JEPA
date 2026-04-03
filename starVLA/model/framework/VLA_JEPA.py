@@ -8,6 +8,8 @@ A lightweight implementation that Qwen-VL + Flow-matching head to directly predi
 Flow-matching header is copyright from GR00T N1.5,
 """
 from contextlib import nullcontext
+from pathlib import Path
+import time
 from typing import List, Optional, Tuple
 import torch
 import torch.nn.functional as F
@@ -25,6 +27,15 @@ from starVLA.model.modules.action_model.GR00T_ActionHeader import get_action_mod
 from starVLA.model.modules.world_model.vj2_predictor import VisionTransformerPredictorAC
 from starVLA.training.trainer_utils.trainer_tools import resize_images
 from starVLA.model.tools import FRAMEWORK_REGISTRY
+
+
+def _clean_vjepa_backbone_key(state_dict):
+    cleaned = {}
+    for key, value in state_dict.items():
+        key = key.replace("module.", "")
+        key = key.replace("backbone.", "")
+        cleaned[key] = value
+    return cleaned
 
 @FRAMEWORK_REGISTRY.register("VLA_JEPA")
 class VLA_JEPA(baseframework):
@@ -154,22 +165,64 @@ class VLA_JEPA(baseframework):
             preprocessor_name = vj_cfg.get("hub_preprocessor_name", "vjepa2_preprocessor")
             crop_size = vj_cfg.get("crop_size", 384)
             pretrained = vj_cfg.get("pretrained", True)
-            hub_source = "local" if "/" in str(repo_or_dir) else "github"
+            checkpoint_url = vj_cfg.get("hub_checkpoint_url", None)
+            checkpoint_path = vj_cfg.get("hub_checkpoint_path", None)
+            checkpoint_key = vj_cfg.get("hub_checkpoint_key", "ema_encoder")
+            repo_or_dir = str(repo_or_dir)
+            expanded_repo_path = Path(repo_or_dir).expanduser()
+            hub_source = "local" if expanded_repo_path.exists() else "github"
+            if hub_source == "local":
+                repo_or_dir = str(expanded_repo_path)
 
-            loaded = torch.hub.load(
-                repo_or_dir,
+            def _hub_load(entrypoint: str, **load_kwargs):
+                return torch.hub.load(
+                    repo_or_dir,
+                    entrypoint,
+                    source=hub_source,
+                    **load_kwargs,
+                )
+
+            manual_checkpoint = checkpoint_url is not None or checkpoint_path is not None
+
+            if hub_source == "github" and torch.distributed.is_available() and torch.distributed.is_initialized():
+                cache_sentinel = Path(torch.hub.get_dir()) / f".{repo_or_dir.replace('/', '_')}_ready"
+                if torch.distributed.get_rank() == 0:
+                    _hub_load(model_name, pretrained=False if manual_checkpoint else pretrained)
+                    _hub_load(
+                        preprocessor_name,
+                        pretrained=pretrained,
+                        crop_size=crop_size,
+                    )
+                    cache_sentinel.write_text("ready\n")
+                else:
+                    deadline = time.time() + 600
+                    while not cache_sentinel.exists():
+                        if time.time() > deadline:
+                            raise TimeoutError(
+                                f"Timed out waiting for torch.hub cache warmup for `{repo_or_dir}`"
+                            )
+                        time.sleep(1.0)
+
+            loaded = _hub_load(
                 model_name,
-                source=hub_source,
-                pretrained=pretrained,
+                pretrained=False if manual_checkpoint else pretrained,
             )
             encoder = loaded[0] if isinstance(loaded, tuple) else loaded
-            processor = torch.hub.load(
-                repo_or_dir,
+            processor = _hub_load(
                 preprocessor_name,
-                source=hub_source,
                 pretrained=pretrained,
                 crop_size=crop_size,
             )
+
+            if manual_checkpoint:
+                if checkpoint_path is not None:
+                    checkpoint_file = Path(str(checkpoint_path)).expanduser()
+                    state_dict = torch.load(checkpoint_file, map_location="cpu")
+                else:
+                    state_dict = torch.hub.load_state_dict_from_url(str(checkpoint_url), map_location="cpu")
+
+                encoder_state_dict = _clean_vjepa_backbone_key(state_dict[checkpoint_key])
+                encoder.load_state_dict(encoder_state_dict, strict=True)
             return encoder, processor
 
         raise ValueError(f"Unsupported V-JEPA source: {source}")

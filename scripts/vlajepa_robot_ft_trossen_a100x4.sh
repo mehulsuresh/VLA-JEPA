@@ -37,20 +37,18 @@ export TMPDIR="${TMPDIR:-${HOME}/tmp}"
 export FFMPEG_THREADS="${FFMPEG_THREADS:-1}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 export WANDB_MODE="${WANDB_MODE:-disabled}"
-export STARVLA_USE_DEEPSPEED="${STARVLA_USE_DEEPSPEED:-1}"
 
 mkdir -p "${TMPDIR}"
 
 ACCELERATE_BIN="${ACCELERATE_BIN:-$(command -v accelerate 2>/dev/null || echo "${HOME}/miniconda3/envs/vla-jepa-vjepa21/bin/accelerate")}"
-CONFIG_YAML="${CONFIG_YAML:-${REPO_ROOT}/scripts/config/vlajepa_robot_ft.yaml}"
-ACCELERATE_CONFIG="${ACCELERATE_CONFIG:-${REPO_ROOT}/starVLA/config/deepseeds/deepspeed_zero2.yaml}"
-NUM_PROCESSES="${NUM_PROCESSES:-$(nvidia-smi -L | wc -l)}"
+CONFIG_YAML="${CONFIG_YAML:-${REPO_ROOT}/scripts/config/vlajepa_robot_ft_trossen_vjepa21_small_a100x4.yaml}"
+NUM_PROCESSES="${NUM_PROCESSES:-4}"
 MAIN_PROCESS_PORT="${MAIN_PROCESS_PORT:-29500}"
 
 cd "${REPO_ROOT}"
 
 "${ACCELERATE_BIN}" launch \
-  --config_file "${ACCELERATE_CONFIG}" \
+  --multi_gpu \
   --num_processes "${NUM_PROCESSES}" \
   --main_process_port "${MAIN_PROCESS_PORT}" \
   ./starVLA/training/train_starvla.py \

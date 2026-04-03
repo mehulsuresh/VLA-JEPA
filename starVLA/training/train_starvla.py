@@ -18,12 +18,17 @@ import argparse
 import math
 import json
 import os
+import sys
 from pathlib import Path
 from collections.abc import Mapping, Sequence
 from typing import Optional, Tuple
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
 import time
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 # Third-Party Libraries
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
@@ -33,7 +38,7 @@ import yaml
 from accelerate import Accelerator, DeepSpeedPlugin
 from accelerate.logging import get_logger
 from accelerate.tracking import LoggerType
-from accelerate.utils import set_seed
+from accelerate.utils import DistributedDataParallelKwargs, set_seed
 from omegaconf import OmegaConf
 from tqdm import tqdm
 from transformers import AutoProcessor, get_scheduler
@@ -122,18 +127,41 @@ def build_accelerator(cfg) -> Accelerator:
     mixed_precision = resolve_mixed_precision_mode(cfg)
     trackers = resolve_trackers(cfg)
     project_dir = os.path.join(cfg.run_root_dir, cfg.run_id)
+    ddp_kwargs = DistributedDataParallelKwargs(
+        find_unused_parameters=bool(cfg.get("trainer", {}).get("find_unused_parameters", True))
+    )
     accelerator = (
         Accelerator(
             deepspeed_plugin=deepspeed_plugin,
             mixed_precision=mixed_precision,
             log_with=trackers or None,
             project_dir=project_dir,
+            kwargs_handlers=[ddp_kwargs],
         )
         if use_deepspeed
-        else Accelerator(mixed_precision=mixed_precision, log_with=trackers or None, project_dir=project_dir)
+        else Accelerator(
+            mixed_precision=mixed_precision,
+            log_with=trackers or None,
+            project_dir=project_dir,
+            kwargs_handlers=[ddp_kwargs],
+        )
     )
+    if torch.cuda.is_available():
+        # Ensure NCCL collectives run on the process-local device before any early barrier().
+        torch.cuda.set_device(accelerator.local_process_index)
     accelerator.print(accelerator.state)
     return accelerator
+
+
+def distributed_wait(accelerator: Optional[Accelerator] = None) -> None:
+    if dist.is_initialized():
+        barrier_kwargs = {}
+        if torch.cuda.is_available():
+            barrier_kwargs["device_ids"] = [torch.cuda.current_device()]
+        dist.barrier(**barrier_kwargs)
+        return
+    if accelerator is not None:
+        accelerator.wait_for_everyone()
 
 
 def load_fast_tokenizer():
@@ -235,8 +263,6 @@ def prepare_data(cfg, accelerator, output_dir, model=None) -> Tuple[DataLoader, 
     )
 
     accelerator.dataloader_config.dispatch_batches = False
-    if dist.is_initialized():
-        dist.barrier()
 
     return vla_train_dataloader
 
@@ -494,7 +520,7 @@ class VLATrainer(TrainerUtils):
             with open(os.path.join(self.config.output_dir, "summary.jsonl"), "a") as f:
                 f.write(json.dumps(summary_data) + "\n")
             self.accelerator.print(f"✅ Checkpoint saved at {checkpoint_path}")
-        self.accelerator.wait_for_everyone()
+        distributed_wait(self.accelerator)
 
     def _should_save_checkpoint(self, step_metrics: dict) -> bool:
         if not bool(self.config.trainer.get("save_best_only", False)):
@@ -883,7 +909,7 @@ class VLATrainer(TrainerUtils):
             logger.info(f"Training complete. Final model saved at {final_checkpoint}")
         if self.accelerator.trackers:
             self.accelerator.end_training()
-        self.accelerator.wait_for_everyone()
+        distributed_wait(self.accelerator)
 
 
 def main(cfg) -> None:
@@ -923,7 +949,7 @@ def main(cfg) -> None:
     # And... we're done!
     logger.info("... and that's all, folks!")
     if dist.is_initialized():
-        dist.barrier()
+        distributed_wait()
         dist.destroy_process_group()
 
 

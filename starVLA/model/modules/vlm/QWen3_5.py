@@ -1,11 +1,13 @@
 # Copyright 2025 starVLA community. All rights reserved.
 # Licensed under the MIT License, Version 1.0 (the "License");
 
+import os
 import torch
 from typing import Optional
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers import Qwen3_5ForConditionalGeneration, AutoProcessor
 from transformers.models.qwen3_5 import modeling_qwen3_5
+from transformers.utils import is_flash_attn_2_available
 
 from accelerate.logging import get_logger
 
@@ -21,12 +23,60 @@ import torch.nn as nn
 class _QWen3_5_Interface(nn.Module):
     """Wrapper around Qwen3.5 multimodal models."""
 
+    @staticmethod
+    def _safe_log(level: str, message: str) -> None:
+        try:
+            getattr(logger, level)(message)
+        except RuntimeError:
+            print(message)
+
+    @staticmethod
+    def _resolve_attn_implementation(requested: Optional[str]) -> str:
+        normalized = (requested or "flash_attention_2").strip().lower()
+        alias_map = {
+            "flash": "flash_attention_2",
+            "flash2": "flash_attention_2",
+            "flash_attn": "flash_attention_2",
+            "flash_attn_2": "flash_attention_2",
+            "flash-attn": "flash_attention_2",
+            "flash-attn-2": "flash_attention_2",
+        }
+        normalized = alias_map.get(normalized, normalized)
+
+        if normalized == "auto":
+            normalized = "flash_attention_2"
+
+        flash_available = torch.cuda.is_available() and is_flash_attn_2_available()
+        prefer_flash = os.getenv("STARVLA_DISABLE_FLASH_ATTN_PROMOTION", "0") != "1"
+
+        if normalized == "sdpa" and flash_available and prefer_flash:
+            _QWen3_5_Interface._safe_log(
+                "info", "Promoting requested `sdpa` attention to `flash_attention_2` for Qwen3.5"
+            )
+            normalized = "flash_attention_2"
+
+        if normalized == "flash_attention_2":
+            if not torch.cuda.is_available():
+                _QWen3_5_Interface._safe_log(
+                    "warning", "FlashAttention requested but CUDA is unavailable; falling back to sdpa"
+                )
+                return "sdpa"
+            if not is_flash_attn_2_available():
+                _QWen3_5_Interface._safe_log(
+                    "warning", "FlashAttention requested but `flash-attn` is unavailable; falling back to sdpa"
+                )
+                return "sdpa"
+            return "flash_attention_2"
+
+        return normalized
+
     def __init__(self, config: Optional[dict] = None, **kwargs):
         super().__init__()
 
         qwenvl_config = config.framework.get("qwenvl", {})
         model_id = qwenvl_config.get("base_vlm", "Qwen/Qwen3.5-2B")
-        attn_implementation = qwenvl_config.get("attn_implementation", "sdpa")
+        requested_attn_implementation = qwenvl_config.get("attn_implementation", "flash_attention_2")
+        attn_implementation = self._resolve_attn_implementation(requested_attn_implementation)
         compile_qwen_model = bool(config.get("trainer", {}).get("compile_qwen_model", False))
         device_map = qwenvl_config.get("device_map", None if compile_qwen_model else "cuda")
         enable_fast_linear_attention = bool(qwenvl_config.get("enable_fast_linear_attention", False))
@@ -50,6 +100,13 @@ class _QWen3_5_Interface(nn.Module):
             model = model.to("cuda")
         processor = AutoProcessor.from_pretrained(model_id)
         processor.tokenizer.padding_side = "left"
+
+        logger.info(
+            "Loaded `%s` with attention backend `%s` (requested `%s`)",
+            model_id,
+            attn_implementation,
+            requested_attn_implementation,
+        )
 
         self.model = model
         self.processor = processor

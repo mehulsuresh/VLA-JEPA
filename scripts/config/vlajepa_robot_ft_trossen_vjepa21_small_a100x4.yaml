@@ -9,7 +9,7 @@ framework:
   name: VLA_JEPA
   qwenvl:
     base_vlm: "Qwen/Qwen3.5-0.8B"
-    attn_implementation: sdpa
+    attn_implementation: flash_attention_2
     enable_fast_linear_attention: false
     vl_hidden_dim: 1024
   action_model:
@@ -43,6 +43,8 @@ framework:
     hub_repo_or_dir: /home/mehul_yonduai_com/work/vjepa2
     hub_model_name: vjepa2_1_vit_base_384
     hub_preprocessor_name: vjepa2_preprocessor
+    hub_checkpoint_url: https://dl.fbaipublicfiles.com/vjepa2/vjepa2_1_vitb_dist_vitG_384.pt
+    hub_checkpoint_key: ema_encoder
     crop_size: 384
     pretrained: true
     freeze_encoder: true

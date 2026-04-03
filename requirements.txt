@@ -1,4 +1,7 @@
-transformers==4.57.0
+# Qwen3.5 multimodal support (Qwen3_5ForConditionalGeneration) is not yet in a
+# stable PyPI release; pin to git HEAD until a versioned release ships.
+# Once released, replace with: transformers>=<version>
+transformers @ git+https://github.com/huggingface/transformers.git
 accelerate==1.5.2
 tiktoken
 einops
