@@ -61,10 +61,24 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe", model=None): # TODO
             action_horizon=cfg.framework.action_model.action_horizon,
             video_horizon=cfg.framework.vj2_model.num_frames)
 
+        sampler = None
+        shuffle = True
+        if dist.is_initialized():
+            sampler = DistributedSampler(
+                vla_dataset,
+                num_replicas=dist.get_world_size(),
+                rank=dist.get_rank(),
+                shuffle=True,
+                drop_last=drop_last,
+            )
+            shuffle = False
+
         loader_kwargs = dict(
             dataset=vla_dataset,
             batch_size=cfg.datasets.vla_data.per_device_batch_size,
             collate_fn=collate_fn,
+            shuffle=shuffle,
+            sampler=sampler,
             num_workers=num_workers,
             pin_memory=pin_memory,
             drop_last=drop_last,

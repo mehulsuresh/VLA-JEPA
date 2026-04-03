@@ -267,10 +267,21 @@ def prepare_data(cfg, accelerator, output_dir, model=None) -> Tuple[DataLoader, 
     return vla_train_dataloader
 
 
-def resolve_training_schedule(cfg, vla_train_dataloader) -> None:
-    """Resolve epoch-based training schedule once the dataloader length is known."""
+def resolve_training_schedule(cfg, vla_train_dataloader, num_processes: int = 1) -> None:
+    """Resolve epoch-based training schedule once the dataloader length is known.
+
+    ``num_processes`` must be the number of DDP ranks (accelerator.num_processes).
+    The raw dataloader is built *before* accelerator.prepare() wraps it with a
+    DistributedSampler, so its __len__ still reflects the full dataset divided by
+    per-device batch size.  We divide by num_processes here so that
+    steps_per_epoch and max_train_steps reflect one pass per rank, not one pass
+    over the whole dataset repeated on every rank.
+    """
     trainer_cfg = cfg.trainer
-    micro_batches_per_epoch = len(vla_train_dataloader)
+    raw_batches = len(vla_train_dataloader)
+    # Each rank will see raw_batches // num_processes batches per epoch after
+    # accelerator.prepare() installs a DistributedSampler.
+    micro_batches_per_epoch = max(1, raw_batches // num_processes)
     grad_accum_steps = max(int(trainer_cfg.get("gradient_accumulation_steps", 1)), 1)
     steps_per_epoch = math.ceil(micro_batches_per_epoch / grad_accum_steps)
     trainer_cfg.micro_batches_per_epoch = micro_batches_per_epoch
@@ -927,7 +938,11 @@ def main(cfg) -> None:
         output_dir=output_dir,
         model=vla,
     )
-    resolve_training_schedule(cfg=cfg, vla_train_dataloader=vla_train_dataloader)
+    resolve_training_schedule(
+        cfg=cfg,
+        vla_train_dataloader=vla_train_dataloader,
+        num_processes=accelerator.num_processes,
+    )
 
     # set optimizer and scheduler
     optimizer, lr_scheduler = setup_optimizer_and_scheduler(model=vla, cfg=cfg)
