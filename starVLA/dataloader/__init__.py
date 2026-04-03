@@ -5,7 +5,6 @@ from functools import partial
 import torch
 import numpy as np
 from torch.utils.data import DataLoader
-from torch.utils.data.distributed import DistributedSampler
 import torch.distributed as dist
 from pathlib import Path
 from starVLA.dataloader.vlm_datasets import make_vlm_dataloader
@@ -61,24 +60,11 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe", model=None): # TODO
             action_horizon=cfg.framework.action_model.action_horizon,
             video_horizon=cfg.framework.vj2_model.num_frames)
 
-        sampler = None
-        shuffle = True
-        if dist.is_initialized():
-            sampler = DistributedSampler(
-                vla_dataset,
-                num_replicas=dist.get_world_size(),
-                rank=dist.get_rank(),
-                shuffle=True,
-                drop_last=drop_last,
-            )
-            shuffle = False
-
         loader_kwargs = dict(
             dataset=vla_dataset,
             batch_size=cfg.datasets.vla_data.per_device_batch_size,
             collate_fn=collate_fn,
-            shuffle=shuffle,
-            sampler=sampler,
+            shuffle=True,
             num_workers=num_workers,
             pin_memory=pin_memory,
             drop_last=drop_last,
@@ -138,24 +124,11 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe", model=None): # TODO
                 )
                 num_workers = safe_worker_cap
 
-        sampler = None
-        shuffle = True
-        if dist.is_initialized():
-            sampler = DistributedSampler(
-                vla_dataset,
-                num_replicas=dist.get_world_size(),
-                rank=dist.get_rank(),
-                shuffle=True,
-                drop_last=drop_last,
-            )
-            shuffle = False
-
         loader_kwargs = dict(
             dataset=vla_dataset,
             batch_size=cfg.datasets.vla_data.per_device_batch_size,
             collate_fn=collate_fn,
-            shuffle=shuffle,
-            sampler=sampler,
+            shuffle=True,
             num_workers=num_workers,
             pin_memory=pin_memory,
             drop_last=drop_last,
@@ -190,16 +163,12 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe", model=None): # TODO
             task_key=cfg.datasets.vla_data.task_key if cfg.datasets.vla_data.task_key else None,
             resize_size=cfg.datasets.vla_data.resize_size)
 
-
-
-        train_sampler = torch.utils.data.distributed.DistributedSampler(vla_dataset, shuffle=True)
-
         vla_train_dataloader = DataLoader(
             vla_dataset,
             batch_size=cfg.datasets.vla_data.per_device_batch_size,
             collate_fn=custom_collate_fn,
             num_workers=16,
-            sampler=train_sampler,
+            shuffle=True,
         )      
         #if dist.get_rank() == 0: 
         #    for batch in vla_train_dataloader:
@@ -226,14 +195,11 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe", model=None): # TODO
         video_collate_fn = partial(collate_fn, 
             n_views=2,
             resolution_size=video_dataset_cfg.resolution_size)
-
-        train_sampler = torch.utils.data.distributed.DistributedSampler(video_dataset, shuffle=True)
-
         video_train_dataloader = DataLoader(
             video_dataset,
             batch_size=video_dataset_cfg.per_device_batch_size,
             collate_fn=video_collate_fn,
             num_workers=16,
-            sampler=train_sampler,
+            shuffle=True,
         )        
         return video_train_dataloader

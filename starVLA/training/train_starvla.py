@@ -15,6 +15,7 @@ warnings.filterwarnings("ignore")
 
 # Standard Library
 import argparse
+import gc
 import math
 import json
 import os
@@ -164,6 +165,16 @@ def distributed_wait(accelerator: Optional[Accelerator] = None) -> None:
         accelerator.wait_for_everyone()
 
 
+def finish_trackers(accelerator: Optional[Accelerator]) -> None:
+    if accelerator is None:
+        return
+    for tracker in getattr(accelerator, "trackers", []):
+        try:
+            tracker.finish()
+        except Exception as exc:
+            logger.warning(f"Tracker shutdown failed for `{type(tracker).__name__}`: {exc}")
+
+
 def load_fast_tokenizer():
     fast_tokenizer = AutoProcessor.from_pretrained("physical-intelligence/fast", trust_remote_code=True)
     return fast_tokenizer
@@ -267,21 +278,74 @@ def prepare_data(cfg, accelerator, output_dir, model=None) -> Tuple[DataLoader, 
     return vla_train_dataloader
 
 
-def resolve_training_schedule(cfg, vla_train_dataloader, num_processes: int = 1) -> None:
-    """Resolve epoch-based training schedule once the dataloader length is known.
+def _find_sampler(obj, visited: set[int] | None = None):
+    if obj is None:
+        return None
+    if visited is None:
+        visited = set()
+    obj_id = id(obj)
+    if obj_id in visited:
+        return None
+    visited.add(obj_id)
 
-    ``num_processes`` must be the number of DDP ranks (accelerator.num_processes).
-    The raw dataloader is built *before* accelerator.prepare() wraps it with a
-    DistributedSampler, so its __len__ still reflects the full dataset divided by
-    per-device batch size.  We divide by num_processes here so that
-    steps_per_epoch and max_train_steps reflect one pass per rank, not one pass
-    over the whole dataset repeated on every rank.
-    """
-    trainer_cfg = cfg.trainer
+    sampler = getattr(obj, "sampler", None)
+    if sampler is not None:
+        return sampler
+
+    batch_sampler = getattr(obj, "batch_sampler", None)
+    if batch_sampler is not None:
+        nested_sampler = _find_sampler(batch_sampler, visited)
+        if nested_sampler is not None:
+            return nested_sampler
+
+    for attr_name in ("dataloader", "base_dataloader"):
+        nested_obj = getattr(obj, attr_name, None)
+        nested_sampler = _find_sampler(nested_obj, visited)
+        if nested_sampler is not None:
+            return nested_sampler
+
+    return None
+
+
+def _shutdown_dataloader_iterator(iterator) -> None:
+    if iterator is None:
+        return
+    shutdown = getattr(iterator, "_shutdown_workers", None)
+    if callable(shutdown):
+        try:
+            shutdown()
+        except Exception as exc:
+            logger.warning(f"Failed to shut down dataloader iterator `{type(iterator).__name__}`: {exc}")
+
+
+def _shutdown_dataloader_workers(dataloader) -> None:
+    if dataloader is None:
+        return
+    _shutdown_dataloader_iterator(getattr(dataloader, "_iterator", None))
+
+
+def _raw_dataloader_batches_per_rank(vla_train_dataloader, num_processes: int) -> int:
     raw_batches = len(vla_train_dataloader)
-    # Each rank will see raw_batches // num_processes batches per epoch after
-    # accelerator.prepare() installs a DistributedSampler.
-    micro_batches_per_epoch = max(1, raw_batches // num_processes)
+    sampler = _find_sampler(vla_train_dataloader)
+    if isinstance(sampler, torch.utils.data.distributed.DistributedSampler):
+        return raw_batches
+
+    if num_processes <= 1:
+        return raw_batches
+
+    drop_last = bool(getattr(vla_train_dataloader, "drop_last", False))
+    # Accelerate shards an unprepared dataloader across ranks after this point.
+    # Match DataLoaderShard semantics: floor when dropping incomplete batches,
+    # otherwise ceil so every rank sees the same number of steps.
+    if drop_last:
+        return max(1, raw_batches // num_processes)
+    return max(1, math.ceil(raw_batches / num_processes))
+
+
+def resolve_training_schedule(cfg, vla_train_dataloader, num_processes: int = 1) -> None:
+    """Resolve epoch-based training schedule once the dataloader length is known."""
+    trainer_cfg = cfg.trainer
+    micro_batches_per_epoch = _raw_dataloader_batches_per_rank(vla_train_dataloader, num_processes)
     grad_accum_steps = max(int(trainer_cfg.get("gradient_accumulation_steps", 1)), 1)
     steps_per_epoch = math.ceil(micro_batches_per_epoch / grad_accum_steps)
     trainer_cfg.micro_batches_per_epoch = micro_batches_per_epoch
@@ -483,13 +547,15 @@ class VLATrainer(TrainerUtils):
         if not dist.is_initialized():
             return
 
-        sampler = getattr(self.vla_train_dataloader, "sampler", None)
-        if sampler is None and hasattr(self.vla_train_dataloader, "batch_sampler"):
-            sampler = getattr(self.vla_train_dataloader.batch_sampler, "sampler", None)
+        sampler = _find_sampler(self.vla_train_dataloader)
 
-        if sampler is None or not callable(getattr(sampler, "set_epoch", None)):
+        if sampler is None:
+            logger.info(
+                f"Prepared VLA dataloader wrapper `{type(self.vla_train_dataloader).__name__}` does not expose a sampler directly; relying on Accelerate-managed sharding"
+            )
+        elif not callable(getattr(sampler, "set_epoch", None)):
             logger.warning(
-                "Prepared VLA dataloader does not expose a sampler with set_epoch(); verify Accelerate preserved the DistributedSampler to avoid duplicate shards across ranks"
+                "Prepared VLA dataloader exposes a sampler without set_epoch(); verify shuffling behavior across ranks"
             )
         else:
             logger.info(f"Prepared VLA dataloader sampler: {type(sampler).__name__}")
@@ -918,54 +984,82 @@ class VLATrainer(TrainerUtils):
             os.makedirs(final_checkpoint, exist_ok=True)
             torch.save(state_dict, os.path.join(final_checkpoint, "pytorch_model.pt"))
             logger.info(f"Training complete. Final model saved at {final_checkpoint}")
-        if self.accelerator.trackers:
-            self.accelerator.end_training()
+        self._shutdown_data_runtime()
         distributed_wait(self.accelerator)
+        finish_trackers(self.accelerator)
+
+    def _shutdown_data_runtime(self):
+        for attr_name in ("vla_iter", "vla_eval_iter"):
+            iterator = getattr(self, attr_name, None)
+            _shutdown_dataloader_iterator(iterator)
+            setattr(self, attr_name, None)
+        _shutdown_dataloader_workers(getattr(self, "vla_train_dataloader", None))
+        gc.collect()
 
 
 def main(cfg) -> None:
     accelerator = build_accelerator(cfg)
     logger.info("VLA Training :: Warming Up")
+    interrupted = False
+    trainer = None
 
-    # create output directory and save config
-    output_dir = setup_directories(cfg=cfg)
-    # build model
-    vla = build_model(cfg)
-    # prepare data
-    vla_train_dataloader = prepare_data(
-        cfg=cfg,
-        accelerator=accelerator,
-        output_dir=output_dir,
-        model=vla,
-    )
-    resolve_training_schedule(
-        cfg=cfg,
-        vla_train_dataloader=vla_train_dataloader,
-        num_processes=accelerator.num_processes,
-    )
+    try:
+        # create output directory and save config
+        output_dir = setup_directories(cfg=cfg)
+        # build model
+        vla = build_model(cfg)
+        # prepare data
+        vla_train_dataloader = prepare_data(
+            cfg=cfg,
+            accelerator=accelerator,
+            output_dir=output_dir,
+            model=vla,
+        )
+        resolve_training_schedule(
+            cfg=cfg,
+            vla_train_dataloader=vla_train_dataloader,
+            num_processes=accelerator.num_processes,
+        )
 
-    # set optimizer and scheduler
-    optimizer, lr_scheduler = setup_optimizer_and_scheduler(model=vla, cfg=cfg)
+        # set optimizer and scheduler
+        optimizer, lr_scheduler = setup_optimizer_and_scheduler(model=vla, cfg=cfg)
 
-    trainer = VLATrainer(
-        cfg=cfg,
-        model=vla,
-        vla_train_dataloader=vla_train_dataloader,
-        optimizer=optimizer,
-        lr_scheduler=lr_scheduler,
-        accelerator=accelerator,
-    )
+        trainer = VLATrainer(
+            cfg=cfg,
+            model=vla,
+            vla_train_dataloader=vla_train_dataloader,
+            optimizer=optimizer,
+            lr_scheduler=lr_scheduler,
+            accelerator=accelerator,
+        )
 
-    # execute training preparation
-    trainer.prepare_training()
-    # execute training
-    trainer.train()
+        # execute training preparation
+        trainer.prepare_training()
+        # execute training
+        trainer.train()
 
-    # And... we're done!
-    logger.info("... and that's all, folks!")
-    if dist.is_initialized():
-        distributed_wait()
-        dist.destroy_process_group()
+        # And... we're done!
+        logger.info("... and that's all, folks!")
+    except KeyboardInterrupt:
+        interrupted = True
+        logger.warning("Training interrupted; shutting down distributed workers")
+        raise
+    finally:
+        if trainer is not None:
+            try:
+                trainer._shutdown_data_runtime()
+            except Exception as exc:
+                logger.warning(f"Training data shutdown failed: {exc}")
+        if dist.is_initialized():
+            if not interrupted:
+                try:
+                    distributed_wait(accelerator)
+                except Exception as exc:
+                    logger.warning(f"Distributed barrier during shutdown failed: {exc}")
+            try:
+                dist.destroy_process_group()
+            except Exception as exc:
+                logger.warning(f"Distributed shutdown failed: {exc}")
 
 
 if __name__ == "__main__":

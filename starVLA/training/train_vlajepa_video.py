@@ -438,37 +438,51 @@ class VLATrainer(TrainerUtils):
 
 def main(cfg) -> None:
     logger.info("VLA Training :: Warming Up")
+    interrupted = False
+    try:
+        # create output directory and save config
+        output_dir = setup_directories(cfg=cfg)
+        # build model
+        vla = build_framework(cfg)
+        # prepare data
+        vla_train_dataloader = prepare_data(cfg=cfg, accelerator=accelerator, output_dir=output_dir)
 
-    # create output directory and save config
-    output_dir = setup_directories(cfg=cfg)
-    # build model
-    vla = build_framework(cfg)
-    # prepare data
-    vla_train_dataloader = prepare_data(cfg=cfg, accelerator=accelerator, output_dir=output_dir)
+        # set optimizer and scheduler
+        optimizer, lr_scheduler = setup_optimizer_and_scheduler(model=vla, cfg=cfg)
 
-    # set optimizer and scheduler
-    optimizer, lr_scheduler = setup_optimizer_and_scheduler(model=vla, cfg=cfg)
+        # create trainer
+        # Run VLA Training
+        trainer = VLATrainer(
+            cfg=cfg,
+            model=vla,
+            vla_train_dataloader=vla_train_dataloader,
+            optimizer=optimizer,
+            lr_scheduler=lr_scheduler,
+            accelerator=accelerator,
+        )
 
-    # create trainer
-    # Run VLA Training
-    trainer = VLATrainer(
-        cfg=cfg,
-        model=vla,
-        vla_train_dataloader=vla_train_dataloader,
-        optimizer=optimizer,
-        lr_scheduler=lr_scheduler,
-        accelerator=accelerator,
-    )
+        # execute training preparation
+        trainer.prepare_training()
+        # execute training
+        trainer.train()
 
-    # execute training preparation
-    trainer.prepare_training()
-    # execute training
-    trainer.train()
-
-    # And... we're done!
-    logger.info("... and that's all, folks!")
-    dist.barrier()
-    dist.destroy_process_group()
+        # And... we're done!
+        logger.info("... and that's all, folks!")
+    except KeyboardInterrupt:
+        interrupted = True
+        logger.warning("Training interrupted; shutting down distributed workers")
+        raise
+    finally:
+        if dist.is_initialized():
+            if not interrupted:
+                try:
+                    dist.barrier()
+                except Exception as exc:
+                    logger.warning(f"Distributed barrier during shutdown failed: {exc}")
+            try:
+                dist.destroy_process_group()
+            except Exception as exc:
+                logger.warning(f"Distributed shutdown failed: {exc}")
 
 
 if __name__ == "__main__":

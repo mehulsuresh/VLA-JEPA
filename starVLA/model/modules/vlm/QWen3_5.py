@@ -20,6 +20,26 @@ _ACTION_TOKEN_MAX = 260000
 import torch.nn as nn
 
 
+def _enable_partial_fast_linear_attention_logging() -> None:
+    has_fla_kernels = all(
+        (
+            modeling_qwen3_5.chunk_gated_delta_rule,
+            modeling_qwen3_5.fused_recurrent_gated_delta_rule,
+            modeling_qwen3_5.FusedRMSNormGated,
+        )
+    )
+    has_full_fast_path = has_fla_kernels and all(
+        (
+            modeling_qwen3_5.causal_conv1d_fn,
+            modeling_qwen3_5.causal_conv1d_update,
+        )
+    )
+    if has_fla_kernels and not has_full_fast_path:
+        # Upstream only uses `is_fast_path_available` for warning text. Keep the
+        # fused delta-rule kernels enabled even when conv1d falls back to torch.
+        modeling_qwen3_5.is_fast_path_available = True
+
+
 class _QWen3_5_Interface(nn.Module):
     """Wrapper around Qwen3.5 multimodal models."""
 
@@ -89,6 +109,8 @@ class _QWen3_5_Interface(nn.Module):
             modeling_qwen3_5.chunk_gated_delta_rule = None
             modeling_qwen3_5.fused_recurrent_gated_delta_rule = None
             modeling_qwen3_5.FusedRMSNormGated = None
+        else:
+            _enable_partial_fast_linear_attention_logging()
 
         model = Qwen3_5ForConditionalGeneration.from_pretrained(
             model_id,
@@ -107,6 +129,19 @@ class _QWen3_5_Interface(nn.Module):
             attn_implementation,
             requested_attn_implementation,
         )
+        if enable_fast_linear_attention:
+            has_fast_delta = all(
+                (
+                    modeling_qwen3_5.chunk_gated_delta_rule,
+                    modeling_qwen3_5.fused_recurrent_gated_delta_rule,
+                    modeling_qwen3_5.FusedRMSNormGated,
+                )
+            )
+            if has_fast_delta and modeling_qwen3_5.causal_conv1d_fn is None:
+                self._safe_log(
+                    "info",
+                    "Qwen3.5 fast linear attention is enabled with fused delta kernels; causal-conv1d is unavailable so conv1d stays on the torch fallback path",
+                )
 
         self.model = model
         self.processor = processor
