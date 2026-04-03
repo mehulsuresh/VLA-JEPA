@@ -208,6 +208,12 @@ class VLAMTrainer(TrainerUtils):
     def _load_checkpoint(self, checkpoint_path):
         """load checkpoint"""
         self.accelerator.load_state(checkpoint_path)
+        checkpoint_name = os.path.basename(os.path.normpath(checkpoint_path))
+        if checkpoint_name.startswith("steps_"):
+            try:
+                self.completed_steps = int(checkpoint_name.split("_", 1)[1])
+            except ValueError:
+                logger.warning(f"Unable to parse completed_steps from checkpoint path: {checkpoint_path}")
         self.accelerator.print(f"Resumed from checkpoint: {checkpoint_path}")
 
     def _save_checkpoint(self):
@@ -291,7 +297,9 @@ class VLAMTrainer(TrainerUtils):
 
         # create progress bar
         progress_bar = tqdm(
-            range(self.config.trainer.max_train_steps), disable=not self.accelerator.is_local_main_process
+            total=self.config.trainer.max_train_steps,
+            initial=min(self.completed_steps, self.config.trainer.max_train_steps),
+            disable=not self.accelerator.is_local_main_process,
         )
 
         # main training loop
