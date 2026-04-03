@@ -578,12 +578,23 @@ class VLATrainer(TrainerUtils):
     def _load_checkpoint(self, checkpoint_path):
         """load checkpoint"""
         self.accelerator.load_state(checkpoint_path)
-        checkpoint_name = os.path.basename(os.path.normpath(checkpoint_path))
-        if checkpoint_name.startswith("steps_"):
+        trainer_state_path = os.path.join(checkpoint_path, "trainer_state.json")
+        if os.path.exists(trainer_state_path):
             try:
-                self.completed_steps = int(checkpoint_name.split("_", 1)[1])
-            except ValueError:
-                logger.warning(f"Unable to parse completed_steps from checkpoint path: {checkpoint_path}")
+                with open(trainer_state_path, "r") as f:
+                    trainer_state = json.load(f)
+                self.completed_steps = int(trainer_state.get("completed_steps", self.completed_steps))
+                best_metric_value = trainer_state.get("best_metric_value", None)
+                self.best_metric_value = None if best_metric_value is None else float(best_metric_value)
+            except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+                logger.warning(f"Unable to load trainer state from checkpoint `{checkpoint_path}`: {exc}")
+        else:
+            checkpoint_name = os.path.basename(os.path.normpath(checkpoint_path))
+            if checkpoint_name.startswith("steps_"):
+                try:
+                    self.completed_steps = int(checkpoint_name.split("_", 1)[1])
+                except ValueError:
+                    logger.warning(f"Unable to parse completed_steps from checkpoint path: {checkpoint_path}")
         self.accelerator.print(f"Resumed from checkpoint: {checkpoint_path}")
 
     def _save_checkpoint(self):
@@ -595,6 +606,15 @@ class VLATrainer(TrainerUtils):
             # save plain model weights alongside the full accelerator state for convenience
             state_dict = self.accelerator.get_state_dict(self.model)
             torch.save(state_dict, os.path.join(checkpoint_path, "pytorch_model.pt"))
+
+            trainer_state = {
+                "completed_steps": self.completed_steps,
+                "best_metric_name": self.best_metric_name,
+                "best_metric_mode": self.best_metric_mode,
+                "best_metric_value": self.best_metric_value,
+            }
+            with open(os.path.join(checkpoint_path, "trainer_state.json"), "w") as f:
+                json.dump(trainer_state, f, indent=2)
 
             # save training metadata
             summary_data = {
@@ -723,7 +743,9 @@ class VLATrainer(TrainerUtils):
 
         # create progress bar
         progress_bar = tqdm(
-            range(self.config.trainer.max_train_steps), disable=not self.accelerator.is_local_main_process
+            total=self.config.trainer.max_train_steps,
+            initial=min(self.completed_steps, self.config.trainer.max_train_steps),
+            disable=not self.accelerator.is_local_main_process,
         )
 
         # main training loop
