@@ -43,7 +43,14 @@ mkdir -p "${TMPDIR}"
 
 ACCELERATE_BIN="${ACCELERATE_BIN:-$(command -v accelerate 2>/dev/null || echo "${HOME}/miniconda3/envs/vla-jepa-vjepa21/bin/accelerate")}"
 CONFIG_YAML="${CONFIG_YAML:-${REPO_ROOT}/scripts/config/vlajepa_robot_ft.yaml}"
-ACCELERATE_CONFIG="${ACCELERATE_CONFIG:-${REPO_ROOT}/starVLA/config/deepseeds/deepspeed_zero2.yaml}"
+DEEPSPEED_STAGE="${STARVLA_DEEPSPEED_STAGE:-2}"
+DEFAULT_ACCELERATE_CONFIG="${REPO_ROOT}/starVLA/config/deepseeds/deepspeed_zero2.yaml"
+EXTRA_TRAIN_ARGS=()
+if [[ "${DEEPSPEED_STAGE}" == "3" || "${DEEPSPEED_STAGE,,}" == "zero3" ]]; then
+  DEFAULT_ACCELERATE_CONFIG="${REPO_ROOT}/starVLA/config/deepseeds/deepspeed_zero3.yaml"
+  EXTRA_TRAIN_ARGS+=(--framework.qwenvl.device_map null)
+fi
+ACCELERATE_CONFIG="${ACCELERATE_CONFIG:-${DEFAULT_ACCELERATE_CONFIG}}"
 NUM_PROCESSES="${NUM_PROCESSES:-$(nvidia-smi -L | wc -l)}"
 MAIN_PROCESS_PORT="${MAIN_PROCESS_PORT:-29500}"
 
@@ -55,4 +62,5 @@ cd "${REPO_ROOT}"
   --main_process_port "${MAIN_PROCESS_PORT}" \
   ./starVLA/training/train_starvla.py \
   --config_yaml "${CONFIG_YAML}" \
+  "${EXTRA_TRAIN_ARGS[@]}" \
   "$@"

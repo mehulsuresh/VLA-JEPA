@@ -163,7 +163,9 @@ class VisionTransformerPredictorAC(nn.Module):
         else:
             x = torch.cat([a, x], dim=2).flatten(1, 2)  # [B, T*(H*W+2), D]
 
-        attn_mask = self.attn_mask[: x.size(1), : x.size(1)]
+        attn_mask = None
+        if self.attn_mask is not None:
+            attn_mask = self.attn_mask[: x.size(1), : x.size(1)].to(x.device)
 
         # Fwd prop
         for i, blk in enumerate(self.predictor_blocks):

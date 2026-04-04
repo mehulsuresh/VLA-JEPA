@@ -15,9 +15,21 @@ export FFMPEG_THREADS=1
 export OMP_NUM_THREADS=1
 
 export WANDB_MODE=disabled
+export STARVLA_USE_DEEPSPEED="${STARVLA_USE_DEEPSPEED:-1}"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+DEEPSPEED_STAGE="${STARVLA_DEEPSPEED_STAGE:-2}"
+ACCELERATE_CONFIG="${REPO_ROOT}/starVLA/config/deepseeds/deepspeed_zero2.yaml"
+EXTRA_TRAIN_ARGS=()
+if [[ "${DEEPSPEED_STAGE}" == "3" || "${DEEPSPEED_STAGE,,}" == "zero3" ]]; then
+  ACCELERATE_CONFIG="${REPO_ROOT}/starVLA/config/deepseeds/deepspeed_zero3.yaml"
+  EXTRA_TRAIN_ARGS+=(--framework.qwenvl.device_map null)
+fi
 
 accelerate launch \
-  --config_file ./starVLA/config/deepseeds/deepspeed_zero2.yaml \
+  --config_file "${ACCELERATE_CONFIG}" \
   --num_processes 8 \
   ./starVLA/training/train_vlajepa_cotrain.py \
-  --config_yaml ./scripts/config/vlajepa_cotrain.yaml
+  --config_yaml "${REPO_ROOT}/scripts/config/vlajepa_cotrain.yaml" \
+  "${EXTRA_TRAIN_ARGS[@]}"

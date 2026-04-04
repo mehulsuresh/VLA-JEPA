@@ -379,8 +379,10 @@ class VLA_JEPA(baseframework):
             has_actions = actions is not None
 
         input_ids = qwen_inputs["input_ids"]
-        action_indices = torch.isin(input_ids, self._action_token_ids_t).nonzero(as_tuple=True)
-        embodied_action_indices = torch.isin(input_ids, self._embodied_token_id_t).nonzero(as_tuple=True)
+        action_token_ids = self._action_token_ids_t.to(input_ids.device)
+        embodied_token_id = self._embodied_token_id_t.to(input_ids.device)
+        action_indices = torch.isin(input_ids, action_token_ids).nonzero(as_tuple=True)
+        embodied_action_indices = torch.isin(input_ids, embodied_token_id).nonzero(as_tuple=True)
         
         qwen_context = nullcontext() if self._qwen_requires_grad() else torch.no_grad()
         with qwen_context, torch.autocast("cuda", dtype=torch.bfloat16):

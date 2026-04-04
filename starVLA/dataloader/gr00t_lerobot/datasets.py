@@ -62,7 +62,18 @@ LE_ROBOT_INFO_FILENAME = "meta/info.json"
 LE_ROBOT_STATS_FILENAME = "meta/stats_gr00t.json"
 LE_ROBOT_DATA_FILENAME = "data/*/*.parquet"
 LE_ROBOT_STEPS_FILENAME = "meta/steps.pkl"
+LE_ROBOT3_TASKS_FILENAME = "meta/tasks.parquet"
+LE_ROBOT3_EPISODE_FILENAME = "meta/episodes/*/*.parquet"
 EPSILON = 5e-4
+
+
+def detect_lerobot_version(dataset_path: Path) -> str | None:
+    """Infer the LeRobot dataset format from version-specific metadata files."""
+    if (dataset_path / LE_ROBOT3_TASKS_FILENAME).exists():
+        return "v3.0"
+    if (dataset_path / LE_ROBOT_EPISODE_FILENAME).exists():
+        return "v2.0"
+    return None
 
 def calculate_dataset_statistics(parquet_paths: list[Path]) -> dict:
     """Calculate the dataset statistics of all columns for a list of parquet files."""
@@ -124,6 +135,8 @@ class LeRobotSingleDataset(Dataset):
         video_backend_kwargs: dict | None = None,
         transforms: ComposedModalityTransform | None = None,
         delete_pause_frame: bool = False,
+        data_cfg=None,
+        lerobot_version: str | None = None,
     ):
         """
         Initialize the dataset.
@@ -140,6 +153,17 @@ class LeRobotSingleDataset(Dataset):
         # first check if the path directory exists
         if not Path(dataset_path).exists():
             raise FileNotFoundError(f"Dataset path {dataset_path} does not exist")
+
+        self.data_cfg = data_cfg
+        detected_version = detect_lerobot_version(Path(dataset_path))
+        if lerobot_version is not None:
+            self._lerobot_version = lerobot_version
+        elif detected_version is not None:
+            self._lerobot_version = detected_version
+        elif data_cfg is not None and data_cfg.get("lerobot_version", None) is not None:
+            self._lerobot_version = str(data_cfg.get("lerobot_version"))
+        else:
+            self._lerobot_version = "v2.0"
 
         self.delete_pause_frame = delete_pause_frame
 
@@ -166,6 +190,7 @@ class LeRobotSingleDataset(Dataset):
         self._video_path_pattern = self._get_video_path_pattern()
         self._chunk_size = self._get_chunk_size()
         self._tasks = self._get_tasks()
+        self.trajectory_ids_to_metadata = {}
         self.curr_traj_data = None
         self.curr_traj_id = None
 
@@ -380,16 +405,51 @@ class LeRobotSingleDataset(Dataset):
 
     def _get_trajectories(self) -> tuple[np.ndarray, np.ndarray]:
         """Get the trajectories in the dataset."""
-        # Get trajectory lengths, IDs, and whitelist from dataset metadata
-        episode_path = self.dataset_path / LE_ROBOT_EPISODE_FILENAME
-        with open(episode_path, "r") as f:
-            episode_metadata = [json.loads(line) for line in f]
-        trajectory_ids = []
-        trajectory_lengths = []
-        for episode in episode_metadata:
-            trajectory_ids.append(episode["episode_index"])
-            trajectory_lengths.append(episode["length"])
-        return np.array(trajectory_ids), np.array(trajectory_lengths)
+        if self._lerobot_version == "v2.0":
+            episode_path = self.dataset_path / LE_ROBOT_EPISODE_FILENAME
+            with open(episode_path, "r") as f:
+                episode_metadata = [json.loads(line) for line in f]
+            trajectory_ids = []
+            trajectory_lengths = []
+            for episode in episode_metadata:
+                trajectory_ids.append(episode["episode_index"])
+                trajectory_lengths.append(episode["length"])
+            return np.array(trajectory_ids), np.array(trajectory_lengths)
+
+        if self._lerobot_version == "v3.0":
+            file_paths = sorted((self.dataset_path).glob(LE_ROBOT3_EPISODE_FILENAME))
+            trajectory_ids = []
+            trajectory_lengths = []
+            self.trajectory_ids_to_metadata = {}
+            for file_path in file_paths:
+                episodes_data = pd.read_parquet(file_path)
+                timestamp_cols = [
+                    c
+                    for c in episodes_data.columns
+                    if str(c).startswith("videos/") and str(c).endswith("/from_timestamp")
+                ]
+                for file_row_index, (_, episode) in enumerate(episodes_data.iterrows()):
+                    trajectory_id = int(episode["episode_index"])
+                    trajectory_ids.append(trajectory_id)
+                    trajectory_lengths.append(int(episode["length"]))
+
+                    from_timestamps = {}
+                    for col in timestamp_cols:
+                        value = episode[col]
+                        if pd.isna(value):
+                            continue
+                        video_key = str(col)[len("videos/") : -len("/from_timestamp")]
+                        from_timestamps[video_key] = float(value)
+
+                    self.trajectory_ids_to_metadata[trajectory_id] = {
+                        "data/chunk_index": int(episode["data/chunk_index"]),
+                        "data/file_index": int(episode["data/file_index"]),
+                        "data/file_from_index": int(file_row_index),
+                        "videos/from_timestamps": from_timestamps,
+                    }
+            return np.array(trajectory_ids), np.array(trajectory_lengths)
+
+        raise ValueError(f"Unsupported LeRobot version: {self._lerobot_version}")
 
     def _get_all_steps(self) -> list[tuple[int, int]]:
         """Get the trajectory IDs and base indices for all steps in the dataset.
@@ -458,6 +518,7 @@ class LeRobotSingleDataset(Dataset):
         config_dict = {
             "delete_pause_frame": self.delete_pause_frame,
             "dataset_name": self.dataset_name,
+            "lerobot_version": self._lerobot_version,
         }
         # Create a hash of the configuration
         config_str = str(sorted(config_dict.items()))
@@ -678,11 +739,24 @@ class LeRobotSingleDataset(Dataset):
 
     def _get_tasks(self) -> pd.DataFrame:
         """Get the tasks for the dataset."""
-        tasks_path = self.dataset_path / LE_ROBOT_TASKS_FILENAME
-        with open(tasks_path, "r") as f:
-            tasks = [json.loads(line) for line in f]
-        df = pd.DataFrame(tasks)
-        return df.set_index("task_index")
+        if self._lerobot_version == "v2.0":
+            tasks_path = self.dataset_path / LE_ROBOT_TASKS_FILENAME
+            with open(tasks_path, "r") as f:
+                tasks = [json.loads(line) for line in f]
+            df = pd.DataFrame(tasks)
+            return df.set_index("task_index")
+
+        if self._lerobot_version == "v3.0":
+            tasks_path = self.dataset_path / LE_ROBOT3_TASKS_FILENAME
+            df = pd.read_parquet(tasks_path)
+            if "task_index" in df.columns:
+                return df.set_index("task_index")
+            if "task" in df.columns:
+                df = df.reset_index().rename(columns={"index": "task_index"})
+                return df.set_index("task_index")
+            raise ValueError(f"Unexpected LeRobot v3 task schema in {tasks_path}: {list(df.columns)}")
+
+        raise ValueError(f"Unsupported LeRobot version: {self._lerobot_version}")
 
     def _check_integrity(self):
         """Use the config to check if the keys are valid and detect silent data corruption."""
@@ -797,13 +871,31 @@ class LeRobotSingleDataset(Dataset):
         """Get the data for a trajectory."""
         if self.curr_traj_id == trajectory_id and self.curr_traj_data is not None:
             return self.curr_traj_data
-        else:
+        if self._lerobot_version == "v2.0":
             chunk_index = self.get_episode_chunk(trajectory_id)
             parquet_path = self.dataset_path / self.data_path_pattern.format(
                 episode_chunk=chunk_index, episode_index=trajectory_id
             )
             assert parquet_path.exists(), f"Parquet file not found at {parquet_path}"
             return pd.read_parquet(parquet_path)
+        if self._lerobot_version == "v3.0":
+            return self.get_trajectory_data_lerobot_v3(trajectory_id)
+        raise ValueError(f"Unsupported LeRobot version: {self._lerobot_version}")
+
+    def get_trajectory_data_lerobot_v3(self, trajectory_id: int) -> pd.DataFrame:
+        """Get a single trajectory from a shared LeRobot v3 parquet shard."""
+        if self.curr_traj_id == trajectory_id and self.curr_traj_data is not None:
+            return self.curr_traj_data
+
+        episode_meta = self.trajectory_ids_to_metadata[trajectory_id]
+        parquet_path = self.dataset_path / self.data_path_pattern.format(
+            chunk_index=episode_meta["data/chunk_index"],
+            file_index=episode_meta["data/file_index"],
+        )
+        assert parquet_path.exists(), f"Parquet file not found at {parquet_path}"
+        file_data = pd.read_parquet(parquet_path)
+        # Reset to a dense 0..T-1 index so downstream step indexing stays positional.
+        return file_data.loc[file_data["episode_index"] == trajectory_id].reset_index(drop=True).copy()
 
     def get_trajectory_index(self, trajectory_id: int) -> int:
         """Get the index of the trajectory in the dataset by the trajectory ID.
@@ -825,6 +917,11 @@ class LeRobotSingleDataset(Dataset):
     def get_episode_chunk(self, ep_index: int) -> int:
         """Get the chunk index for an episode index."""
         return ep_index // self.chunk_size
+
+    def get_episode_file_index(self, ep_index: int) -> int:
+        """Get the data file index for a LeRobot v3 episode."""
+        episode_meta = self.trajectory_ids_to_metadata[ep_index]
+        return episode_meta["data/file_index"]
 
     def retrieve_data_and_pad(
         self,
@@ -878,9 +975,19 @@ class LeRobotSingleDataset(Dataset):
         original_key = self.lerobot_modality_meta.video[key].original_key
         if original_key is None:
             original_key = key
-        video_filename = self.video_path_pattern.format(
-            episode_chunk=chunk_index, episode_index=trajectory_id, video_key=original_key
-        )
+        if self._lerobot_version == "v2.0":
+            video_filename = self.video_path_pattern.format(
+                episode_chunk=chunk_index, episode_index=trajectory_id, video_key=original_key
+            )
+        elif self._lerobot_version == "v3.0":
+            episode_meta = self.trajectory_ids_to_metadata[trajectory_id]
+            video_filename = self.video_path_pattern.format(
+                video_key=original_key,
+                chunk_index=episode_meta["data/chunk_index"],
+                file_index=episode_meta["data/file_index"],
+            )
+        else:
+            raise ValueError(f"Unsupported LeRobot version: {self._lerobot_version}")
         return self.dataset_path / video_filename
 
     def get_video(
@@ -919,6 +1026,13 @@ class LeRobotSingleDataset(Dataset):
         timestamp: np.ndarray = self.curr_traj_data["timestamp"].to_numpy()
         # Get the corresponding video timestamps from the step indices
         video_timestamp = timestamp[step_indices]
+        if self._lerobot_version == "v3.0":
+            episode_meta = self.trajectory_ids_to_metadata.get(trajectory_id, {})
+            from_timestamps = episode_meta.get("videos/from_timestamps", {})
+            original_video_key = self.lerobot_modality_meta.video[key].original_key
+            if original_video_key is None:
+                original_video_key = key
+            video_timestamp = video_timestamp + float(from_timestamps.get(original_video_key, 0.0))
 
         return get_frames_by_timestamps(
             video_path.as_posix(),
