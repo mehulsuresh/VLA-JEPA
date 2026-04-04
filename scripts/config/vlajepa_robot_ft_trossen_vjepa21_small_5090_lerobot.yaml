@@ -60,8 +60,7 @@ framework:
 datasets:
   vla_data:
     dataset_py: lerobot_datasets
-    # Update this path to the local LeRobot export if it lives elsewhere.
-    data_root_dir: /home/mehul/work/reward_model_small/Subtask_dataset
+    data_root_dir: /home/mehul/work/reward_model_small/Subtask_dataset/subtask_labelled_combined
     data_mix: trossen_subtask_combined
     action_type: delta_qpos
     CoT_prompt: "Your task is {instruction}. Infer the temporal dynamics from frames {actions} and produce the corresponding policy actions {e_actions}."
@@ -122,6 +121,10 @@ trainer:
   compile_qwen_model: false
   compile_action_model: false
   compile_vj_predictor: false
+  compile_vj_encoder: false
+  compile_vj_encoder_dynamic: true
+  compile_full_model: true
+  compile_full_model_dynamic: false
   compile_mode: default
   compile_dynamic: true
   use_rabc: true
