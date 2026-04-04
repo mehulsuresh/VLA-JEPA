@@ -45,6 +45,36 @@ def _resolve_output_dir(cfg) -> Path | None:
     return None
 
 
+def _configure_lerobot_worker(worker_id: int, *, torch_threads: int, cv2_threads: int) -> None:
+    """
+    Keep each LeRobot dataloader worker close to single-threaded so we do not
+    accidentally multiply 20 workers into hundreds of native helper threads.
+    """
+    os.environ["OMP_NUM_THREADS"] = str(torch_threads)
+    os.environ["MKL_NUM_THREADS"] = str(torch_threads)
+    os.environ["OPENBLAS_NUM_THREADS"] = str(torch_threads)
+    os.environ["NUMEXPR_NUM_THREADS"] = str(torch_threads)
+
+    try:
+        torch.set_num_threads(torch_threads)
+    except Exception:
+        pass
+
+    try:
+        torch.set_num_interop_threads(1)
+    except Exception:
+        pass
+
+    try:
+        import cv2
+
+        cv2.setNumThreads(cv2_threads)
+        if hasattr(cv2, "ocl"):
+            cv2.ocl.setUseOpenCL(False)
+    except Exception:
+        pass
+
+
 
 def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe", model=None): # TODO now here only is get dataset, we need mv dataloader to here
 
@@ -75,6 +105,11 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe", model=None): # TODO
             loader_kwargs["prefetch_factor"] = max(2, int(vla_dataset_cfg.get("prefetch_factor", 2)))
             loader_kwargs["persistent_workers"] = bool(vla_dataset_cfg.get("persistent_workers", True))
             loader_kwargs["multiprocessing_context"] = vla_dataset_cfg.get("multiprocessing_context", "spawn")
+            loader_kwargs["worker_init_fn"] = partial(
+                _configure_lerobot_worker,
+                torch_threads=max(1, int(vla_dataset_cfg.get("worker_torch_threads", 1))),
+                cv2_threads=max(1, int(vla_dataset_cfg.get("worker_cv2_threads", 1))),
+            )
 
         vla_train_dataloader = DataLoader(**loader_kwargs)
         if not dist.is_initialized() or dist.get_rank() == 0:

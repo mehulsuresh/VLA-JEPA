@@ -17,6 +17,7 @@
 import av
 import cv2
 import numpy as np
+from functools import lru_cache
 
 import torch  # noqa: F401 # isort: skip
 import torchvision  # noqa: F401 # isort: skip
@@ -35,6 +36,22 @@ try:
     TORCHCODEC_AVAILABLE = True
 except (ImportError, RuntimeError):
     TORCHCODEC_AVAILABLE = False
+
+
+def _freeze_backend_kwargs(video_backend_kwargs: dict | None) -> tuple[tuple[str, object], ...]:
+    if not video_backend_kwargs:
+        return ()
+    return tuple(sorted(video_backend_kwargs.items()))
+
+
+@lru_cache(maxsize=512)
+def _get_decord_frame_timestamps(
+    video_path: str,
+    frozen_backend_kwargs: tuple[tuple[str, object], ...],
+) -> np.ndarray:
+    vr = decord.VideoReader(video_path, **dict(frozen_backend_kwargs))
+    num_frames = len(vr)
+    return vr.get_frame_timestamp(range(num_frames))
 
 
 def get_frames_by_indices(
@@ -90,9 +107,10 @@ def get_frames_by_timestamps(
         if not DECORD_AVAILABLE:
             raise ImportError("decord is not available.")
         vr = decord.VideoReader(video_path, **video_backend_kwargs)
-        num_frames = len(vr)
-        # Retrieve the timestamps for each frame in the video
-        frame_ts: np.ndarray = vr.get_frame_timestamp(range(num_frames))
+        frame_ts = _get_decord_frame_timestamps(
+            video_path,
+            _freeze_backend_kwargs(video_backend_kwargs),
+        )
         # Map each requested timestamp to the closest frame index
         # Only take the first element of the frame_ts array which corresponds to start_seconds
         indices = np.abs(frame_ts[:, :1] - timestamps).argmin(axis=0)

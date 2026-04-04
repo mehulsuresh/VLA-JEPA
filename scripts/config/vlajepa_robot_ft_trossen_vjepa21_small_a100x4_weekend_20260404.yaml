@@ -1,4 +1,4 @@
-run_id: robot_ft_trossen_vjepa21_small_a100x4_30ep
+run_id: robot_ft_trossen_vjepa21_small_a100x4_weekend_20260404
 run_root_dir: checkpoints
 seed: 42
 trackers:

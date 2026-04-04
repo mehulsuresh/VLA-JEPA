@@ -8,6 +8,7 @@ A lightweight implementation that Qwen-VL + Flow-matching head to directly predi
 Flow-matching header is copyright from GR00T N1.5,
 """
 from contextlib import nullcontext
+import importlib
 from pathlib import Path
 import time
 from typing import List, Optional, Tuple
@@ -139,6 +140,7 @@ class VLA_JEPA(baseframework):
             persistent=False,
         )
         self._qwen_grad_cache: Optional[bool] = None
+        self._vj_compile_prepared = False
         repeated_diffusion_steps = 4
         if self.config is not None:
             framework_action_cfg = self.config.get("framework", {}).get("action_model", {})
@@ -150,6 +152,71 @@ class VLA_JEPA(baseframework):
                 )
             )
         self._repeated_diffusion_steps = max(repeated_diffusion_steps, 1)
+
+    def prepare_vj_encoder_for_compile(self) -> int:
+        """
+        Make the frozen V-JEPA encoder more compile-friendly.
+
+        The upstream RoPE attention path builds token-position helpers on the fly.
+        Those helper methods tend to be dynamic-shape heavy and a poor target for
+        `torch.compile`, so we force just those subpaths back to eager mode while
+        leaving the main encoder forward compiled.
+        """
+        if self._vj_compile_prepared:
+            return 0
+
+        patched = 0
+        seen_modules: set[int] = set()
+
+        def _disable_bound_method(owner, method_name: str) -> bool:
+            method = getattr(owner, method_name, None)
+            if method is None or not callable(method):
+                return False
+            if getattr(method, "_starvla_compile_disabled", False):
+                return False
+            disabled = torch.compiler.disable(method)
+            disabled._starvla_compile_disabled = True
+            setattr(owner, method_name, disabled)
+            return True
+
+        blocks = getattr(self.vj_encoder, "blocks", None)
+        if blocks is not None:
+            for blk in blocks:
+                attn = getattr(blk, "attn", None)
+                if attn is None:
+                    continue
+                for helper_name in ("_get_frame_pos", "_get_height_pos", "separate_positions"):
+                    if _disable_bound_method(attn, helper_name):
+                        patched += 1
+
+                attn_module_name = type(attn).__module__
+                try:
+                    attn_module = importlib.import_module(attn_module_name)
+                except Exception:
+                    attn_module = None
+
+                if attn_module is None:
+                    continue
+
+                module_id = id(attn_module)
+                if module_id in seen_modules:
+                    continue
+                seen_modules.add(module_id)
+
+                rotate_fn = getattr(attn_module, "rotate_queries_or_keys", None)
+                if rotate_fn is not None and callable(rotate_fn):
+                    if not getattr(rotate_fn, "_starvla_compile_disabled", False):
+                        disabled_rotate = torch.compiler.disable(rotate_fn)
+                        disabled_rotate._starvla_compile_disabled = True
+                        setattr(attn_module, "rotate_queries_or_keys", disabled_rotate)
+                        patched += 1
+
+        self._vj_compile_prepared = True
+        logger.info(
+            "Prepared V-JEPA encoder for torch.compile by forcing %d RoPE helper subpaths to eager mode",
+            patched,
+        )
+        return patched
 
     def _load_vjepa_backbone(self, vj_cfg):
         source = vj_cfg.get("source", "hf")

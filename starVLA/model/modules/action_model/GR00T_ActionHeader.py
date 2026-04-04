@@ -257,6 +257,33 @@ class FlowmatchingActionHead(nn.Module):
         self.beta_dist = Beta(config.noise_beta_alpha, config.noise_beta_beta)
         self.num_timestep_buckets = config.num_timestep_buckets
         self.config = config
+        self._compile_prepared = False
+
+    def prepare_for_compile(self) -> int:
+        """
+        Make the action head more compile-friendly by keeping the stochastic
+        time-sampling and sinusoidal timestep helper on the eager path.
+        """
+        if self._compile_prepared:
+            return 0
+
+        patched = 0
+        for owner, method_name in (
+            (self, "sample_time"),
+            (self.action_encoder.pos_encoding, "forward"),
+        ):
+            method = getattr(owner, method_name, None)
+            if method is None or not callable(method):
+                continue
+            if getattr(method, "_starvla_compile_disabled", False):
+                continue
+            disabled = torch.compiler.disable(method)
+            disabled._starvla_compile_disabled = True
+            setattr(owner, method_name, disabled)
+            patched += 1
+
+        self._compile_prepared = True
+        return patched
 
     def sample_time(self, batch_size, device, dtype):
         sample = self.beta_dist.sample([batch_size]).to(device, dtype=dtype)

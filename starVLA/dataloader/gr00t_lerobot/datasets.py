@@ -831,7 +831,12 @@ class LeRobotSingleDataset(Dataset):
         
         return dict(action=action, image=images, language=language)
 
-    def get_step_data(self, trajectory_id: int, base_index: int) -> dict:
+    def get_step_data(
+        self,
+        trajectory_id: int,
+        base_index: int,
+        modalities: Sequence[str] | None = None,
+    ) -> dict:
         """Get the RAW data for a single step in a trajectory. No transforms are applied.
 
         Args:
@@ -860,8 +865,11 @@ class LeRobotSingleDataset(Dataset):
         data = {}
         # Get the data for all modalities
         self.curr_traj_data = self.get_trajectory_data(trajectory_id)
+        selected_modalities = list(self.modality_keys.keys()) if modalities is None else list(modalities)
         # TODO @JinhuiYE The logic below is poorly implemented. Data reading should be directly based on curr_traj_data.
-        for modality in self.modality_keys:
+        for modality in selected_modalities:
+            if modality not in self.modality_keys:
+                raise KeyError(f"Unknown modality `{modality}`. Available modalities: {list(self.modality_keys.keys())}")
             # Get the data corresponding to each key in the modality
             for key in self.modality_keys[modality]:
                 data[key] = self.get_data_by_modality(trajectory_id, modality, key, base_index)
@@ -1366,7 +1374,12 @@ class CachedLeRobotSingleDataset(LeRobotSingleDataset):
         absolute_indices = self.start_indices[trajectory_index] + step_indices
         return self.cached_frames[key][absolute_indices]
 
-    def get_step_data(self, trajectory_id: int, base_index: int) -> dict:
+    def get_step_data(
+        self,
+        trajectory_id: int,
+        base_index: int,
+        modalities: Sequence[str] | None = None,
+    ) -> dict:
         """Get the RAW data for a single step. No transforms are applied.
 
         Args:
@@ -1378,8 +1391,11 @@ class CachedLeRobotSingleDataset(LeRobotSingleDataset):
         """
         data = {}
         self.curr_traj_data = self.get_trajectory_data(trajectory_id)
+        selected_modalities = list(self.modality_keys.keys()) if modalities is None else list(modalities)
         # Get the data for all modalities
-        for modality in self.modality_keys:
+        for modality in selected_modalities:
+            if modality not in self.modality_keys:
+                raise KeyError(f"Unknown modality `{modality}`. Available modalities: {list(self.modality_keys.keys())}")
             # Get the data corresponding to each key in the modality
             for key in self.modality_keys[modality]:
                 data[key] = self.get_data_by_modality(trajectory_id, modality, key, base_index)
@@ -1404,6 +1420,24 @@ def safe_hash(input_tuple):
     seed = int(sha256.hexdigest(), 16)
 
     return seed & 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
+
+
+def apply_transforms_for_present_keys(transforms, data: dict) -> dict:
+    """Apply only the transforms whose declared keys are present in the sample.
+
+    This lets callers skip redundant video decoding while still applying state/action
+    normalization on partial samples.
+    """
+    if transforms is None:
+        return data
+    if isinstance(transforms, ComposedModalityTransform):
+        for transform in transforms.transforms:
+            apply_to = getattr(transform, "apply_to", None)
+            if apply_to and not all(key in data for key in apply_to):
+                continue
+            data = transform(data)
+        return data
+    return transforms(data)
 
 
 class MixtureSpecElement(BaseModel):
@@ -1739,20 +1773,22 @@ class LeRobotMixtureDataset(Dataset):
 
         context_horizon = video_horizon - self.video_target_shift_steps
         context_offsets = np.arange(-(context_horizon - 1), 1, dtype=np.int64) * self.video_frame_stride
-        target_offsets = context_offsets + (self.video_target_shift_steps * self.video_frame_stride)
+        union_offsets = np.arange(
+            -(context_horizon - 1),
+            self.video_target_shift_steps + 1,
+            dtype=np.int64,
+        ) * self.video_frame_stride
+        target_start = self.video_target_shift_steps
 
         videos, target_videos, images = [], [], []
         for video_key in dataset.modality_keys["video"]:
-            context_video = dataset.get_video_by_step_indices(
+            merged_video = dataset.get_video_by_step_indices(
                 trajectory_name,
                 video_key,
-                step + context_offsets,
+                step + union_offsets,
             )
-            target_video = dataset.get_video_by_step_indices(
-                trajectory_name,
-                video_key,
-                step + target_offsets,
-            )
+            context_video = merged_video[:context_horizon]
+            target_video = merged_video[target_start:]
             context_video = self.resize_video_opencv(context_video, self.video_resolution_size)
             target_video = self.resize_video_opencv(target_video, self.video_resolution_size)
             videos.append(context_video)
@@ -1778,12 +1814,18 @@ class LeRobotMixtureDataset(Dataset):
         for attempt in range(max_retries):
             try:
                 dataset, trajectory_name, step = self.sample_step(index)
-                data = dataset.transforms(dataset.get_step_data(trajectory_name, step))    # video T = 1, action T = horizon
-                
-                video_horizon = int(data[dataset.modality_keys["video"][0]].shape[0])
 
                 # Process all video keys dynamically.
                 if self.video_target_shift_steps > 0:
+                    non_video_modalities = [
+                        modality for modality in ("state", "action", "language")
+                        if modality in dataset.modality_keys
+                    ]
+                    data = apply_transforms_for_present_keys(
+                        dataset.transforms,
+                        dataset.get_step_data(trajectory_name, step, modalities=non_video_modalities),
+                    )
+                    video_horizon = len(dataset.delta_indices[dataset.modality_keys["video"][0]])
                     videos, target_videos, images = self._build_shifted_video_views(
                         dataset,
                         trajectory_name,
@@ -1791,6 +1833,7 @@ class LeRobotMixtureDataset(Dataset):
                         video_horizon=video_horizon,
                     )
                 else:
+                    data = dataset.transforms(dataset.get_step_data(trajectory_name, step))    # video T = 1, action T = horizon
                     videos, target_videos, images = [], [], []
                     for video_key in dataset.modality_keys["video"]:
                         video = data[video_key] # Shape: (T, H, W, C)

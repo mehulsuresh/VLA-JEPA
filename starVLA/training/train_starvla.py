@@ -75,7 +75,6 @@ from transformers import AutoProcessor, get_scheduler
 
 # Local Modules
 from starVLA.training.trainer_utils.trainer_tools import normalize_dotlist_args
-from starVLA.model.framework import build_framework
 from starVLA.training.trainer_utils.trainer_tools import TrainerUtils
 from starVLA.training.trainer_utils.trainer_tools import build_param_lr_groups
 
@@ -422,6 +421,8 @@ def setup_directories(cfg) -> Path:
 
 def build_model(cfg) -> torch.nn.Module:
     """build model framework"""
+    from starVLA.model.framework import build_framework
+
     logger.info(f"Loading Base VLM `{cfg.framework.qwenvl.base_vlm}` from ID/Path")
     model = build_framework(cfg)
 
@@ -460,6 +461,8 @@ def build_model(cfg) -> torch.nn.Module:
 
         if trainer_cfg.get("compile_action_model", False):
             try:
+                if hasattr(model.action_model, "prepare_for_compile"):
+                    model.action_model.prepare_for_compile()
                 action_dynamic = _resolve_compile_dynamic(
                     trainer_cfg,
                     "compile_action_model_dynamic",
@@ -476,6 +479,8 @@ def build_model(cfg) -> torch.nn.Module:
 
         if trainer_cfg.get("compile_vj_predictor", False):
             try:
+                if hasattr(model.vj_predictor, "prepare_for_compile"):
+                    model.vj_predictor.prepare_for_compile()
                 vj_dynamic = _resolve_compile_dynamic(
                     trainer_cfg,
                     "compile_vj_predictor_dynamic",
@@ -492,6 +497,8 @@ def build_model(cfg) -> torch.nn.Module:
 
         if trainer_cfg.get("compile_vj_encoder", False):
             try:
+                if hasattr(model, "prepare_vj_encoder_for_compile"):
+                    model.prepare_vj_encoder_for_compile()
                 vj_encoder_dynamic = _resolve_compile_dynamic(
                     trainer_cfg,
                     "compile_vj_encoder_dynamic",
@@ -534,12 +541,10 @@ def build_model(cfg) -> torch.nn.Module:
     return model
 
 
-# here changes need to 📦 encapsulate Dataloader
-from starVLA.dataloader import build_dataloader
-
-
 def prepare_data(cfg, accelerator, output_dir, model=None) -> Tuple[DataLoader, DataLoader]:
     """prepare training data"""
+    from starVLA.dataloader import build_dataloader
+
     # VLA data loader
     dataset_py = cfg.datasets.vla_data.dataset_py
     if "data_mix" in cfg.datasets.vla_data:
@@ -590,6 +595,26 @@ def _find_sampler(obj, visited: set[int] | None = None):
             return nested_sampler
 
     return None
+
+
+def _summarize_batch_structure(batch) -> str:
+    if isinstance(batch, torch.Tensor):
+        return f"Tensor(shape={tuple(batch.shape)}, dtype={batch.dtype}, device={batch.device})"
+    if isinstance(batch, Mapping):
+        parts = []
+        for key, value in batch.items():
+            if isinstance(value, torch.Tensor):
+                parts.append(f"{key}:Tensor{tuple(value.shape)}")
+            elif isinstance(value, np.ndarray):
+                parts.append(f"{key}:ndarray{value.shape}")
+            elif isinstance(value, list):
+                parts.append(f"{key}:list(len={len(value)})")
+            else:
+                parts.append(f"{key}:{type(value).__name__}")
+        return "{" + ", ".join(parts) + "}"
+    if isinstance(batch, Sequence) and not isinstance(batch, (str, bytes)):
+        return f"{type(batch).__name__}(len={len(batch)})"
+    return type(batch).__name__
 
 
 def _shutdown_dataloader_iterator(iterator) -> None:
@@ -788,6 +813,8 @@ class VLATrainer(TrainerUtils):
         rank = dist.get_rank() if dist.is_initialized() else 0
         seed = self.config.seed + rank if hasattr(self.config, "seed") else rank + 3047
         set_seed(seed)
+        if self.accelerator.is_main_process:
+            logger.info("Step 0 debug: entered prepare_training")
 
         trackers = resolve_trackers(self.config)
         if trackers:
@@ -818,6 +845,8 @@ class VLATrainer(TrainerUtils):
         self.print_trainable_parameters(self.model)
 
         # initialize distributed training components
+        if self.accelerator.is_main_process:
+            logger.info("Step 0 debug: calling accelerator.prepare")
         self.model, self.optimizer, self.vla_train_dataloader = self.setup_distributed_training(
             self.accelerator,  # must be the first param
             self.model,
@@ -825,10 +854,16 @@ class VLATrainer(TrainerUtils):
             self.vla_train_dataloader,
             # self.vlm_train_dataloader
         )
+        if self.accelerator.is_main_process:
+            logger.info("Step 0 debug: accelerator.prepare returned")
         self._validate_prepared_dataloader()
+        if self.accelerator.is_main_process:
+            logger.info("Step 0 debug: prepared dataloader validated")
 
         #self._init_wandb()
         self._init_checkpointing()
+        if self.accelerator.is_main_process:
+            logger.info("Step 0 debug: checkpointing initialized")
 
     def _calculate_total_batch_size(self):
         """calculate global batch size"""
@@ -1017,6 +1052,8 @@ class VLATrainer(TrainerUtils):
 
     def _get_next_batch(self):
         """get next batch (automatically handle data loop)"""
+        if self.completed_steps == 0 and self.accelerator.is_main_process:
+            logger.info("Step 0 debug: fetching first training batch")
         try:
             batch_vla = next(self.vla_iter)
         except StopIteration:
@@ -1024,6 +1061,8 @@ class VLATrainer(TrainerUtils):
                 self.vla_train_dataloader, self.vla_epoch_count
             )
             batch_vla = next(self.vla_iter)
+        if self.completed_steps == 0 and self.accelerator.is_main_process:
+            logger.info(f"Step 0 debug: fetched first training batch { _summarize_batch_structure(batch_vla) }")
 
         return batch_vla
 
@@ -1046,6 +1085,8 @@ class VLATrainer(TrainerUtils):
 
     def train(self):
         """execute training loop"""
+        if self.accelerator.is_main_process:
+            logger.info("Step 0 debug: entered train()")
         # print training config
         self._log_training_config()
 
@@ -1307,15 +1348,23 @@ class VLATrainer(TrainerUtils):
         with self.accelerator.accumulate(self.model):
             rabc_weights, rabc_stats = self._compute_rabc_weights(batch_vla)
             # VLA task forward propagation
+            if self.completed_steps == 0 and self.accelerator.is_main_process:
+                logger.info("Step 0 debug: starting model.forward")
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 output_dict = self.model.forward(batch_vla, rabc_weights=rabc_weights)
                 total_loss = (
                     output_dict.get("action_loss", 0.0) * self.action_loss_scale
                     + output_dict.get("wm_loss", 0.0) * self.wm_loss_scale
                 )
+            if self.completed_steps == 0 and self.accelerator.is_main_process:
+                logger.info("Step 0 debug: finished model.forward")
 
             # VLA backward propagation
+            if self.completed_steps == 0 and self.accelerator.is_main_process:
+                logger.info("Step 0 debug: starting backward")
             self.accelerator.backward(total_loss)
+            if self.completed_steps == 0 and self.accelerator.is_main_process:
+                logger.info("Step 0 debug: finished backward")
 
             # gradient clipping
             grad_norm = None

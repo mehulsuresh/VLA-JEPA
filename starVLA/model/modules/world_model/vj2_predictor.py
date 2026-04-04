@@ -5,6 +5,7 @@
 
 import math
 from functools import partial
+import importlib
 
 import torch
 import torch.nn as nn
@@ -121,6 +122,63 @@ class VisionTransformerPredictorAC(nn.Module):
             self.register_buffer("attn_mask", attn_mask, persistent=False)
         else:
             self.attn_mask = None
+        self._compile_prepared = False
+
+    def prepare_for_compile(self) -> int:
+        """
+        Make the AC predictor more compile-friendly by forcing the dynamic RoPE
+        position helpers back to eager mode while leaving the main predictor path
+        available for torch.compile.
+        """
+        if self._compile_prepared:
+            return 0
+
+        patched = 0
+        seen_modules: set[int] = set()
+
+        def _disable_bound_method(owner, method_name: str) -> bool:
+            method = getattr(owner, method_name, None)
+            if method is None or not callable(method):
+                return False
+            if getattr(method, "_starvla_compile_disabled", False):
+                return False
+            disabled = torch.compiler.disable(method)
+            disabled._starvla_compile_disabled = True
+            setattr(owner, method_name, disabled)
+            return True
+
+        for blk in self.predictor_blocks:
+            attn = getattr(blk, "attn", None)
+            if attn is None:
+                continue
+            for helper_name in ("_get_frame_pos", "_get_height_pos", "separate_positions"):
+                if _disable_bound_method(attn, helper_name):
+                    patched += 1
+
+            attn_module_name = type(attn).__module__
+            try:
+                attn_module = importlib.import_module(attn_module_name)
+            except Exception:
+                attn_module = None
+
+            if attn_module is None:
+                continue
+
+            module_id = id(attn_module)
+            if module_id in seen_modules:
+                continue
+            seen_modules.add(module_id)
+
+            rotate_fn = getattr(attn_module, "rotate_queries_or_keys", None)
+            if rotate_fn is not None and callable(rotate_fn):
+                if not getattr(rotate_fn, "_starvla_compile_disabled", False):
+                    disabled_rotate = torch.compiler.disable(rotate_fn)
+                    disabled_rotate._starvla_compile_disabled = True
+                    setattr(attn_module, "rotate_queries_or_keys", disabled_rotate)
+                    patched += 1
+
+        self._compile_prepared = True
+        return patched
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
