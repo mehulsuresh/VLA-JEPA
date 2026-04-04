@@ -105,6 +105,8 @@ def get_vla_dataset(
         with_state=data_cfg.get("with_state", False),
         resolution_size=data_cfg.get("resolution_size", 224),
         video_resolution_size=data_cfg.get("video_resolution_size", 256),
+        video_frame_stride=video_frame_stride,
+        video_target_shift_steps=data_cfg.get("video_target_shift_steps", 0),
         seed=seed,
         **kwargs,
     )
