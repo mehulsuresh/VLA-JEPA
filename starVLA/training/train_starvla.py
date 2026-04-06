@@ -15,6 +15,7 @@ warnings.filterwarnings("ignore")
 
 # Standard Library
 import argparse
+import ctypes
 import gc
 import math
 import json
@@ -634,6 +635,49 @@ def _shutdown_dataloader_workers(dataloader) -> None:
     _shutdown_dataloader_iterator(getattr(dataloader, "_iterator", None))
 
 
+def _drop_file_cache_best_effort(path: str) -> None:
+    posix_fadvise = getattr(os, "posix_fadvise", None)
+    dontneed_flag = getattr(os, "POSIX_FADV_DONTNEED", None)
+    if posix_fadvise is None or dontneed_flag is None:
+        return
+
+    try:
+        for root, _, filenames in os.walk(path):
+            for filename in filenames:
+                file_path = os.path.join(root, filename)
+                try:
+                    fd = os.open(file_path, os.O_RDONLY)
+                except OSError:
+                    continue
+                try:
+                    file_size = os.fstat(fd).st_size
+                    posix_fadvise(fd, 0, file_size, dontneed_flag)
+                except OSError:
+                    pass
+                finally:
+                    os.close(fd)
+    except Exception as exc:
+        logger.warning(f"Unable to release checkpoint file cache for `{path}`: {exc}")
+
+
+def _trim_process_memory_best_effort() -> None:
+    gc.collect()
+
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+    try:
+        libc = ctypes.CDLL("libc.so.6")
+        malloc_trim = getattr(libc, "malloc_trim", None)
+        if malloc_trim is not None:
+            malloc_trim(0)
+    except Exception:
+        pass
+
+
 def _raw_dataloader_batches_per_rank(vla_train_dataloader, num_processes: int) -> int:
     raw_batches = len(vla_train_dataloader)
     sampler = _find_sampler(vla_train_dataloader)
@@ -946,9 +990,12 @@ class VLATrainer(TrainerUtils):
         os.makedirs(checkpoint_path, exist_ok=True)
         self.accelerator.save_state(checkpoint_path)
         if self.accelerator.is_main_process:
-            # save plain model weights alongside the full accelerator state for convenience
-            state_dict = self.accelerator.get_state_dict(self.model)
-            torch.save(state_dict, os.path.join(checkpoint_path, "pytorch_model.pt"))
+            if bool(self.config.trainer.get("save_plain_weights_in_checkpoints", False)):
+                # Optional convenience artifact. Disabled by default because gathering and
+                # serializing a second full copy of the model can create a large rank-0
+                # memory spike during periodic checkpoint saves.
+                state_dict = self.accelerator.get_state_dict(self.model)
+                torch.save(state_dict, os.path.join(checkpoint_path, "pytorch_model.pt"))
 
             trainer_state = {
                 "completed_steps": self.completed_steps,
@@ -965,7 +1012,14 @@ class VLATrainer(TrainerUtils):
             }
             with open(os.path.join(self.config.output_dir, "summary.jsonl"), "a") as f:
                 f.write(json.dumps(summary_data) + "\n")
+
+            if bool(self.config.trainer.get("drop_checkpoint_page_cache", True)):
+                _drop_file_cache_best_effort(checkpoint_path)
+
             self.accelerator.print(f"✅ Checkpoint saved at {checkpoint_path}")
+
+        if bool(self.config.trainer.get("trim_process_memory_after_checkpoint", True)):
+            _trim_process_memory_best_effort()
         distributed_wait(self.accelerator)
 
     def _should_save_checkpoint(self, step_metrics: dict) -> bool:
@@ -1192,14 +1246,11 @@ class VLATrainer(TrainerUtils):
                     num_ddim_steps=20,
                 )
         else:
-            batch_images = [example["image"] for example in examples]
-            instructions = [example["lang"] for example in examples]
             actions = [example["action"] for example in examples]
             state = [example["state"] for example in examples] if "state" in examples[0] else None
             with torch.no_grad():
                 output_dict = infer_model.predict_action(
-                    batch_images=batch_images,
-                    instructions=instructions,
+                    batch=examples,
                     state=state,
                     use_ddim=True,
                     num_ddim_steps=20,
@@ -1396,7 +1447,11 @@ class VLATrainer(TrainerUtils):
             final_checkpoint = os.path.join(self.config.output_dir, "final_model")
             os.makedirs(final_checkpoint, exist_ok=True)
             torch.save(state_dict, os.path.join(final_checkpoint, "pytorch_model.pt"))
+            if bool(self.config.trainer.get("drop_checkpoint_page_cache", True)):
+                _drop_file_cache_best_effort(final_checkpoint)
             logger.info(f"Training complete. Final model saved at {final_checkpoint}")
+        if bool(self.config.trainer.get("trim_process_memory_after_checkpoint", True)):
+            _trim_process_memory_best_effort()
         self._shutdown_data_runtime()
         distributed_wait(self.accelerator)
         finish_trackers(self.accelerator)

@@ -8,6 +8,7 @@ A lightweight implementation that Qwen-VL + Flow-matching head to directly predi
 Flow-matching header is copyright from GR00T N1.5,
 """
 from contextlib import nullcontext
+from functools import lru_cache
 import importlib
 from pathlib import Path
 import time
@@ -29,6 +30,14 @@ from starVLA.model.modules.world_model.vj2_predictor import VisionTransformerPre
 from starVLA.training.trainer_utils.trainer_tools import resize_images
 from starVLA.model.tools import FRAMEWORK_REGISTRY
 
+try:
+    import decord
+
+    DECORD_AVAILABLE = True
+except ImportError:
+    decord = None
+    DECORD_AVAILABLE = False
+
 
 def _clean_vjepa_backbone_key(state_dict):
     cleaned = {}
@@ -37,6 +46,33 @@ def _clean_vjepa_backbone_key(state_dict):
         key = key.replace("backbone.", "")
         cleaned[key] = value
     return cleaned
+
+
+@lru_cache(maxsize=64)
+def _get_rank_cpu_video_reader(video_path: str, num_threads: int):
+    if not DECORD_AVAILABLE:
+        raise ImportError("decord is not available.")
+    return decord.VideoReader(video_path, ctx=decord.cpu(0), num_threads=num_threads)
+
+
+@lru_cache(maxsize=16)
+def _get_rank_gpu_video_reader(video_path: str, device_index: int, num_threads: int):
+    if not DECORD_AVAILABLE:
+        raise ImportError("decord is not available.")
+    return decord.VideoReader(video_path, ctx=decord.gpu(device_index), num_threads=num_threads)
+
+
+@lru_cache(maxsize=256)
+def _get_rank_video_frame_timestamps(
+    video_path: str,
+    device_index: int,
+    num_threads: int,
+) -> np.ndarray:
+    if device_index >= 0:
+        reader = _get_rank_gpu_video_reader(video_path, device_index, num_threads)
+    else:
+        reader = _get_rank_cpu_video_reader(video_path, num_threads)
+    return reader.get_frame_timestamp(range(len(reader)))
 
 @FRAMEWORK_REGISTRY.register("VLA_JEPA")
 class VLA_JEPA(baseframework):
@@ -344,6 +380,167 @@ class VLA_JEPA(baseframework):
             prompt_template=self.config.datasets.video_data.get("CoT_prompt", ""),
         )
 
+    def _build_qwen_inputs_from_video_tensor(
+        self,
+        batch_videos: np.ndarray | torch.Tensor,
+        instructions: List[str],
+        has_actions: bool,
+        prompt_replace_dict: Optional[dict[str, str]] = None,
+        prompt_template: Optional[str] = None,
+    ) -> dict[str, torch.Tensor]:
+        qwen_device = self._get_qwen_device()
+        if isinstance(batch_videos, np.ndarray):
+            frames = torch.from_numpy(np.ascontiguousarray(batch_videos[:, :, -1]))
+        else:
+            frames = batch_videos[:, :, -1]
+
+        frames = frames.to(qwen_device, dtype=torch.float32, non_blocking=True)
+        B, V, C, H, W = frames.shape
+        target_size = int(self.config.datasets.vla_data.get("resolution_size", H))
+        if H != target_size or W != target_size:
+            frames = F.interpolate(
+                frames.reshape(B * V, C, H, W),
+                size=(target_size, target_size),
+                mode="bilinear",
+                align_corners=False,
+            ).reshape(B, V, C, target_size, target_size)
+        frames = frames.clamp_(0, 255).round_().to(torch.uint8)
+        image_batches = [
+            [frames[b, v].permute(1, 2, 0).contiguous() for v in range(V)]
+            for b in range(B)
+        ]
+
+        if prompt_replace_dict is None:
+            if has_actions:
+                prompt_replace_dict = {
+                    "{actions}": self.replace_prompt,
+                    "{e_actions}": self.embodied_replace_prompt,
+                }
+            else:
+                prompt_replace_dict = {"{actions}": self.replace_prompt}
+        if prompt_template is None:
+            prompt_template = (
+                self.config.datasets.vla_data.get("CoT_prompt", "")
+                if has_actions
+                else self.config.datasets.video_data.get("CoT_prompt", "")
+            )
+
+        return self.qwen_vl_interface.build_qwenvl_inputs(
+            images=image_batches,
+            instructions=instructions,
+            prompt_replace_dict=prompt_replace_dict,
+            prompt_template=prompt_template,
+        )
+
+    def _split_compact_videos(
+        self,
+        batch_compact_videos: np.ndarray | torch.Tensor,
+    ) -> tuple[np.ndarray | torch.Tensor, Optional[np.ndarray | torch.Tensor]]:
+        shift = int(self.config.datasets.vla_data.get("video_target_shift_steps", 0))
+        if shift <= 0:
+            return batch_compact_videos, None
+
+        total_frames = batch_compact_videos.shape[2]
+        context_horizon = total_frames - shift
+        if context_horizon <= 0:
+            raise ValueError(
+                f"Compact video clip has invalid temporal length {total_frames} for shift {shift}"
+            )
+        return batch_compact_videos[:, :, :context_horizon], batch_compact_videos[:, :, shift:]
+
+    def _decode_video_specs(
+        self,
+        examples: List[dict],
+        spec_key: str,
+    ) -> torch.Tensor:
+        if not DECORD_AVAILABLE:
+            raise ImportError("CUDA-enabled decord is required for rank-side GPU video decoding.")
+
+        decode_threads = max(1, int(self.config.datasets.vla_data.get("video_backend_num_threads", 1)))
+        target_size = int(
+            self.config.datasets.vla_data.get(
+                "video_resolution_size",
+                self.config.datasets.vla_data.get("resolution_size", 224),
+            )
+        )
+        encoder_device = next(self.vj_encoder.parameters()).device
+        batch_videos = []
+
+        for example in examples:
+            view_videos = []
+            for spec in example[spec_key]:
+                video_path = spec["video_path"]
+                if "frame_indices" in spec:
+                    frame_indices = np.asarray(spec["frame_indices"], dtype=np.int64).tolist()
+                else:
+                    timestamps = np.asarray(spec["timestamps"], dtype=np.float64)
+                    decode_device_index = int(encoder_device.index or 0) if encoder_device.type == "cuda" else -1
+                    frame_ts = _get_rank_video_frame_timestamps(
+                        video_path,
+                        decode_device_index,
+                        decode_threads,
+                    )[:, :1]
+                    frame_indices = np.abs(frame_ts - timestamps).argmin(axis=0).astype(np.int64).tolist()
+
+                if encoder_device.type == "cuda":
+                    decode_device_index = int(encoder_device.index or 0)
+                    reader = _get_rank_gpu_video_reader(
+                        video_path, decode_device_index, decode_threads
+                    )
+                    frames = reader.get_batch(frame_indices)
+                    frames = torch.utils.dlpack.from_dlpack(frames.to_dlpack())
+                else:
+                    reader = _get_rank_cpu_video_reader(video_path, decode_threads)
+                    frames = torch.from_numpy(reader.get_batch(frame_indices).asnumpy())
+
+                frames = frames.to(encoder_device, non_blocking=True)
+                frames = frames.permute(0, 3, 1, 2).contiguous()
+                _, _, H, W = frames.shape
+                if H != target_size or W != target_size:
+                    frames = F.interpolate(
+                        frames.to(dtype=torch.float32),
+                        size=(target_size, target_size),
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+                    frames = frames.clamp_(0, 255).round_().to(torch.uint8)
+                elif frames.dtype != torch.uint8:
+                    frames = frames.to(torch.uint8)
+                view_videos.append(frames)
+
+            if len(view_videos) == 1:
+                view_videos.append(view_videos[0].clone())
+            batch_videos.append(torch.stack(view_videos, dim=0))
+
+        return torch.stack(batch_videos, dim=0)
+
+    def _extract_training_videos(
+        self,
+        examples: List[dict] | dict,
+    ) -> tuple[np.ndarray | torch.Tensor, Optional[np.ndarray | torch.Tensor]]:
+        if isinstance(examples, dict):
+            batch_compact_videos = examples.get("video_compact")
+            if batch_compact_videos is not None:
+                return self._split_compact_videos(batch_compact_videos)
+            return examples["video"], examples.get("video_target")
+
+        if "video_compact_decode_specs" in examples[0]:
+            batch_compact_videos = self._decode_video_specs(examples, "video_compact_decode_specs")
+            return self._split_compact_videos(batch_compact_videos)
+
+        if "video_decode_specs" in examples[0]:
+            return self._decode_video_specs(examples, "video_decode_specs"), None
+
+        if "video_compact" in examples[0]:
+            batch_compact_videos = np.stack([example["video_compact"] for example in examples]).transpose(0, 1, 2, 5, 3, 4)
+            return self._split_compact_videos(batch_compact_videos)
+
+        batch_videos = np.stack([example["video"] for example in examples]).transpose(0, 1, 2, 5, 3, 4)
+        batch_target_videos = None
+        if "video_target" in examples[0]:
+            batch_target_videos = np.stack([example["video_target"] for example in examples]).transpose(0, 1, 2, 5, 3, 4)
+        return batch_videos, batch_target_videos
+
     def _encode_videos(self, batch_videos: np.ndarray | torch.Tensor, device: torch.device) -> torch.Tensor:
         """
         Encode multi-view videos into patch tokens.
@@ -428,21 +625,29 @@ class VLA_JEPA(baseframework):
         rabc_weights: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Tuple:
+        batch_videos, batch_target_videos = self._extract_training_videos(examples)
         if isinstance(examples, dict):
-            batch_videos = examples["video"]
-            batch_target_videos = examples.get("video_target")
             actions = examples.get("action")
             state = examples.get("state")
-            qwen_inputs = self._move_qwen_inputs(examples["qwen_inputs"])
+            if "qwen_inputs" in examples:
+                qwen_inputs = self._move_qwen_inputs(examples["qwen_inputs"])
+            else:
+                instructions = list(examples["lang"])
+                qwen_inputs = self._build_qwen_inputs_from_video_tensor(
+                    batch_videos=batch_videos,
+                    instructions=instructions,
+                    has_actions=actions is not None,
+                )
             has_actions = actions is not None
         else:
-            batch_videos = np.stack([example["video"] for example in examples]).transpose(0, 1, 2, 5, 3, 4)
-            batch_target_videos = None
-            if "video_target" in examples[0]:
-                batch_target_videos = np.stack([example["video_target"] for example in examples]).transpose(0, 1, 2, 5, 3, 4)
             actions = [example["action"] for example in examples] if "action" in examples[0] else None
             state = [example["state"] for example in examples] if "state" in examples[0] else None
-            qwen_inputs = self._build_qwen_inputs_from_examples(examples)
+            instructions = [example["lang"] for example in examples]
+            qwen_inputs = self._build_qwen_inputs_from_video_tensor(
+                batch_videos=batch_videos,
+                instructions=instructions,
+                has_actions=actions is not None,
+            )
             has_actions = actions is not None
 
         input_ids = qwen_inputs["input_ids"]
@@ -537,7 +742,7 @@ class VLA_JEPA(baseframework):
         batch_images: Optional[List[List[Image.Image]]] = None,
         instructions: Optional[List[str]] = None,
         state: Optional[np.ndarray] = None,
-        batch: Optional[dict] = None,
+        batch: Optional[dict | List[dict]] = None,
         **kwargs: str,
     ) -> np.ndarray:
         """
@@ -553,9 +758,41 @@ class VLA_JEPA(baseframework):
             dict with normalized_actions [B, T, action_dim] and embodied_action_tokens.
         """
         if batch is not None:
-            qwen_inputs = self._move_qwen_inputs(batch["qwen_inputs"])
-            if state is None:
-                state = batch.get("state")
+            if isinstance(batch, dict):
+                qwen_inputs = self._move_qwen_inputs(batch["qwen_inputs"])
+                if state is None:
+                    state = batch.get("state")
+            else:
+                if state is None and "state" in batch[0]:
+                    state = [example["state"] for example in batch]
+                instructions = [example["lang"] for example in batch]
+                if (
+                    "video_decode_specs" in batch[0]
+                    or "video_compact_decode_specs" in batch[0]
+                    or "video" in batch[0]
+                    or "video_compact" in batch[0]
+                ):
+                    batch_videos, _ = self._extract_training_videos(batch)
+                    qwen_inputs = self._build_qwen_inputs_from_video_tensor(
+                        batch_videos=batch_videos,
+                        instructions=instructions,
+                        has_actions=False,
+                        prompt_replace_dict={
+                            "{actions}": self.replace_prompt,
+                            "{e_actions}": self.embodied_replace_prompt,
+                        },
+                        prompt_template=self.config.datasets.vla_data.get("CoT_prompt", ""),
+                    )
+                else:
+                    batch_images = [example["image"] for example in batch]
+                    qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(
+                        images=batch_images,
+                        instructions=instructions,
+                        prompt_replace_dict={
+                            "{actions}": self.replace_prompt,
+                            "{e_actions}": self.embodied_replace_prompt,
+                        },
+                    )
         else:
             train_obs_image_size = getattr(self.config.datasets.vla_data, "image_size", None)
             if train_obs_image_size:

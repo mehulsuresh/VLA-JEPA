@@ -1,5 +1,6 @@
 import json
 import os
+import signal
 from accelerate.logging import get_logger
 from functools import partial
 import torch
@@ -49,7 +50,21 @@ def _configure_lerobot_worker(worker_id: int, *, torch_threads: int, cv2_threads
     """
     Keep each LeRobot dataloader worker close to single-threaded so we do not
     accidentally multiply 20 workers into hundreds of native helper threads.
+    Also ask Linux to terminate the worker if its training-rank parent dies, so
+    failed runs do not leave multi-GB orphan workers behind.
     """
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        PR_SET_PDEATHSIG = 1
+        if libc.prctl(PR_SET_PDEATHSIG, signal.SIGTERM, 0, 0, 0) != 0:
+            logger.warning(
+                "Unable to install worker parent-death signal; orphaned workers may survive rank crashes"
+            )
+    except Exception:
+        pass
+
     os.environ["OMP_NUM_THREADS"] = str(torch_threads)
     os.environ["MKL_NUM_THREADS"] = str(torch_threads)
     os.environ["OPENBLAS_NUM_THREADS"] = str(torch_threads)
@@ -91,6 +106,11 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe", model=None): # TODO
             video_horizon=cfg.framework.vj2_model.num_frames,
             video_frame_stride=vla_dataset_cfg.get("video_frame_stride", 1),
         )
+        if bool(vla_dataset_cfg.get("gpu_video_decode_on_rank", False)):
+            logger.info(
+                "LeRobot dataloader will hand off video decode specs to each training rank; "
+                "video frames are decoded on the rank device instead of inside dataloader workers"
+            )
 
         loader_kwargs = dict(
             dataset=vla_dataset,

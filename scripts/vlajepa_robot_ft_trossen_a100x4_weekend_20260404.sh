@@ -18,6 +18,71 @@ print(":".join(filtered))
 PY
 }
 
+cleanup_stale_training_sidecars() {
+  python3 - <<'PY'
+import os
+import signal
+import subprocess
+import time
+
+ENV_PYTHON = os.path.expanduser("~/miniconda3/envs/vla-jepa-vjepa21/bin/python")
+patterns = ("from multiprocessing.spawn import spawn_main", "from multiprocessing.resource_tracker import main")
+
+def list_stale_pids():
+    output = subprocess.check_output(
+        ["ps", "-eo", "pid=,ppid=,cmd="],
+        text=True,
+    )
+    stale = []
+    for line in output.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split(None, 2)
+        if len(parts) < 3:
+            continue
+        pid_s, ppid_s, cmd = parts
+        try:
+            pid = int(pid_s)
+            ppid = int(ppid_s)
+        except ValueError:
+            continue
+        if ppid != 1:
+            continue
+        if ENV_PYTHON not in cmd:
+            continue
+        if not any(pattern in cmd for pattern in patterns):
+            continue
+        stale.append(pid)
+    return stale
+
+stale = list_stale_pids()
+if not stale:
+    raise SystemExit(0)
+
+print(f"Cleaning up stale multiprocessing sidecars: {stale}", flush=True)
+for pid in stale:
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+
+deadline = time.time() + 5.0
+while time.time() < deadline:
+    remaining = [pid for pid in stale if os.path.exists(f"/proc/{pid}")]
+    if not remaining:
+        raise SystemExit(0)
+    time.sleep(0.2)
+
+for pid in stale:
+    if os.path.exists(f"/proc/{pid}"):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+PY
+}
+
 DEFAULT_SOCKET_IFNAME="${DEFAULT_SOCKET_IFNAME:-$(detect_default_ifname)}"
 DEFAULT_SOCKET_IFNAME="${DEFAULT_SOCKET_IFNAME:-ens8}"
 DEFAULT_SOCKET_IFNAME="${DEFAULT_SOCKET_IFNAME:-lo}"
@@ -40,6 +105,7 @@ export WANDB_MODE="${WANDB_MODE:-disabled}"
 export STARVLA_USE_DEEPSPEED="${STARVLA_USE_DEEPSPEED:-1}"
 
 mkdir -p "${TMPDIR}"
+cleanup_stale_training_sidecars
 
 ACCELERATE_BIN="${ACCELERATE_BIN:-$(command -v accelerate 2>/dev/null || echo "${HOME}/miniconda3/envs/vla-jepa-vjepa21/bin/accelerate")}"
 CONFIG_YAML="${CONFIG_YAML:-${REPO_ROOT}/scripts/config/vlajepa_robot_ft_trossen_vjepa21_small_a100x4_weekend_20260404.yaml}"

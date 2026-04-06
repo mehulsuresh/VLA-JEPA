@@ -112,6 +112,7 @@ def get_vla_dataset(
         video_resolution_size=data_cfg.get("video_resolution_size", 256),
         video_frame_stride=video_frame_stride,
         video_target_shift_steps=data_cfg.get("video_target_shift_steps", 0),
+        gpu_video_decode_on_rank=bool(data_cfg.get("gpu_video_decode_on_rank", False)),
         seed=seed,
         **kwargs,
     )

@@ -70,10 +70,11 @@ datasets:
     resolution_size: 224
     video_resolution_size: 384
     video_frame_stride: 10
-    video_target_shift_steps: 0
+    video_target_shift_steps: 2
+    gpu_video_decode_on_rank: false
     per_device_batch_size: 104
-    num_workers: 5
-    prefetch_factor: 2
+    num_workers: 3
+    prefetch_factor: 1
     persistent_workers: false
     multiprocessing_context: spawn
     worker_torch_threads: 1
@@ -85,7 +86,7 @@ datasets:
     with_state: true
 
 trainer:
-  epochs: 2
+  epochs: 5
   max_train_steps: auto
   num_warmup_steps: auto
   save_interval: 1000
@@ -138,6 +139,9 @@ trainer:
   compile_full_model_dynamic: false
   compile_mode: default
   compile_dynamic: false
+  save_plain_weights_in_checkpoints: false
+  drop_checkpoint_page_cache: true
+  trim_process_memory_after_checkpoint: true
   use_rabc: true
   rabc_progress_key: rabc_progress_delta
   rabc_fallback_progress_key: rabc_global_progress_delta

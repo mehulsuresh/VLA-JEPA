@@ -76,12 +76,8 @@ class PreprocessedSubtaskCollator:
             return_tensors="pt",
         )
 
-        videos = np.stack([sample["video"] for sample in batch]).transpose(0, 1, 2, 5, 3, 4)
-        target_videos = np.stack([sample["video_target"] for sample in batch]).transpose(0, 1, 2, 5, 3, 4)
         collated = {
             "qwen_inputs": qwen_inputs,
-            "video": torch.from_numpy(np.ascontiguousarray(videos)),
-            "video_target": torch.from_numpy(np.ascontiguousarray(target_videos)),
             "action": torch.from_numpy(
                 np.asarray([sample["action"] for sample in batch], dtype=np.float32)
             ),
@@ -89,6 +85,16 @@ class PreprocessedSubtaskCollator:
                 np.asarray([sample["state"] for sample in batch], dtype=np.float32)
             ),
         }
+
+        if "video_compact" in batch[0]:
+            compact_videos = np.stack([sample["video_compact"] for sample in batch]).transpose(0, 1, 2, 5, 3, 4)
+            collated["video_compact"] = torch.from_numpy(np.ascontiguousarray(compact_videos))
+        else:
+            videos = np.stack([sample["video"] for sample in batch]).transpose(0, 1, 2, 5, 3, 4)
+            collated["video"] = torch.from_numpy(np.ascontiguousarray(videos))
+            if "video_target" in batch[0]:
+                target_videos = np.stack([sample["video_target"] for sample in batch]).transpose(0, 1, 2, 5, 3, 4)
+                collated["video_target"] = torch.from_numpy(np.ascontiguousarray(target_videos))
 
         tensor_keys = (
             "frame_index",
@@ -296,37 +302,27 @@ class PreprocessedSubtaskVLADataset(Dataset):
 
         current_frame_idx = int(frame_indices[row_idx])
         image_list = []
-        context_offsets = list(range(-(self.video_context_horizon - 1), 1))
-        target_offsets = [offset + self.video_target_shift_steps for offset in context_offsets]
-        video_views = []
-        target_video_views = []
+        union_offsets = list(range(-(self.video_context_horizon - 1), self.video_target_shift_steps + 1))
+        compact_video_views = []
         for camera in self.current_cameras:
             current_rgb = self._load_rgb(episode_name, camera, current_frame_idx)
             image_list.append(
                 Image.fromarray(self._resize_rgb(current_rgb, self.resolution_size))
             )
 
-            context_frames = []
-            target_frames = []
-            for offset in context_offsets:
+            merged_frames = []
+            for offset in union_offsets:
                 sampled_frame_idx = self._resolve_sampled_frame_index(row_idx, offset, frame_indices)
                 rgb = current_rgb if sampled_frame_idx == current_frame_idx else self._load_rgb(
                     episode_name, camera, sampled_frame_idx
                 )
-                context_frames.append(self._resize_rgb(rgb, self.video_resolution_size))
-            for offset in target_offsets:
-                sampled_frame_idx = self._resolve_sampled_frame_index(row_idx, offset, frame_indices)
-                rgb = current_rgb if sampled_frame_idx == current_frame_idx else self._load_rgb(
-                    episode_name, camera, sampled_frame_idx
-                )
-                target_frames.append(self._resize_rgb(rgb, self.video_resolution_size))
-            video_views.append(np.stack(context_frames, axis=0))
-            target_video_views.append(np.stack(target_frames, axis=0))
+                merged_frames.append(self._resize_rgb(rgb, self.video_resolution_size))
+            merged_frames = np.stack(merged_frames, axis=0)
+            compact_video_views.append(merged_frames)
 
-        if len(video_views) == 1:
-            video_views = [video_views[0], video_views[0].copy()]
-            target_video_views = [target_video_views[0], target_video_views[0].copy()]
+        if len(compact_video_views) == 1:
             image_list = [image_list[0], image_list[0].copy()]
+            compact_video_views = [compact_video_views[0], compact_video_views[0].copy()]
 
         action_rows = []
         for offset in range(self.action_horizon):
@@ -361,8 +357,7 @@ class PreprocessedSubtaskVLADataset(Dataset):
             "action": action,
             "image": image_list,
             "lang": self.instruction_text,
-            "video": np.stack(video_views, axis=0),
-            "video_target": np.stack(target_video_views, axis=0),
+            "video_compact": np.stack(compact_video_views, axis=0),
             "state": state,
             "frame_index": current_frame_idx,
             "task_id": current_task,
