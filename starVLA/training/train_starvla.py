@@ -22,7 +22,10 @@ import json
 import os
 import sys
 import logging
+import queue
 from pathlib import Path
+import threading
+import traceback
 from collections import deque
 from collections.abc import Mapping, Sequence
 from typing import Callable, Optional, Tuple
@@ -635,6 +638,73 @@ def _shutdown_dataloader_workers(dataloader) -> None:
     _shutdown_dataloader_iterator(getattr(dataloader, "_iterator", None))
 
 
+class _RankVideoBatchPrefetcher:
+    def __init__(self, trainer: "VLATrainer", queue_size: int):
+        self.trainer = trainer
+        self.queue_size = max(int(queue_size), 1)
+        self._queue: queue.Queue = queue.Queue(maxsize=self.queue_size)
+        self._stop_event = threading.Event()
+        self._thread = threading.Thread(
+            target=self._worker,
+            name="rank-video-prefetch",
+            daemon=True,
+        )
+        self._cuda_stream = None
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def close(self) -> None:
+        self._stop_event.set()
+        self._thread.join(timeout=5)
+
+    def _worker(self) -> None:
+        try:
+            device = self.trainer.accelerator.device
+            if torch.cuda.is_available() and device.type == "cuda":
+                torch.cuda.set_device(device)
+                self._cuda_stream = torch.cuda.Stream(device=device)
+
+            while not self._stop_event.is_set():
+                raw_fetch_start = time.perf_counter()
+                raw_batch = self.trainer._get_next_raw_batch()
+                raw_fetch_time = time.perf_counter() - raw_fetch_start
+                prepare_start = time.perf_counter()
+                prepared_batch, ready_event = self.trainer._prepare_prefetched_batch(
+                    raw_batch, stream=self._cuda_stream
+                )
+                prepare_time = time.perf_counter() - prepare_start
+                if isinstance(prepared_batch, list) and prepared_batch and isinstance(prepared_batch[0], dict):
+                    timing_payload = dict(prepared_batch[0].get("_prefetch_timing", {}))
+                    timing_payload["raw_batch_fetch_time"] = raw_fetch_time
+                    timing_payload["prefetch_prepare_time"] = prepare_time
+                    timing_payload["prefetch_total_time"] = raw_fetch_time + prepare_time
+                    prepared_batch[0]["_prefetch_timing"] = timing_payload
+                while not self._stop_event.is_set():
+                    try:
+                        self._queue.put(("batch", prepared_batch, ready_event), timeout=0.5)
+                        break
+                    except queue.Full:
+                        continue
+        except Exception as exc:
+            try:
+                self._queue.put(("error", exc, traceback.format_exc()), timeout=0.5)
+            except queue.Full:
+                pass
+
+    def next_batch(self):
+        item = self._queue.get()
+        kind = item[0]
+        if kind == "error":
+            _, exc, tb = item
+            raise RuntimeError(f"Rank video prefetch failed:\n{tb}") from exc
+
+        _, batch, ready_event = item
+        if ready_event is not None and torch.cuda.is_available():
+            torch.cuda.current_stream(device=self.trainer.accelerator.device).wait_event(ready_event)
+        return batch
+
+
 def _drop_file_cache_best_effort(path: str) -> None:
     posix_fadvise = getattr(os, "posix_fadvise", None)
     dontneed_flag = getattr(os, "POSIX_FADV_DONTNEED", None)
@@ -820,6 +890,9 @@ class VLATrainer(TrainerUtils):
         self.progress_eta_window = max(int(self.config.trainer.get("progress_eta_window", 50)), 1)
         self.progress_eta_warmup_steps = max(int(self.config.trainer.get("progress_eta_warmup_steps", 3)), 0)
         self._recent_wall_step_times = deque(maxlen=self.progress_eta_window)
+        self._rank_video_prefetcher: Optional[_RankVideoBatchPrefetcher] = None
+        self._prefetch_model = None
+        self._last_prefetch_timing: Optional[dict] = None
 
     @staticmethod
     def _format_duration(seconds: Optional[float]) -> str:
@@ -840,6 +913,9 @@ class VLATrainer(TrainerUtils):
             return 0.0
         avg_wall_step_time = sum(self._recent_wall_step_times) / len(self._recent_wall_step_times)
         return avg_wall_step_time * remaining_steps
+
+    def _runtime_timing_enabled(self) -> bool:
+        return bool(self.config.datasets.vla_data.get("runtime_timing_logging", False))
 
     @staticmethod
     def _to_scalar(value):
@@ -903,6 +979,7 @@ class VLATrainer(TrainerUtils):
         self._validate_prepared_dataloader()
         if self.accelerator.is_main_process:
             logger.info("Step 0 debug: prepared dataloader validated")
+        self._prefetch_model = self.accelerator.unwrap_model(self.model)
 
         #self._init_wandb()
         self._init_checkpointing()
@@ -964,7 +1041,34 @@ class VLATrainer(TrainerUtils):
 
     def _load_checkpoint(self, checkpoint_path):
         """load checkpoint"""
-        self.accelerator.load_state(checkpoint_path)
+        load_optimizer_state = bool(self.config.trainer.get("resume_load_optimizer_state", True))
+        if load_optimizer_state:
+            self.accelerator.load_state(checkpoint_path)
+        else:
+            model_path = os.path.join(checkpoint_path, "model.safetensors")
+            if os.path.exists(model_path):
+                from safetensors.torch import load_file as load_safetensors_file
+
+                state_dict = load_safetensors_file(model_path, device="cpu")
+            else:
+                fallback_model_path = os.path.join(checkpoint_path, "pytorch_model.pt")
+                if not os.path.exists(fallback_model_path):
+                    raise FileNotFoundError(
+                        f"Checkpoint `{checkpoint_path}` does not contain `model.safetensors` or `pytorch_model.pt`."
+                    )
+                state_dict = torch.load(fallback_model_path, map_location="cpu")
+            incompatible_keys = self.accelerator.unwrap_model(self.model).load_state_dict(
+                state_dict,
+                strict=False,
+            )
+            allowed_missing_keys = {"qwen_vl_interface.model.lm_head.weight"}
+            missing_keys = set(incompatible_keys.missing_keys) - allowed_missing_keys
+            unexpected_keys = set(incompatible_keys.unexpected_keys)
+            if missing_keys or unexpected_keys:
+                raise RuntimeError(
+                    "Model-only checkpoint load mismatch: "
+                    f"missing_keys={sorted(missing_keys)} unexpected_keys={sorted(unexpected_keys)}"
+                )
         trainer_state_path = os.path.join(checkpoint_path, "trainer_state.json")
         if os.path.exists(trainer_state_path):
             try:
@@ -982,7 +1086,17 @@ class VLATrainer(TrainerUtils):
                     self.completed_steps = int(checkpoint_name.split("_", 1)[1])
                 except ValueError:
                     logger.warning(f"Unable to parse completed_steps from checkpoint path: {checkpoint_path}")
-        self.accelerator.print(f"Resumed from checkpoint: {checkpoint_path}")
+        if self.completed_steps > 0 and self.lr_scheduler is not None:
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    self.lr_scheduler.step(self.completed_steps)
+            except Exception as exc:
+                logger.warning(
+                    f"Unable to fast-forward lr scheduler to resumed step {self.completed_steps}: {exc}"
+                )
+        resume_mode = "full_state" if load_optimizer_state else "model_only"
+        self.accelerator.print(f"Resumed from checkpoint ({resume_mode}): {checkpoint_path}")
 
     def _save_checkpoint(self):
         """save current training state"""
@@ -1100,14 +1214,26 @@ class VLATrainer(TrainerUtils):
     def _create_data_iterators(self):
         """create data iterators"""
         self.vla_iter = iter(self.vla_train_dataloader)
-        self.vla_eval_iter = iter(self.vla_train_dataloader)
         self.vla_epoch_count = 0
+        if self._rank_video_prefetch_enabled():
+            self._rank_video_prefetcher = _RankVideoBatchPrefetcher(
+                self,
+                queue_size=self._rank_video_prefetch_queue_size(),
+            )
+            self._rank_video_prefetcher.start()
         # self.vlm_iter = iter(self.vlm_train_dataloader)
 
-    def _get_next_batch(self):
-        """get next batch (automatically handle data loop)"""
-        if self.completed_steps == 0 and self.accelerator.is_main_process:
-            logger.info("Step 0 debug: fetching first training batch")
+    def _rank_video_prefetch_enabled(self) -> bool:
+        data_cfg = self.config.datasets.vla_data
+        return bool(
+            data_cfg.get("gpu_video_decode_on_rank", False)
+            and data_cfg.get("gpu_video_decode_async_prefetch", True)
+        )
+
+    def _rank_video_prefetch_queue_size(self) -> int:
+        return max(1, int(self.config.datasets.vla_data.get("gpu_video_decode_prefetch_queue_size", 2)))
+
+    def _get_next_raw_batch(self):
         try:
             batch_vla = next(self.vla_iter)
         except StopIteration:
@@ -1115,21 +1241,41 @@ class VLATrainer(TrainerUtils):
                 self.vla_train_dataloader, self.vla_epoch_count
             )
             batch_vla = next(self.vla_iter)
+        return batch_vla
+
+    def _prepare_prefetched_batch(self, batch_vla, stream=None):
+        if not self._rank_video_prefetch_enabled():
+            return batch_vla, None
+        model = self._prefetch_model or self.accelerator.unwrap_model(self.model)
+        if not hasattr(model, "prepare_rank_prefetched_batch"):
+            return batch_vla, None
+        return model.prepare_rank_prefetched_batch(batch_vla, stream=stream)
+
+    def _get_next_batch(self):
+        """get next batch (automatically handle data loop)"""
+        if self.completed_steps == 0 and self.accelerator.is_main_process:
+            logger.info("Step 0 debug: fetching first training batch")
+        if self._rank_video_prefetcher is not None:
+            batch_vla = self._rank_video_prefetcher.next_batch()
+        else:
+            batch_vla = self._get_next_raw_batch()
+        self._last_prefetch_timing = None
+        if isinstance(batch_vla, list) and batch_vla and isinstance(batch_vla[0], dict):
+            timing_payload = batch_vla[0].pop("_prefetch_timing", None)
+            if isinstance(timing_payload, dict):
+                self._last_prefetch_timing = timing_payload
+        elif isinstance(batch_vla, dict):
+            timing_payload = batch_vla.pop("_prefetch_timing", None)
+            if isinstance(timing_payload, dict):
+                self._last_prefetch_timing = timing_payload
         if self.completed_steps == 0 and self.accelerator.is_main_process:
             logger.info(f"Step 0 debug: fetched first training batch { _summarize_batch_structure(batch_vla) }")
 
         return batch_vla
 
     def _get_next_eval_batch(self):
-        """get next evaluation batch without consuming the training iterator"""
-        try:
-            batch_vla = next(self.vla_eval_iter)
-        except StopIteration:
-            # Eval shares the loader but must not mutate the training sampler epoch.
-            self.vla_eval_iter = iter(self.vla_train_dataloader)
-            batch_vla = next(self.vla_eval_iter)
-
-        return batch_vla
+        """Get an eval batch from the same live training iterator."""
+        return self._get_next_batch()
 
     def _resolve_loss_scales(self):
         loss_scale_cfg = self.config.trainer.get("loss_scale", {})
@@ -1203,15 +1349,34 @@ class VLATrainer(TrainerUtils):
                     if self._recent_wall_step_times
                     else None
                 )
-                progress_bar.set_postfix(
-                    {
-                        "data_times": f"{t_end_data - t_start_data:.3f}",
-                        "model_times": f"{t_end_model - t_start_model:.3f}",
-                        "wall_time": f"{step_metrics['wall_step_time']:.3f}",
-                        "avg_wall": f"{avg_wall_step_time:.3f}" if avg_wall_step_time is not None else "warmup",
-                        "eta": self._format_duration(eta_seconds),
-                    }
-                )
+                postfix = {
+                    "data_times": f"{t_end_data - t_start_data:.3f}",
+                    "model_times": f"{t_end_model - t_start_model:.3f}",
+                    "wall_time": f"{step_metrics['wall_step_time']:.3f}",
+                    "avg_wall": f"{avg_wall_step_time:.3f}" if avg_wall_step_time is not None else "warmup",
+                    "eta": self._format_duration(eta_seconds),
+                }
+                if self._runtime_timing_enabled():
+                    timing_keys = (
+                        ("raw_batch_fetch_time", "fetch"),
+                        ("video_tensor_to_cuda_time", "to_cuda"),
+                        ("video_decode_time", "decode"),
+                        ("video_postprocess_time", "post"),
+                        ("qwen_tensor_build_time", "qwen"),
+                        ("qwen_forward_time", "qfwd"),
+                        ("vj_encode_time", "vj"),
+                        ("predictor_action_head_time", "head"),
+                        ("forward_time", "fwd"),
+                        ("backward_only_time", "back"),
+                        ("grad_clip_time", "clip"),
+                        ("optimizer_step_time", "opt"),
+                        ("backward_optimizer_time", "bwd"),
+                    )
+                    for metric_key, label in timing_keys:
+                        metric_value = self._to_scalar(step_metrics.get(metric_key))
+                        if metric_value is not None:
+                            postfix[label] = f"{metric_value:.3f}"
+                progress_bar.set_postfix(postfix)
 
             self._log_metrics(step_metrics)
 
@@ -1401,43 +1566,65 @@ class VLATrainer(TrainerUtils):
             # VLA task forward propagation
             if self.completed_steps == 0 and self.accelerator.is_main_process:
                 logger.info("Step 0 debug: starting model.forward")
+            forward_start = time.perf_counter()
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 output_dict = self.model.forward(batch_vla, rabc_weights=rabc_weights)
                 total_loss = (
                     output_dict.get("action_loss", 0.0) * self.action_loss_scale
                     + output_dict.get("wm_loss", 0.0) * self.wm_loss_scale
                 )
+            forward_time = time.perf_counter() - forward_start
             if self.completed_steps == 0 and self.accelerator.is_main_process:
                 logger.info("Step 0 debug: finished model.forward")
 
             # VLA backward propagation
             if self.completed_steps == 0 and self.accelerator.is_main_process:
                 logger.info("Step 0 debug: starting backward")
+            backward_start = time.perf_counter()
             self.accelerator.backward(total_loss)
+            backward_only_time = time.perf_counter() - backward_start
             if self.completed_steps == 0 and self.accelerator.is_main_process:
                 logger.info("Step 0 debug: finished backward")
 
             # gradient clipping
             grad_norm = None
+            grad_clip_time = 0.0
             if self.accelerator.sync_gradients and self.config.trainer.gradient_clipping is not None:
+                grad_clip_start = time.perf_counter()
                 grad_norm = self.accelerator.clip_grad_norm_(
                     self.model.parameters(), self.config.trainer.gradient_clipping
                 )
+                grad_clip_time = time.perf_counter() - grad_clip_start
 
             # optimizer step
+            optimizer_step_time = 0.0
             if self.accelerator.sync_gradients:
+                optimizer_step_start = time.perf_counter()
                 self.optimizer.step()
                 self.lr_scheduler.step()
                 self.optimizer.zero_grad(set_to_none=True)
+                optimizer_step_time = time.perf_counter() - optimizer_step_start
+            backward_optimizer_time = time.perf_counter() - backward_start
             
             result_dict = {}
             for key, value in output_dict.items():
                 result_dict[key] = value.detach() if isinstance(value, torch.Tensor) else value
+            if "qwen_tensor_build_time" not in result_dict and "qwen_input_build_time" in result_dict:
+                # Surface the non-prefetch Qwen build timing under the existing progress-bar key.
+                result_dict["qwen_tensor_build_time"] = result_dict["qwen_input_build_time"]
             result_dict["total_loss"] = total_loss.detach() if isinstance(total_loss, torch.Tensor) else total_loss
             for key, value in rabc_stats.items():
                 result_dict[key] = value.detach() if isinstance(value, torch.Tensor) else value
             if grad_norm is not None:
                 result_dict["grad_norm"] = grad_norm.detach() if isinstance(grad_norm, torch.Tensor) else grad_norm
+            result_dict["forward_time"] = forward_time
+            result_dict["backward_only_time"] = backward_only_time
+            result_dict["grad_clip_time"] = grad_clip_time
+            result_dict["optimizer_step_time"] = optimizer_step_time
+            result_dict["backward_optimizer_time"] = backward_optimizer_time
+            if self._last_prefetch_timing:
+                for key, value in self._last_prefetch_timing.items():
+                    result_dict[key] = value
 
         return result_dict
 
@@ -1457,6 +1644,12 @@ class VLATrainer(TrainerUtils):
         finish_trackers(self.accelerator)
 
     def _shutdown_data_runtime(self):
+        if self._rank_video_prefetcher is not None:
+            try:
+                self._rank_video_prefetcher.close()
+            except Exception as exc:
+                logger.warning(f"Rank video prefetcher shutdown failed: {exc}")
+            self._rank_video_prefetcher = None
         for attr_name in ("vla_iter", "vla_eval_iter"):
             iterator = getattr(self, attr_name, None)
             _shutdown_dataloader_iterator(iterator)

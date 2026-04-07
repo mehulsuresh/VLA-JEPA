@@ -1,3 +1,19 @@
+# Reference machine for this config:
+# - 4 x NVIDIA A100-SXM4-40GB (40 GiB VRAM each)
+# - 48 logical CPUs / 24 physical cores
+# - 334 GiB system RAM
+# These settings are tuned for that box:
+# - per_device_batch_size: 104
+# - num_workers: 5
+# - prefetch_factor: 1
+# - gpu_video_decode_on_rank: false
+# - compile_qwen_model/action_model/vj_predictor/vj_encoder: true
+# How to scale on another machine:
+# - Less VRAM than 40 GiB/GPU: lower per_device_batch_size first.
+# - Less system RAM or fewer CPU cores: lower num_workers first, then prefetch_factor.
+# - More VRAM but similar CPU/RAM: do not raise batch without also checking host RAM and dataloader pressure.
+# - More CPU/RAM but same VRAM: raise num_workers before raising batch size.
+# - This config assumes train/eval share one live dataloader iterator pool; if that changes, revisit num_workers.
 run_id: robot_ft_trossen_vjepa21_small_a100x4_weekend_20260404
 run_root_dir: checkpoints
 seed: 42
@@ -73,7 +89,7 @@ datasets:
     video_target_shift_steps: 2
     gpu_video_decode_on_rank: false
     per_device_batch_size: 104
-    num_workers: 3
+    num_workers: 5
     prefetch_factor: 1
     persistent_workers: false
     multiprocessing_context: spawn
@@ -91,7 +107,7 @@ trainer:
   num_warmup_steps: auto
   save_interval: 1000
   eval_interval: 1000
-  save_best_only: true
+  save_best_only: false
   best_metric_name: mae_score
   best_metric_mode: min
   learning_rate:

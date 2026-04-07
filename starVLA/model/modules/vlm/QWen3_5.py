@@ -3,10 +3,12 @@
 
 import os
 import torch
+import torch.nn.functional as F
 from typing import Optional
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers import Qwen3_5ForConditionalGeneration, AutoProcessor
 from transformers.models.qwen3_5 import modeling_qwen3_5
+from transformers.models.qwen2_vl.image_processing_qwen2_vl import smart_resize
 from transformers.utils import is_flash_attn_2_available
 
 from accelerate.logging import get_logger
@@ -148,6 +150,7 @@ class _QWen3_5_Interface(nn.Module):
         self.config = config
         self.model.config.hidden_size = self.model.config.text_config.hidden_size
         self._compile_prepared = False
+        self._chat_wrapper_cache: dict[tuple[int, bool], tuple[str, str]] = {}
 
     def prepare_for_compile(self) -> int:
         """
@@ -209,6 +212,170 @@ class _QWen3_5_Interface(nn.Module):
         with torch.autocast("cuda", dtype=torch.float16):
             return self.model.generate(**kwargs)
 
+    def _render_prompt_text(
+        self,
+        instruction: str,
+        prompt_replace_dict=None,
+        prompt_template=None,
+    ) -> str:
+        if prompt_template is None:
+            if "CoT_prompt" in self.config.datasets.vla_data:
+                prompt = self.config.datasets.vla_data.get("CoT_prompt", "").replace("{instruction}", instruction)
+                if prompt_replace_dict is not None:
+                    for k, v in prompt_replace_dict.items():
+                        prompt = prompt.replace(k, v)
+            else:
+                prompt = instruction
+        else:
+            prompt = prompt_template.replace("{instruction}", instruction)
+            if prompt_replace_dict is not None:
+                for k, v in prompt_replace_dict.items():
+                    prompt = prompt.replace(k, v)
+        return prompt
+
+    def _get_chat_wrapper(self, num_images: int, *, add_generation_prompt: bool) -> tuple[str, str]:
+        cache_key = (int(num_images), bool(add_generation_prompt))
+        cached = self._chat_wrapper_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        sentinel = "__STARVLA_PROMPT_SENTINEL__"
+        content = [{"type": "image", "image": f"dummy_{i}"} for i in range(num_images)]
+        content.append({"type": "text", "text": sentinel})
+        rendered = self.processor.apply_chat_template(
+            [[{"role": "user", "content": content}]],
+            tokenize=False,
+            add_generation_prompt=add_generation_prompt,
+        )[0]
+        sentinel_index = rendered.find(sentinel)
+        if sentinel_index < 0:
+            raise ValueError("Failed to derive cached Qwen chat wrapper")
+        wrapper = (
+            rendered[:sentinel_index],
+            rendered[sentinel_index + len(sentinel):],
+        )
+        self._chat_wrapper_cache[cache_key] = wrapper
+        return wrapper
+
+    def build_qwenvl_inputs_from_frames_tensor(
+        self,
+        frames: torch.Tensor,
+        instructions,
+        prompt_replace_dict=None,
+        prompt_template=None,
+    ):
+        if frames.ndim != 5:
+            raise ValueError(f"Expected frames with shape [B, V, C, H, W], got {tuple(frames.shape)}")
+
+        qwen_device = self.model.device
+        frames = frames.to(qwen_device, non_blocking=True)
+        if frames.dtype != torch.uint8:
+            frames = frames.clamp_(0, 255).round_().to(torch.uint8)
+
+        B, V, C, H, W = frames.shape
+        image_processor = self.processor.image_processor
+        patch_size = int(image_processor.patch_size)
+        merge_size = int(image_processor.merge_size)
+        temporal_patch_size = int(image_processor.temporal_patch_size)
+        factor = patch_size * merge_size
+
+        resized_height, resized_width = smart_resize(
+            H,
+            W,
+            factor=factor,
+            min_pixels=image_processor.size["shortest_edge"],
+            max_pixels=image_processor.size["longest_edge"],
+        )
+        if (resized_height, resized_width) != (H, W):
+            frames = F.interpolate(
+                frames.reshape(B * V, C, H, W).to(dtype=torch.float32),
+                size=(resized_height, resized_width),
+                mode="bilinear",
+                align_corners=False,
+            ).reshape(B, V, C, resized_height, resized_width)
+            frames = frames.clamp_(0, 255).round_().to(torch.uint8)
+
+        flat_images = frames.reshape(B * V, C, resized_height, resized_width).to(dtype=torch.float32)
+        if bool(getattr(image_processor, "do_rescale", True)):
+            flat_images = flat_images * float(getattr(image_processor, "rescale_factor", 1.0 / 255.0))
+        if bool(getattr(image_processor, "do_normalize", True)):
+            mean = torch.as_tensor(image_processor.image_mean, device=flat_images.device, dtype=flat_images.dtype).view(1, C, 1, 1)
+            std = torch.as_tensor(image_processor.image_std, device=flat_images.device, dtype=flat_images.dtype).view(1, C, 1, 1)
+            flat_images = (flat_images - mean) / std
+
+        patches = flat_images.unsqueeze(1)
+        if patches.shape[1] % temporal_patch_size != 0:
+            repeats = patches[:, -1:].repeat(1, temporal_patch_size - patches.shape[1] % temporal_patch_size, 1, 1, 1)
+            patches = torch.cat([patches, repeats], dim=1)
+
+        batch_size, grid_t_raw, channel = patches.shape[:3]
+        grid_t = grid_t_raw // temporal_patch_size
+        grid_h = resized_height // patch_size
+        grid_w = resized_width // patch_size
+
+        patches = patches.view(
+            batch_size,
+            grid_t,
+            temporal_patch_size,
+            channel,
+            grid_h // merge_size,
+            merge_size,
+            patch_size,
+            grid_w // merge_size,
+            merge_size,
+            patch_size,
+        )
+        patches = patches.permute(0, 1, 4, 7, 5, 8, 3, 2, 6, 9)
+        pixel_values = patches.reshape(
+            batch_size * grid_t * grid_h * grid_w,
+            channel * temporal_patch_size * patch_size * patch_size,
+        )
+        image_grid_thw = torch.tensor(
+            [[grid_t, grid_h, grid_w]] * batch_size,
+            dtype=torch.long,
+            device=flat_images.device,
+        )
+
+        num_image_tokens = int((grid_t * grid_h * grid_w) // (merge_size ** 2))
+        prompts = [
+            self._render_prompt_text(
+                instruction=instruction,
+                prompt_replace_dict=prompt_replace_dict,
+                prompt_template=prompt_template,
+            )
+            for instruction in instructions
+        ]
+        prefix, suffix = self._get_chat_wrapper(V, add_generation_prompt=True)
+        rendered_text = [
+            f"{prefix}{prompt}{suffix}".replace(self.processor.image_token, self.processor.image_token * num_image_tokens)
+            for prompt in prompts
+        ]
+
+        tokenizer_kwargs = {
+            "padding": True,
+            "return_token_type_ids": False,
+            "return_tensors": "pt",
+        }
+        if self.processor.tokenizer.bos_token is not None and rendered_text and rendered_text[0].startswith(self.processor.tokenizer.bos_token):
+            tokenizer_kwargs["add_special_tokens"] = False
+
+        text_inputs = self.processor.tokenizer(rendered_text, **tokenizer_kwargs)
+        mm_token_type_ids = self.processor.create_mm_token_type_ids(text_inputs["input_ids"].tolist())
+        text_inputs["mm_token_type_ids"] = torch.tensor(
+            mm_token_type_ids,
+            dtype=text_inputs["input_ids"].dtype,
+        )
+
+        batch_inputs = {
+            **text_inputs,
+            "pixel_values": pixel_values,
+            "image_grid_thw": image_grid_thw,
+        }
+        return {
+            key: value.to(qwen_device, non_blocking=True) if isinstance(value, torch.Tensor) else value
+            for key, value in batch_inputs.items()
+        }
+
     def build_qwenvl_inputs(
         self,
         images,
@@ -218,6 +385,46 @@ class _QWen3_5_Interface(nn.Module):
         prompt_template=None,
         **kwargs,
     ):
+        if solutions is None:
+            prompts = [
+                self._render_prompt_text(
+                    instruction=instruction,
+                    prompt_replace_dict=prompt_replace_dict,
+                    prompt_template=prompt_template,
+                )
+                for instruction in instructions
+            ]
+            rendered_text = []
+            for imgs, prompt in zip(images, prompts):
+                prefix, suffix = self._get_chat_wrapper(
+                    len(imgs),
+                    add_generation_prompt=True,
+                )
+                rendered_text.append(f"{prefix}{prompt}{suffix}")
+
+            batch_inputs = self.processor(
+                text=rendered_text,
+                images=images,
+                text_kwargs={
+                    "padding": True,
+                    "return_tensors": "pt",
+                },
+            )
+
+            if self.config.get("trainer", {}).get("channels_last", False):
+                if "pixel_values" in batch_inputs and isinstance(batch_inputs["pixel_values"], torch.Tensor):
+                    if batch_inputs["pixel_values"].dim() == 4:
+                        batch_inputs["pixel_values"] = batch_inputs["pixel_values"].contiguous(
+                            memory_format=torch.channels_last
+                        )
+                if "pixel_values_videos" in batch_inputs and isinstance(batch_inputs["pixel_values_videos"], torch.Tensor):
+                    if batch_inputs["pixel_values_videos"].dim() == 5:
+                        batch_inputs["pixel_values_videos"] = batch_inputs["pixel_values_videos"].contiguous(
+                            memory_format=torch.channels_last_3d
+                        )
+
+            return batch_inputs.to(self.model.device)
+
         messages = []
         assert len(images) == len(instructions), "Images and instructions must have the same length"
         for imgs, instruction in zip(images, instructions):

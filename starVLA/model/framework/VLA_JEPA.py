@@ -10,6 +10,7 @@ Flow-matching header is copyright from GR00T N1.5,
 from contextlib import nullcontext
 from functools import lru_cache
 import importlib
+from collections import OrderedDict
 from pathlib import Path
 import time
 from typing import List, Optional, Tuple
@@ -38,6 +39,14 @@ except ImportError:
     decord = None
     DECORD_AVAILABLE = False
 
+try:
+    import torchcodec
+
+    TORCHCODEC_AVAILABLE = True
+except (ImportError, RuntimeError):
+    torchcodec = None
+    TORCHCODEC_AVAILABLE = False
+
 
 def _clean_vjepa_backbone_key(state_dict):
     cleaned = {}
@@ -55,11 +64,29 @@ def _get_rank_cpu_video_reader(video_path: str, num_threads: int):
     return decord.VideoReader(video_path, ctx=decord.cpu(0), num_threads=num_threads)
 
 
-@lru_cache(maxsize=16)
 def _get_rank_gpu_video_reader(video_path: str, device_index: int, num_threads: int):
     if not DECORD_AVAILABLE:
         raise ImportError("decord is not available.")
     return decord.VideoReader(video_path, ctx=decord.gpu(device_index), num_threads=num_threads)
+
+
+def _get_rank_torchcodec_video_reader(
+    video_path: str,
+    device: str,
+    num_threads: int,
+    *,
+    dimension_order: str = "NHWC",
+    seek_mode: str = "exact",
+):
+    if not TORCHCODEC_AVAILABLE:
+        raise ImportError("torchcodec is not available.")
+    return torchcodec.decoders.VideoDecoder(
+        video_path,
+        device=device,
+        dimension_order=dimension_order,
+        num_ffmpeg_threads=max(1, int(num_threads)),
+        seek_mode=seek_mode,
+    )
 
 
 @lru_cache(maxsize=256)
@@ -176,6 +203,7 @@ class VLA_JEPA(baseframework):
             persistent=False,
         )
         self._qwen_grad_cache: Optional[bool] = None
+        self._torchcodec_reader_cache: "OrderedDict[tuple, object]" = OrderedDict()
         self._vj_compile_prepared = False
         repeated_diffusion_steps = 4
         if self.config is not None:
@@ -387,14 +415,19 @@ class VLA_JEPA(baseframework):
         has_actions: bool,
         prompt_replace_dict: Optional[dict[str, str]] = None,
         prompt_template: Optional[str] = None,
-    ) -> dict[str, torch.Tensor]:
+        *,
+        return_timing: bool = False,
+    ) -> dict[str, torch.Tensor] | tuple[dict[str, torch.Tensor], dict[str, float]]:
         qwen_device = self._get_qwen_device()
         if isinstance(batch_videos, np.ndarray):
             frames = torch.from_numpy(np.ascontiguousarray(batch_videos[:, :, -1]))
         else:
             frames = batch_videos[:, :, -1]
 
+        to_cuda_start = time.perf_counter()
         frames = frames.to(qwen_device, dtype=torch.float32, non_blocking=True)
+        video_tensor_to_cuda_time = time.perf_counter() - to_cuda_start
+        build_start = time.perf_counter()
         B, V, C, H, W = frames.shape
         target_size = int(self.config.datasets.vla_data.get("resolution_size", H))
         if H != target_size or W != target_size:
@@ -405,6 +438,22 @@ class VLA_JEPA(baseframework):
                 align_corners=False,
             ).reshape(B, V, C, target_size, target_size)
         frames = frames.clamp_(0, 255).round_().to(torch.uint8)
+
+        build_from_tensor = getattr(self.qwen_vl_interface, "build_qwenvl_inputs_from_frames_tensor", None)
+        if callable(build_from_tensor):
+            qwen_inputs = build_from_tensor(
+                frames=frames,
+                instructions=instructions,
+                prompt_replace_dict=prompt_replace_dict,
+                prompt_template=prompt_template,
+            )
+            if return_timing:
+                return qwen_inputs, {
+                    "video_tensor_to_cuda_time": video_tensor_to_cuda_time,
+                    "qwen_input_build_time": time.perf_counter() - build_start,
+                }
+            return qwen_inputs
+
         image_batches = [
             [frames[b, v].permute(1, 2, 0).contiguous() for v in range(V)]
             for b in range(B)
@@ -425,12 +474,18 @@ class VLA_JEPA(baseframework):
                 else self.config.datasets.video_data.get("CoT_prompt", "")
             )
 
-        return self.qwen_vl_interface.build_qwenvl_inputs(
+        qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(
             images=image_batches,
             instructions=instructions,
             prompt_replace_dict=prompt_replace_dict,
             prompt_template=prompt_template,
         )
+        if return_timing:
+            return qwen_inputs, {
+                "video_tensor_to_cuda_time": video_tensor_to_cuda_time,
+                "qwen_input_build_time": time.perf_counter() - build_start,
+            }
+        return qwen_inputs
 
     def _split_compact_videos(
         self,
@@ -448,14 +503,135 @@ class VLA_JEPA(baseframework):
             )
         return batch_compact_videos[:, :, :context_horizon], batch_compact_videos[:, :, shift:]
 
+    def _gpu_decode_debug_enabled(self) -> bool:
+        return bool(self.config.datasets.vla_data.get("debug_gpu_decode_timing", False))
+
+    def _gpu_decode_debug_rank(self) -> int:
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            return torch.distributed.get_rank()
+        return 0
+
+    def _log_gpu_decode_debug(self, message: str) -> None:
+        if self._gpu_decode_debug_enabled():
+            logger.info(f"[gpu-decode][rank {self._gpu_decode_debug_rank()}] {message}")
+
+    def _gpu_video_decode_backend(self) -> str:
+        return str(self.config.datasets.vla_data.get("gpu_video_decode_backend", "decord")).lower()
+
+    def _torchcodec_cuda_backend(self) -> str:
+        return str(self.config.datasets.vla_data.get("gpu_video_decode_torchcodec_cuda_backend", "beta")).lower()
+
+    def _torchcodec_seek_mode(self) -> str:
+        return str(self.config.datasets.vla_data.get("gpu_video_decode_torchcodec_seek_mode", "exact")).lower()
+
+    def _torchcodec_dimension_order(self) -> str:
+        return str(self.config.datasets.vla_data.get("gpu_video_decode_torchcodec_dimension_order", "NCHW")).upper()
+
+    def _torchcodec_fetch_mode(self) -> str:
+        return str(self.config.datasets.vla_data.get("gpu_video_decode_torchcodec_fetch_mode", "auto")).lower()
+
+    def _torchcodec_nvdec_cache_capacity(self) -> Optional[int]:
+        value = self.config.datasets.vla_data.get("gpu_video_decode_torchcodec_nvdec_cache_capacity", None)
+        if value is None:
+            return None
+        return int(value)
+
+    def _torchcodec_reader_cache_size(self) -> int:
+        return max(0, int(self.config.datasets.vla_data.get("gpu_video_decode_torchcodec_reader_cache_size", 32)))
+
+    def _get_or_create_torchcodec_reader(
+        self,
+        *,
+        video_path: str,
+        device: str,
+        decode_threads: int,
+        dimension_order: str,
+        seek_mode: str,
+        cuda_backend: str,
+        debug_enabled: bool,
+        spec_index: int,
+    ):
+        cache_size = self._torchcodec_reader_cache_size()
+        cache_key = (
+            video_path,
+            device,
+            int(decode_threads),
+            dimension_order,
+            seek_mode,
+            cuda_backend,
+        )
+        if cache_size > 0:
+            cached = self._torchcodec_reader_cache.get(cache_key)
+            if cached is not None:
+                self._torchcodec_reader_cache.move_to_end(cache_key)
+                if debug_enabled:
+                    self._log_gpu_decode_debug(
+                        f"spec {spec_index} torchcodec reader cache hit size={len(self._torchcodec_reader_cache)}"
+                    )
+                return cached
+
+        create_start = time.perf_counter()
+        if debug_enabled:
+            self._log_gpu_decode_debug(
+                f"spec {spec_index} creating torchcodec reader device={device} "
+                f"cuda_backend={cuda_backend} seek_mode={seek_mode}"
+            )
+
+        if device.startswith("cuda"):
+            from torchcodec.decoders import set_cuda_backend
+
+            with set_cuda_backend(cuda_backend):
+                reader = _get_rank_torchcodec_video_reader(
+                    video_path,
+                    device,
+                    decode_threads,
+                    dimension_order=dimension_order,
+                    seek_mode=seek_mode,
+                )
+        else:
+            reader = _get_rank_torchcodec_video_reader(
+                video_path,
+                device,
+                decode_threads,
+                dimension_order=dimension_order,
+                seek_mode=seek_mode,
+            )
+
+        if debug_enabled:
+            self._log_gpu_decode_debug(
+                f"spec {spec_index} torchcodec reader created elapsed={time.perf_counter() - create_start:.3f}s"
+            )
+
+        if cache_size > 0:
+            self._torchcodec_reader_cache[cache_key] = reader
+            self._torchcodec_reader_cache.move_to_end(cache_key)
+            if len(self._torchcodec_reader_cache) > cache_size:
+                _, evicted_reader = self._torchcodec_reader_cache.popitem(last=False)
+                del evicted_reader
+        return reader
+
+    @staticmethod
+    def _frame_indices_to_range(frame_indices: list[int], fetch_mode: str) -> Optional[tuple[int, int, int]]:
+        if fetch_mode == "indices" or len(frame_indices) < 2:
+            return None
+        step = int(frame_indices[1] - frame_indices[0])
+        if step <= 0:
+            return None
+        if any((frame_indices[i + 1] - frame_indices[i]) != step for i in range(len(frame_indices) - 1)):
+            if fetch_mode == "range":
+                raise RuntimeError(
+                    f"Requested torchcodec range fetch but indices are not an arithmetic progression: {frame_indices}"
+                )
+            return None
+        return int(frame_indices[0]), int(frame_indices[-1] + step), step
+
     def _decode_video_specs(
         self,
         examples: List[dict],
         spec_key: str,
-    ) -> torch.Tensor:
-        if not DECORD_AVAILABLE:
-            raise ImportError("CUDA-enabled decord is required for rank-side GPU video decoding.")
-
+        *,
+        return_timing: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, dict[str, float]]:
         decode_threads = max(1, int(self.config.datasets.vla_data.get("video_backend_num_threads", 1)))
         target_size = int(
             self.config.datasets.vla_data.get(
@@ -464,38 +640,251 @@ class VLA_JEPA(baseframework):
             )
         )
         encoder_device = next(self.vj_encoder.parameters()).device
-        batch_videos = []
+        decode_backend = self._gpu_video_decode_backend()
+        torchcodec_seek_mode = self._torchcodec_seek_mode()
+        torchcodec_dimension_order = self._torchcodec_dimension_order()
+        torchcodec_fetch_mode = self._torchcodec_fetch_mode()
+        torchcodec_cuda_backend = self._torchcodec_cuda_backend()
+        torchcodec_nvdec_cache_capacity = self._torchcodec_nvdec_cache_capacity()
+        if decode_backend not in {"decord", "torchcodec"}:
+            raise ValueError(f"Unsupported gpu_video_decode_backend: {decode_backend}")
+        if decode_backend == "decord" and not DECORD_AVAILABLE:
+            raise ImportError("CUDA-enabled decord is required for rank-side GPU video decoding.")
+        if decode_backend == "torchcodec" and not TORCHCODEC_AVAILABLE:
+            raise ImportError("TorchCodec is required for rank-side TorchCodec video decoding.")
+        if decode_backend == "torchcodec" and encoder_device.type == "cuda":
+            from torchcodec.decoders import set_nvdec_cache_capacity
 
-        for example in examples:
+            if torchcodec_nvdec_cache_capacity is not None:
+                set_nvdec_cache_capacity(torchcodec_nvdec_cache_capacity)
+        batch_videos = []
+        debug_enabled = self._gpu_decode_debug_enabled()
+        total_specs = 0
+        batch_decode_start = time.perf_counter()
+        decode_total_time = 0.0
+        postprocess_total_time = 0.0
+
+        if debug_enabled:
+            self._log_gpu_decode_debug(
+                f"start {spec_key}: examples={len(examples)} target_size={target_size} "
+                f"device={encoder_device} decode_threads={decode_threads} backend={decode_backend} "
+                f"torchcodec_cuda_backend={torchcodec_cuda_backend if decode_backend == 'torchcodec' else 'n/a'} "
+                f"torchcodec_seek_mode={torchcodec_seek_mode if decode_backend == 'torchcodec' else 'n/a'} "
+                f"torchcodec_fetch_mode={torchcodec_fetch_mode if decode_backend == 'torchcodec' else 'n/a'} "
+                f"torchcodec_dimension_order={torchcodec_dimension_order if decode_backend == 'torchcodec' else 'n/a'}"
+            )
+
+        for example_index, example in enumerate(examples):
             view_videos = []
-            for spec in example[spec_key]:
+            for view_index, spec in enumerate(example[spec_key]):
+                total_specs += 1
                 video_path = spec["video_path"]
+                spec_decode_start = time.perf_counter()
+                if debug_enabled:
+                    self._log_gpu_decode_debug(
+                        f"spec {total_specs} begin example={example_index} view={view_index} path={Path(video_path).name}"
+                    )
                 if "frame_indices" in spec:
+                    indices_start = time.perf_counter()
                     frame_indices = np.asarray(spec["frame_indices"], dtype=np.int64).tolist()
+                    if debug_enabled:
+                        self._log_gpu_decode_debug(
+                            f"spec {total_specs} using cached frame_indices count={len(frame_indices)} "
+                            f"elapsed={time.perf_counter() - indices_start:.3f}s"
+                        )
                 else:
+                    ts_lookup_start = time.perf_counter()
                     timestamps = np.asarray(spec["timestamps"], dtype=np.float64)
                     decode_device_index = int(encoder_device.index or 0) if encoder_device.type == "cuda" else -1
-                    frame_ts = _get_rank_video_frame_timestamps(
-                        video_path,
-                        decode_device_index,
-                        decode_threads,
-                    )[:, :1]
-                    frame_indices = np.abs(frame_ts - timestamps).argmin(axis=0).astype(np.int64).tolist()
+                    if decode_backend == "decord":
+                        if debug_enabled:
+                            self._log_gpu_decode_debug(
+                                f"spec {total_specs} lookup timestamps count={len(timestamps)}"
+                            )
+                        frame_ts = _get_rank_video_frame_timestamps(
+                            video_path,
+                            decode_device_index,
+                            decode_threads,
+                        )[:, :1]
+                        if debug_enabled:
+                            self._log_gpu_decode_debug(
+                                f"spec {total_specs} frame timestamp table shape={frame_ts.shape} "
+                                f"elapsed={time.perf_counter() - ts_lookup_start:.3f}s"
+                            )
+                        argmin_start = time.perf_counter()
+                        frame_indices = np.abs(frame_ts - timestamps).argmin(axis=0).astype(np.int64).tolist()
+                        if debug_enabled:
+                            self._log_gpu_decode_debug(
+                                f"spec {total_specs} mapped timestamps->indices elapsed={time.perf_counter() - argmin_start:.3f}s"
+                            )
+                    else:
+                        frame_indices = None
+                        if debug_enabled:
+                            self._log_gpu_decode_debug(
+                                f"spec {total_specs} using torchcodec timestamp decode count={len(timestamps)} "
+                                f"elapsed={time.perf_counter() - ts_lookup_start:.3f}s"
+                            )
 
                 if encoder_device.type == "cuda":
                     decode_device_index = int(encoder_device.index or 0)
-                    reader = _get_rank_gpu_video_reader(
-                        video_path, decode_device_index, decode_threads
-                    )
-                    frames = reader.get_batch(frame_indices)
-                    frames = torch.utils.dlpack.from_dlpack(frames.to_dlpack())
+                    if decode_backend == "decord":
+                        create_start = time.perf_counter()
+                        if debug_enabled:
+                            self._log_gpu_decode_debug(
+                                f"spec {total_specs} creating gpu reader device={decode_device_index}"
+                            )
+                        reader = _get_rank_gpu_video_reader(
+                            video_path, decode_device_index, decode_threads
+                        )
+                        if debug_enabled:
+                            self._log_gpu_decode_debug(
+                                f"spec {total_specs} gpu reader created elapsed={time.perf_counter() - create_start:.3f}s"
+                            )
+                        get_batch_start = time.perf_counter()
+                        if debug_enabled:
+                            self._log_gpu_decode_debug(
+                                f"spec {total_specs} gpu get_batch start count={len(frame_indices)}"
+                            )
+                        frames = reader.get_batch(frame_indices)
+                        if debug_enabled:
+                            self._log_gpu_decode_debug(
+                                f"spec {total_specs} gpu get_batch returned elapsed={time.perf_counter() - get_batch_start:.3f}s"
+                            )
+                        dlpack_start = time.perf_counter()
+                        frames = torch.utils.dlpack.from_dlpack(frames.to_dlpack())
+                        del reader
+                        if debug_enabled:
+                            self._log_gpu_decode_debug(
+                                f"spec {total_specs} gpu dlpack->torch elapsed={time.perf_counter() - dlpack_start:.3f}s"
+                            )
+                    else:
+                        decode_device = f"cuda:{decode_device_index}"
+                        reader = self._get_or_create_torchcodec_reader(
+                            video_path=video_path,
+                            device=decode_device,
+                            decode_threads=decode_threads,
+                            dimension_order=torchcodec_dimension_order,
+                            seek_mode=torchcodec_seek_mode,
+                            cuda_backend=torchcodec_cuda_backend,
+                            debug_enabled=debug_enabled,
+                            spec_index=total_specs,
+                        )
+                        get_batch_start = time.perf_counter()
+                        frame_range = (
+                            self._frame_indices_to_range(frame_indices, torchcodec_fetch_mode)
+                            if frame_indices is not None
+                            else None
+                        )
+                        if frame_range is not None:
+                            start_idx, stop_idx, step_idx = frame_range
+                            if debug_enabled:
+                                self._log_gpu_decode_debug(
+                                    f"spec {total_specs} torchcodec get_frames_in_range start={start_idx} stop={stop_idx} step={step_idx}"
+                                )
+                            frame_batch = reader.get_frames_in_range(
+                                start=start_idx,
+                                stop=stop_idx,
+                                step=step_idx,
+                            )
+                        elif frame_indices is not None:
+                            if debug_enabled:
+                                self._log_gpu_decode_debug(
+                                    f"spec {total_specs} torchcodec get_frames_at start count={len(frame_indices)}"
+                                )
+                            frame_batch = reader.get_frames_at(indices=frame_indices)
+                        else:
+                            if debug_enabled:
+                                self._log_gpu_decode_debug(
+                                    f"spec {total_specs} torchcodec get_frames_played_at start count={len(timestamps)}"
+                                )
+                            frame_batch = reader.get_frames_played_at(seconds=timestamps.tolist())
+                        if debug_enabled:
+                            self._log_gpu_decode_debug(
+                                f"spec {total_specs} torchcodec frame fetch returned elapsed={time.perf_counter() - get_batch_start:.3f}s"
+                            )
+                        frames = frame_batch.data
+                        del frame_batch
+                        if debug_enabled:
+                            self._log_gpu_decode_debug(
+                                f"spec {total_specs} torchcodec tensor ready device={frames.device} dtype={frames.dtype}"
+                            )
                 else:
-                    reader = _get_rank_cpu_video_reader(video_path, decode_threads)
-                    frames = torch.from_numpy(reader.get_batch(frame_indices).asnumpy())
+                    create_start = time.perf_counter()
+                    if debug_enabled:
+                        self._log_gpu_decode_debug(
+                            f"spec {total_specs} creating cpu reader"
+                        )
+                    if decode_backend == "decord":
+                        reader = _get_rank_cpu_video_reader(video_path, decode_threads)
+                        if debug_enabled:
+                            self._log_gpu_decode_debug(
+                                f"spec {total_specs} cpu reader created elapsed={time.perf_counter() - create_start:.3f}s"
+                            )
+                        get_batch_start = time.perf_counter()
+                        if debug_enabled:
+                            self._log_gpu_decode_debug(
+                                f"spec {total_specs} cpu get_batch start count={len(frame_indices)}"
+                            )
+                        frames = torch.from_numpy(reader.get_batch(frame_indices).asnumpy())
+                        if debug_enabled:
+                            self._log_gpu_decode_debug(
+                                f"spec {total_specs} decord cpu get_batch elapsed={time.perf_counter() - get_batch_start:.3f}s"
+                            )
+                    else:
+                        reader = self._get_or_create_torchcodec_reader(
+                            video_path=video_path,
+                            device="cpu",
+                            decode_threads=decode_threads,
+                            dimension_order=torchcodec_dimension_order,
+                            seek_mode=torchcodec_seek_mode,
+                            cuda_backend=torchcodec_cuda_backend,
+                            debug_enabled=debug_enabled,
+                            spec_index=total_specs,
+                        )
+                        get_batch_start = time.perf_counter()
+                        frame_range = (
+                            self._frame_indices_to_range(frame_indices, torchcodec_fetch_mode)
+                            if frame_indices is not None
+                            else None
+                        )
+                        if frame_range is not None:
+                            start_idx, stop_idx, step_idx = frame_range
+                            if debug_enabled:
+                                self._log_gpu_decode_debug(
+                                    f"spec {total_specs} torchcodec cpu get_frames_in_range start={start_idx} stop={stop_idx} step={step_idx}"
+                                )
+                            frame_batch = reader.get_frames_in_range(
+                                start=start_idx,
+                                stop=stop_idx,
+                                step=step_idx,
+                            )
+                        elif frame_indices is not None:
+                            if debug_enabled:
+                                self._log_gpu_decode_debug(
+                                    f"spec {total_specs} torchcodec cpu get_frames_at start count={len(frame_indices)}"
+                                )
+                            frame_batch = reader.get_frames_at(indices=frame_indices)
+                        else:
+                            if debug_enabled:
+                                self._log_gpu_decode_debug(
+                                    f"spec {total_specs} torchcodec cpu get_frames_played_at start count={len(timestamps)}"
+                                )
+                            frame_batch = reader.get_frames_played_at(seconds=timestamps.tolist())
+                        if debug_enabled:
+                            self._log_gpu_decode_debug(
+                                f"spec {total_specs} torchcodec cpu frame fetch elapsed={time.perf_counter() - get_batch_start:.3f}s"
+                            )
+                        frames = frame_batch.data.cpu()
+                        del frame_batch
 
+                decode_total_time += time.perf_counter() - spec_decode_start
+                post_start = time.perf_counter()
                 frames = frames.to(encoder_device, non_blocking=True)
-                frames = frames.permute(0, 3, 1, 2).contiguous()
-                _, _, H, W = frames.shape
+                if decode_backend == "torchcodec" and torchcodec_dimension_order == "NCHW":
+                    _, _, H, W = frames.shape
+                else:
+                    frames = frames.permute(0, 3, 1, 2).contiguous()
+                    _, _, H, W = frames.shape
                 if H != target_size or W != target_size:
                     frames = F.interpolate(
                         frames.to(dtype=torch.float32),
@@ -506,13 +895,32 @@ class VLA_JEPA(baseframework):
                     frames = frames.clamp_(0, 255).round_().to(torch.uint8)
                 elif frames.dtype != torch.uint8:
                     frames = frames.to(torch.uint8)
+                if debug_enabled:
+                    self._log_gpu_decode_debug(
+                        f"spec {total_specs} postprocess shape={tuple(frames.shape)} "
+                        f"elapsed={time.perf_counter() - post_start:.3f}s"
+                    )
+                postprocess_total_time += time.perf_counter() - post_start
                 view_videos.append(frames)
 
             if len(view_videos) == 1:
                 view_videos.append(view_videos[0].clone())
             batch_videos.append(torch.stack(view_videos, dim=0))
 
-        return torch.stack(batch_videos, dim=0)
+        if debug_enabled:
+            self._log_gpu_decode_debug(
+                f"done {spec_key}: examples={len(examples)} specs={total_specs} "
+                f"elapsed={time.perf_counter() - batch_decode_start:.3f}s"
+            )
+        batch_tensor = torch.stack(batch_videos, dim=0)
+        if return_timing:
+            return batch_tensor, {
+                "video_decode_time": decode_total_time,
+                "video_postprocess_time": postprocess_total_time,
+                "video_decode_total_time": time.perf_counter() - batch_decode_start,
+                "video_decode_specs": float(total_specs),
+            }
+        return batch_tensor
 
     def _extract_training_videos(
         self,
@@ -523,6 +931,12 @@ class VLA_JEPA(baseframework):
             if batch_compact_videos is not None:
                 return self._split_compact_videos(batch_compact_videos)
             return examples["video"], examples.get("video_target")
+
+        if "_prefetched_video_compact_batch" in examples[0]:
+            return self._split_compact_videos(examples[0]["_prefetched_video_compact_batch"])
+
+        if "_prefetched_video_batch" in examples[0]:
+            return examples[0]["_prefetched_video_batch"], None
 
         if "video_compact_decode_specs" in examples[0]:
             batch_compact_videos = self._decode_video_specs(examples, "video_compact_decode_specs")
@@ -541,7 +955,73 @@ class VLA_JEPA(baseframework):
             batch_target_videos = np.stack([example["video_target"] for example in examples]).transpose(0, 1, 2, 5, 3, 4)
         return batch_videos, batch_target_videos
 
-    def _encode_videos(self, batch_videos: np.ndarray | torch.Tensor, device: torch.device) -> torch.Tensor:
+    def prepare_rank_prefetched_batch(
+        self,
+        examples: List[dict] | dict,
+        *,
+        stream: Optional[torch.cuda.Stream] = None,
+    ) -> tuple[List[dict] | dict, Optional[torch.cuda.Event]]:
+        if isinstance(examples, dict) or not isinstance(examples, list) or len(examples) == 0:
+            return examples, None
+
+        batch_key = None
+        spec_key = None
+        if "video_compact_decode_specs" in examples[0]:
+            batch_key = "_prefetched_video_compact_batch"
+            spec_key = "video_compact_decode_specs"
+        elif "video_decode_specs" in examples[0]:
+            batch_key = "_prefetched_video_batch"
+            spec_key = "video_decode_specs"
+
+        if spec_key is None:
+            return examples, None
+
+        stream_ctx = (
+            torch.cuda.stream(stream)
+            if stream is not None and torch.cuda.is_available()
+            else nullcontext()
+        )
+        instructions = [example["lang"] for example in examples]
+        has_actions = "action" in examples[0]
+        timing_payload = None
+        with torch.inference_mode(), stream_ctx:
+            decoded_batch, decode_timing = self._decode_video_specs(
+                examples,
+                spec_key,
+                return_timing=True,
+            )
+            qwen_build_start = time.perf_counter()
+            qwen_inputs = self._build_qwen_inputs_from_video_tensor(
+                batch_videos=self._split_compact_videos(decoded_batch)[0] if batch_key == "_prefetched_video_compact_batch" else decoded_batch,
+                instructions=instructions,
+                has_actions=has_actions,
+            )
+            timing_payload = dict(decode_timing)
+            timing_payload["qwen_tensor_build_time"] = time.perf_counter() - qwen_build_start
+
+        prepared_examples = [dict(example) for example in examples]
+        for example in prepared_examples:
+            example.pop(spec_key, None)
+        prepared_examples[0][batch_key] = decoded_batch
+
+        prepared_examples[0]["qwen_inputs"] = qwen_inputs
+        if timing_payload is not None:
+            prepared_examples[0]["_prefetch_timing"] = timing_payload
+
+        ready_event = None
+        if stream is not None and torch.cuda.is_available():
+            ready_event = torch.cuda.Event()
+            stream.record_event(ready_event)
+
+        return prepared_examples, ready_event
+
+    def _encode_videos(
+        self,
+        batch_videos: np.ndarray | torch.Tensor,
+        device: torch.device,
+        *,
+        return_timing: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, dict[str, float]]:
         """
         Encode multi-view videos into patch tokens.
 
@@ -552,6 +1032,8 @@ class VLA_JEPA(baseframework):
         B, V, T, C, H, W = batch_videos.shape
         flat_videos = batch_videos.reshape(B * V, T, C, H, W)
         source = self.config.framework.vj2_model.get("source", "hf")
+        encode_start = time.perf_counter()
+        video_tensor_to_cuda_time = 0.0
 
         if source == "hf":
             processed = []
@@ -559,7 +1041,10 @@ class VLA_JEPA(baseframework):
                 processed.append(
                     self.vj_processor(videos=flat_videos[i], return_tensors="pt")["pixel_values_videos"]
                 )
-            input_videos = torch.cat(processed, dim=0).to(device, non_blocking=True)
+            input_videos = torch.cat(processed, dim=0)
+            to_cuda_start = time.perf_counter()
+            input_videos = input_videos.to(device, non_blocking=True)
+            video_tensor_to_cuda_time += time.perf_counter() - to_cuda_start
             encoded = self.vj_encoder.get_vision_features(pixel_values_videos=input_videos)
         elif source == "torchhub":
             crop_size = self.config.framework.vj2_model.get("crop_size", 384)
@@ -567,7 +1052,9 @@ class VLA_JEPA(baseframework):
                 input_videos = flat_videos
                 if isinstance(input_videos, np.ndarray):
                     input_videos = torch.from_numpy(np.ascontiguousarray(input_videos))
+                to_cuda_start = time.perf_counter()
                 input_videos = input_videos.to(device, dtype=torch.float32, non_blocking=True)
+                video_tensor_to_cuda_time += time.perf_counter() - to_cuda_start
                 input_videos = input_videos.permute(0, 2, 1, 3, 4)
                 input_videos.div_(255.0)
                 input_videos.sub_(self._img_mean.to(device=device)).div_(self._img_std.to(device=device))
@@ -582,14 +1069,24 @@ class VLA_JEPA(baseframework):
                     if isinstance(out, list):
                         out = out[0]
                     processed.append(out)
-                input_videos = torch.stack(processed).to(device, non_blocking=True)
+                input_videos = torch.stack(processed)
+                to_cuda_start = time.perf_counter()
+                input_videos = input_videos.to(device, non_blocking=True)
+                video_tensor_to_cuda_time += time.perf_counter() - to_cuda_start
             if self.config.get("trainer", {}).get("channels_last", False):
                 input_videos = input_videos.contiguous(memory_format=torch.channels_last_3d)
             encoded = self.vj_encoder(input_videos)
         else:
             raise ValueError(f"Unsupported V-JEPA source: {source}")
 
-        return torch.cat(torch.chunk(encoded, chunks=V, dim=0), dim=2)
+        merged = torch.cat(torch.chunk(encoded, chunks=V, dim=0), dim=2)
+        if return_timing:
+            total_encode_time = time.perf_counter() - encode_start
+            return merged, {
+                "video_tensor_to_cuda_time": video_tensor_to_cuda_time,
+                "vj_encode_time": max(0.0, total_encode_time - video_tensor_to_cuda_time),
+            }
+        return merged
 
     def expand_tokenizer(self, 
                          tokenizer: AutoTokenizer,
@@ -625,6 +1122,13 @@ class VLA_JEPA(baseframework):
         rabc_weights: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Tuple:
+        timing_stats = {
+            "video_tensor_to_cuda_time": 0.0,
+            "qwen_input_build_time": 0.0,
+            "qwen_forward_time": 0.0,
+            "vj_encode_time": 0.0,
+            "predictor_action_head_time": 0.0,
+        }
         batch_videos, batch_target_videos = self._extract_training_videos(examples)
         if isinstance(examples, dict):
             actions = examples.get("action")
@@ -633,21 +1137,30 @@ class VLA_JEPA(baseframework):
                 qwen_inputs = self._move_qwen_inputs(examples["qwen_inputs"])
             else:
                 instructions = list(examples["lang"])
-                qwen_inputs = self._build_qwen_inputs_from_video_tensor(
+                qwen_inputs, qwen_timing = self._build_qwen_inputs_from_video_tensor(
                     batch_videos=batch_videos,
                     instructions=instructions,
                     has_actions=actions is not None,
+                    return_timing=True,
                 )
+                timing_stats["video_tensor_to_cuda_time"] += qwen_timing["video_tensor_to_cuda_time"]
+                timing_stats["qwen_input_build_time"] += qwen_timing["qwen_input_build_time"]
             has_actions = actions is not None
         else:
             actions = [example["action"] for example in examples] if "action" in examples[0] else None
             state = [example["state"] for example in examples] if "state" in examples[0] else None
-            instructions = [example["lang"] for example in examples]
-            qwen_inputs = self._build_qwen_inputs_from_video_tensor(
-                batch_videos=batch_videos,
-                instructions=instructions,
-                has_actions=actions is not None,
-            )
+            if "qwen_inputs" in examples[0]:
+                qwen_inputs = self._move_qwen_inputs(examples[0]["qwen_inputs"])
+            else:
+                instructions = [example["lang"] for example in examples]
+                qwen_inputs, qwen_timing = self._build_qwen_inputs_from_video_tensor(
+                    batch_videos=batch_videos,
+                    instructions=instructions,
+                    has_actions=actions is not None,
+                    return_timing=True,
+                )
+                timing_stats["video_tensor_to_cuda_time"] += qwen_timing["video_tensor_to_cuda_time"]
+                timing_stats["qwen_input_build_time"] += qwen_timing["qwen_input_build_time"]
             has_actions = actions is not None
 
         input_ids = qwen_inputs["input_ids"]
@@ -657,6 +1170,7 @@ class VLA_JEPA(baseframework):
         embodied_action_indices = torch.isin(input_ids, embodied_token_id).nonzero(as_tuple=True)
         
         qwen_context = nullcontext() if self._qwen_requires_grad() else torch.no_grad()
+        qwen_forward_start = time.perf_counter()
         with qwen_context, torch.autocast("cuda", dtype=torch.bfloat16):
             # Use feature-extraction path: skips LM head and avoids storing all
             # intermediate hidden states (saves both compute and memory).
@@ -664,6 +1178,7 @@ class VLA_JEPA(baseframework):
             B, _, H = last_hidden.shape
             action_tokens = last_hidden[action_indices[0], action_indices[1], :].view(B, -1, H)
             embodied_action_tokens = last_hidden[embodied_action_indices[0], embodied_action_indices[1], :].view(B, -1, H)
+        timing_stats["qwen_forward_time"] += time.perf_counter() - qwen_forward_start
 
         # Step 2: JEPA Encoder
         with torch.autocast("cuda", dtype=torch.bfloat16):
@@ -671,16 +1186,29 @@ class VLA_JEPA(baseframework):
             encoder_device = next(self.vj_encoder.parameters()).device
             encoder_context = torch.no_grad() if self.vj_freeze_encoder else nullcontext()
             with encoder_context:
-                input_states = self._encode_videos(batch_videos=batch_videos, device=encoder_device)
+                input_states, input_encode_timing = self._encode_videos(
+                    batch_videos=batch_videos,
+                    device=encoder_device,
+                    return_timing=True,
+                )
+                timing_stats["video_tensor_to_cuda_time"] += input_encode_timing["video_tensor_to_cuda_time"]
+                timing_stats["vj_encode_time"] += input_encode_timing["vj_encode_time"]
                 if batch_target_videos is not None:
-                    gt_states = self._encode_videos(batch_videos=batch_target_videos, device=encoder_device)
+                    gt_states, target_encode_timing = self._encode_videos(
+                        batch_videos=batch_target_videos,
+                        device=encoder_device,
+                        return_timing=True,
+                    )
+                    timing_stats["video_tensor_to_cuda_time"] += target_encode_timing["video_tensor_to_cuda_time"]
+                    timing_stats["vj_encode_time"] += target_encode_timing["vj_encode_time"]
                 else:
                     video_embeddings = input_states
                     T = T // self._get_vjepa_attr("tubelet_size")
                     input_states = video_embeddings[:, :video_embeddings.shape[1] // T * (T-1), :]
                     gt_states = video_embeddings[:, video_embeddings.shape[1] // T:, :]
 
-        # Step 3: VJ Predictor
+        # Step 3: VJ Predictor / Action Head
+        predictor_head_start = time.perf_counter()
         with torch.autocast("cuda", dtype=torch.bfloat16):
             predicted_states = self.vj_predictor(
                 input_states,
@@ -694,7 +1222,8 @@ class VLA_JEPA(baseframework):
             )
         
         if not has_actions:
-            return {"wm_loss": teacher_forcing_wm_loss}
+            timing_stats["predictor_action_head_time"] += time.perf_counter() - predictor_head_start
+            return {"wm_loss": teacher_forcing_wm_loss, **timing_stats}
 
         with torch.autocast("cuda", dtype=torch.bfloat16):
             if isinstance(actions, torch.Tensor):
@@ -731,7 +1260,8 @@ class VLA_JEPA(baseframework):
             else:
                 action_loss = per_sample_action_loss.mean()
 
-        result = {"action_loss": action_loss, "wm_loss": teacher_forcing_wm_loss}
+        timing_stats["predictor_action_head_time"] += time.perf_counter() - predictor_head_start
+        result = {"action_loss": action_loss, "wm_loss": teacher_forcing_wm_loss, **timing_stats}
         if rabc_weights is not None:
             result["rabc_mean_weight"] = rabc_weights.detach().mean()
         return result
@@ -765,34 +1295,37 @@ class VLA_JEPA(baseframework):
             else:
                 if state is None and "state" in batch[0]:
                     state = [example["state"] for example in batch]
-                instructions = [example["lang"] for example in batch]
-                if (
-                    "video_decode_specs" in batch[0]
-                    or "video_compact_decode_specs" in batch[0]
-                    or "video" in batch[0]
-                    or "video_compact" in batch[0]
-                ):
-                    batch_videos, _ = self._extract_training_videos(batch)
-                    qwen_inputs = self._build_qwen_inputs_from_video_tensor(
-                        batch_videos=batch_videos,
-                        instructions=instructions,
-                        has_actions=False,
-                        prompt_replace_dict={
-                            "{actions}": self.replace_prompt,
-                            "{e_actions}": self.embodied_replace_prompt,
-                        },
-                        prompt_template=self.config.datasets.vla_data.get("CoT_prompt", ""),
-                    )
+                if "qwen_inputs" in batch[0]:
+                    qwen_inputs = self._move_qwen_inputs(batch[0]["qwen_inputs"])
                 else:
-                    batch_images = [example["image"] for example in batch]
-                    qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(
-                        images=batch_images,
-                        instructions=instructions,
-                        prompt_replace_dict={
-                            "{actions}": self.replace_prompt,
-                            "{e_actions}": self.embodied_replace_prompt,
-                        },
-                    )
+                    instructions = [example["lang"] for example in batch]
+                    if (
+                        "video_decode_specs" in batch[0]
+                        or "video_compact_decode_specs" in batch[0]
+                        or "video" in batch[0]
+                        or "video_compact" in batch[0]
+                    ):
+                        batch_videos, _ = self._extract_training_videos(batch)
+                        qwen_inputs = self._build_qwen_inputs_from_video_tensor(
+                            batch_videos=batch_videos,
+                            instructions=instructions,
+                            has_actions=False,
+                            prompt_replace_dict={
+                                "{actions}": self.replace_prompt,
+                                "{e_actions}": self.embodied_replace_prompt,
+                            },
+                            prompt_template=self.config.datasets.vla_data.get("CoT_prompt", ""),
+                        )
+                    else:
+                        batch_images = [example["image"] for example in batch]
+                        qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(
+                            images=batch_images,
+                            instructions=instructions,
+                            prompt_replace_dict={
+                                "{actions}": self.replace_prompt,
+                                "{e_actions}": self.embodied_replace_prompt,
+                            },
+                        )
         else:
             train_obs_image_size = getattr(self.config.datasets.vla_data, "image_size", None)
             if train_obs_image_size:
