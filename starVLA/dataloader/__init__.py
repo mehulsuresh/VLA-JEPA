@@ -111,6 +111,11 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe", model=None): # TODO
                 "LeRobot dataloader will hand off video decode specs to each training rank; "
                 "video frames are decoded on the rank device instead of inside dataloader workers"
             )
+        elif bool(vla_dataset_cfg.get("cpu_video_decode_drop_worker_images", False)):
+            logger.info(
+                "LeRobot dataloader will keep CPU video decode in workers but skip worker-built image payloads; "
+                "the training rank will derive Qwen inputs from the returned video tensors"
+            )
 
         loader_kwargs = dict(
             dataset=vla_dataset,

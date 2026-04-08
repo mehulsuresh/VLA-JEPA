@@ -1568,6 +1568,7 @@ class LeRobotMixtureDataset(Dataset):
     # Keep a class-level default so older pickled instances still have a sane
     # fallback after reloads or worker respawns.
     gpu_video_decode_on_rank = False
+    cpu_video_decode_drop_worker_images = False
 
     def __init__(
         self,
@@ -1581,6 +1582,7 @@ class LeRobotMixtureDataset(Dataset):
         video_frame_stride: int = 1,
         video_target_shift_steps: int = 0,
         gpu_video_decode_on_rank: bool = False,
+        cpu_video_decode_drop_worker_images: bool = False,
         seed: int = 42,
         metadata_config: dict = {
             "percentile_mixing_method": "min_max",
@@ -1620,6 +1622,7 @@ class LeRobotMixtureDataset(Dataset):
         self.video_frame_stride = max(int(video_frame_stride), 1)
         self.video_target_shift_steps = max(int(video_target_shift_steps), 0)
         self.gpu_video_decode_on_rank = bool(gpu_video_decode_on_rank)
+        self.cpu_video_decode_drop_worker_images = bool(cpu_video_decode_drop_worker_images)
 
         # Set properties for sampling
 
@@ -1694,6 +1697,7 @@ class LeRobotMixtureDataset(Dataset):
 
     def __setstate__(self, state):
         state.setdefault("gpu_video_decode_on_rank", False)
+        state.setdefault("cpu_video_decode_drop_worker_images", False)
         self.__dict__.update(state)
 
     @property
@@ -1790,6 +1794,7 @@ class LeRobotMixtureDataset(Dataset):
         trajectory_name: int,
         step: int,
         video_horizon: int,
+        build_images: bool = True,
     ) -> tuple[list[np.ndarray], list[Image.Image]]:
         if self.video_target_shift_steps <= 0:
             raise ValueError("video_target_shift_steps must be positive to build shifted video targets")
@@ -1814,9 +1819,10 @@ class LeRobotMixtureDataset(Dataset):
             )
             merged_video = self.resize_video_opencv(merged_video, self.video_resolution_size)
             videos.append(merged_video)
-            images.append(
-                Image.fromarray(merged_video[context_horizon - 1]).resize((self.resolution_size, self.resolution_size))
-            )
+            if build_images:
+                images.append(
+                    Image.fromarray(merged_video[context_horizon - 1]).resize((self.resolution_size, self.resolution_size))
+                )
 
         return videos, images
 
@@ -1899,6 +1905,10 @@ class LeRobotMixtureDataset(Dataset):
             try:
                 dataset, trajectory_name, step = self.sample_step(index)
                 compact_video_mode = self.video_target_shift_steps > 0
+                build_worker_images = not (
+                    (not self.gpu_video_decode_on_rank)
+                    and self.cpu_video_decode_drop_worker_images
+                )
 
                 # Process all video keys dynamically.
                 if self.gpu_video_decode_on_rank:
@@ -1947,6 +1957,7 @@ class LeRobotMixtureDataset(Dataset):
                         trajectory_name,
                         step,
                         video_horizon=video_horizon,
+                        build_images=build_worker_images,
                     )
                 else:
                     data = dataset.transforms(dataset.get_step_data(trajectory_name, step))    # video T = 1, action T = horizon
@@ -1955,13 +1966,15 @@ class LeRobotMixtureDataset(Dataset):
                         video = data[video_key] # Shape: (T, H, W, C)
                         video = self.resize_video_opencv(video, self.video_resolution_size)
                         videos.append(video)
-                        primary_image = Image.fromarray(video[0]).resize((self.resolution_size, self.resolution_size))
-                        images.append(primary_image)
+                        if build_worker_images:
+                            primary_image = Image.fromarray(video[0]).resize((self.resolution_size, self.resolution_size))
+                            images.append(primary_image)
 
                 if not self.gpu_video_decode_on_rank:
                     if len(dataset.modality_keys["video"]) == 1:
                         videos = [videos[0], videos[0].copy()]  # Duplicate if only one video
-                        images = [images[0], images[0].copy()]
+                        if build_worker_images:
+                            images = [images[0], images[0].copy()]
                     videos = np.stack(videos, axis=0)  # Shape: (V, T, H, W, C)
                     
                 # Get language and action data
@@ -1971,7 +1984,9 @@ class LeRobotMixtureDataset(Dataset):
                     action.append(data[action_key])
                 action = np.concatenate(action, axis=1).astype(np.float16)
 
-                return_dict = dict(action=action, image=images, lang=language)
+                return_dict = dict(action=action, lang=language)
+                if build_worker_images:
+                    return_dict["image"] = images
                 if self.gpu_video_decode_on_rank:
                     return_dict.pop("image", None)
                     if compact_video_mode:
