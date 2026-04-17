@@ -390,23 +390,78 @@ class VLA_JEPA(baseframework):
                 moved[key] = value
         return moved
 
+    def _resolve_qwen_prompt_args(
+        self,
+        *,
+        has_actions: bool,
+        prompt_replace_dict: Optional[dict[str, str]] = None,
+        prompt_template: Optional[str] = None,
+    ) -> tuple[dict[str, str], str]:
+        if prompt_replace_dict is None:
+            prompt_replace_dict = {"{actions}": self.replace_prompt}
+            if has_actions:
+                prompt_replace_dict["{e_actions}"] = self.embodied_replace_prompt
+
+        if prompt_template is None:
+            prompt_template = (
+                self.config.datasets.vla_data.get("CoT_prompt", "")
+                if has_actions
+                else self.config.datasets.video_data.get("CoT_prompt", "")
+            )
+
+        return prompt_replace_dict, prompt_template
+
+    def _validate_qwen_action_prompt_tokens(
+        self,
+        qwen_inputs: dict[str, torch.Tensor],
+        *,
+        has_actions: bool,
+        stage: str,
+    ) -> None:
+        input_ids = qwen_inputs["input_ids"]
+        action_token_ids = self._action_token_ids_t.to(input_ids.device)
+        embodied_token_id = self._embodied_token_id_t.to(input_ids.device)
+
+        expected_action_count = (
+            self.config.framework.vj2_model.num_frames // self._get_vjepa_attr("tubelet_size") - 1
+        ) * self.config.framework.vj2_model.num_action_tokens_per_timestep
+        action_count = int(torch.isin(input_ids, action_token_ids).sum().item())
+        if action_count != expected_action_count:
+            raise RuntimeError(
+                f"{stage}: expected {expected_action_count} action prompt tokens in Qwen inputs, "
+                f"found {action_count}. This usually means prompt placeholders were not expanded "
+                "before building Qwen inputs."
+            )
+
+        if has_actions:
+            expected_embodied_count = (
+                self.config.framework.vj2_model.num_embodied_action_tokens_per_instruction
+            )
+            embodied_count = int(torch.isin(input_ids, embodied_token_id).sum().item())
+            if embodied_count != expected_embodied_count:
+                raise RuntimeError(
+                    f"{stage}: expected {expected_embodied_count} embodied-action prompt tokens in "
+                    f"Qwen inputs, found {embodied_count}. This usually means prompt placeholders "
+                    "were not expanded before building Qwen inputs."
+                )
+
     def _build_qwen_inputs_from_examples(self, examples: List[dict]) -> dict[str, torch.Tensor]:
         batch_images = [example["image"] for example in examples]
         instructions = [example["lang"] for example in examples]
         has_actions = "action" in examples[0]
-        if has_actions:
-            return self.qwen_vl_interface.build_qwenvl_inputs(
-                images=batch_images,
-                instructions=instructions,
-                prompt_replace_dict={"{actions}": self.replace_prompt, "{e_actions}": self.embodied_replace_prompt},
-                prompt_template=self.config.datasets.vla_data.get("CoT_prompt", ""),
-            )
-        return self.qwen_vl_interface.build_qwenvl_inputs(
+        prompt_replace_dict, prompt_template = self._resolve_qwen_prompt_args(has_actions=has_actions)
+        qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(
             images=batch_images,
             instructions=instructions,
-            prompt_replace_dict={"{actions}": self.replace_prompt},
-            prompt_template=self.config.datasets.video_data.get("CoT_prompt", ""),
+            prompt_replace_dict=prompt_replace_dict,
+            prompt_template=prompt_template,
         )
+        self._validate_qwen_action_prompt_tokens(
+            qwen_inputs,
+            has_actions=has_actions,
+            stage="_build_qwen_inputs_from_examples",
+        )
+        return qwen_inputs
 
     def _build_qwen_inputs_from_video_tensor(
         self,
@@ -439,6 +494,12 @@ class VLA_JEPA(baseframework):
             ).reshape(B, V, C, target_size, target_size)
         frames = frames.clamp_(0, 255).round_().to(torch.uint8)
 
+        prompt_replace_dict, prompt_template = self._resolve_qwen_prompt_args(
+            has_actions=has_actions,
+            prompt_replace_dict=prompt_replace_dict,
+            prompt_template=prompt_template,
+        )
+
         build_from_tensor = getattr(self.qwen_vl_interface, "build_qwenvl_inputs_from_frames_tensor", None)
         if callable(build_from_tensor):
             qwen_inputs = build_from_tensor(
@@ -446,6 +507,11 @@ class VLA_JEPA(baseframework):
                 instructions=instructions,
                 prompt_replace_dict=prompt_replace_dict,
                 prompt_template=prompt_template,
+            )
+            self._validate_qwen_action_prompt_tokens(
+                qwen_inputs,
+                has_actions=has_actions,
+                stage="_build_qwen_inputs_from_video_tensor[tensor_fast_path]",
             )
             if return_timing:
                 return qwen_inputs, {
@@ -459,26 +525,16 @@ class VLA_JEPA(baseframework):
             for b in range(B)
         ]
 
-        if prompt_replace_dict is None:
-            if has_actions:
-                prompt_replace_dict = {
-                    "{actions}": self.replace_prompt,
-                    "{e_actions}": self.embodied_replace_prompt,
-                }
-            else:
-                prompt_replace_dict = {"{actions}": self.replace_prompt}
-        if prompt_template is None:
-            prompt_template = (
-                self.config.datasets.vla_data.get("CoT_prompt", "")
-                if has_actions
-                else self.config.datasets.video_data.get("CoT_prompt", "")
-            )
-
         qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(
             images=image_batches,
             instructions=instructions,
             prompt_replace_dict=prompt_replace_dict,
             prompt_template=prompt_template,
+        )
+        self._validate_qwen_action_prompt_tokens(
+            qwen_inputs,
+            has_actions=has_actions,
+            stage="_build_qwen_inputs_from_video_tensor[image_fallback]",
         )
         if return_timing:
             return qwen_inputs, {
@@ -1331,11 +1387,18 @@ class VLA_JEPA(baseframework):
             if train_obs_image_size:
                 batch_images = resize_images(batch_images, target_size=train_obs_image_size)
 
+            prompt_replace_dict, prompt_template = self._resolve_qwen_prompt_args(has_actions=True)
             qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(
                 images=batch_images,
                 instructions=instructions,
-                prompt_replace_dict={"{actions}": self.replace_prompt, "{e_actions}": self.embodied_replace_prompt},
+                prompt_replace_dict=prompt_replace_dict,
+                prompt_template=prompt_template,
             )
+        self._validate_qwen_action_prompt_tokens(
+            qwen_inputs,
+            has_actions=True,
+            stage="predict_action",
+        )
 
         embodied_action_indices = torch.isin(qwen_inputs["input_ids"], self._embodied_token_id_t).nonzero(as_tuple=True)
 
