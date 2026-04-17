@@ -18,14 +18,20 @@ class WebsocketClientPolicy:
     See WebsocketPolicyServer for a corresponding server implementation.
     """
 
-    def __init__(self, host: str = "127.0.0.1", port: Optional[int] = 10093, api_key: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        host: str = "127.0.0.1",
+        port: Optional[int] = 10093,
+        api_key: Optional[str] = None,
+        timeout: float = 600,
+    ) -> None:
         # 0.0.0.0 cannot be used as a connection target, here default 127.0.0.1
         self._uri = f"ws://{host}"
         if port is not None:
             self._uri += f":{port}"
         self._packer = msgpack_numpy.Packer()
         self._api_key = api_key
-        self._ws, self._server_metadata = self._wait_for_server()
+        self._ws, self._server_metadata = self._wait_for_server(timeout=timeout)
 
     def get_server_metadata(self) -> Dict:
         return self._server_metadata
