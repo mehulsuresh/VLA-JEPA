@@ -1,6 +1,6 @@
 # VLA-JEPA Architecture
 
-This diagram reflects the current training pipeline in [`VLA_JEPA.py`](/home/mehul/work/vjepa/VLA-JEPA/starVLA/model/framework/VLA_JEPA.py) with the active single-GPU training config in [`vlajepa_robot_ft_trossen_vjepa21_small_5090.yaml`](/home/mehul/work/vjepa/VLA-JEPA/scripts/config/vlajepa_robot_ft_trossen_vjepa21_small_5090.yaml).
+This diagram reflects the current training pipeline in [`VLA_JEPA.py`](/home/mehul/work/vjepa/VLA-JEPA/starVLA/model/framework/VLA_JEPA.py) with the active single-GPU training config in [`vlajepa_robot_ft_trossen_vjepa21_small_5090_lerobot.yaml`](/home/mehul/work/vjepa/VLA-JEPA/scripts/config/vlajepa_robot_ft_trossen_vjepa21_small_5090_lerobot.yaml).
 
 ## Executive Summary
 

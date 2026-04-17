@@ -147,7 +147,7 @@ Inference uses only:
 
 The active single-GPU training config lives at:
 
-- [`scripts/config/vlajepa_robot_ft_trossen_vjepa21_small_5090.yaml`](./scripts/config/vlajepa_robot_ft_trossen_vjepa21_small_5090.yaml)
+- [`scripts/config/vlajepa_robot_ft_trossen_vjepa21_small_5090_lerobot.yaml`](./scripts/config/vlajepa_robot_ft_trossen_vjepa21_small_5090_lerobot.yaml)
 
 Important defaults in this fork:
 
@@ -174,8 +174,14 @@ The current training path is intended for the environment:
 
 ```bash
 cd /home/mehul/work/vjepa/VLA-JEPA
-/home/mehul/miniconda3/envs/vla-jepa-vjepa21/bin/python -u starVLA/training/train_starvla.py \
-  --config_yaml scripts/config/vlajepa_robot_ft_trossen_vjepa21_small_5090.yaml
+./scripts/vlajepa_robot_ft_trossen_5090_lerobot.sh
+```
+
+The local launcher defaults to fused `AdamW`. If you want to fall back to the lower-memory optimizer path, use:
+
+```bash
+cd /home/mehul/work/vjepa/VLA-JEPA
+OPTIMIZER_NAME=AdamW8bit ./scripts/vlajepa_robot_ft_trossen_5090_lerobot.sh
 ```
 
 ### TensorBoard
@@ -183,7 +189,7 @@ cd /home/mehul/work/vjepa/VLA-JEPA
 ```bash
 cd /home/mehul/work/vjepa/VLA-JEPA
 /home/mehul/miniconda3/envs/vla-jepa-vjepa21/bin/tensorboard \
-  --logdir checkpoints/robot_ft_trossen_vjepa21_small_5090_30ep \
+  --logdir checkpoints/robot_ft_trossen_vjepa21_small_5090_lerobot_30ep \
   --port 6006
 ```
 

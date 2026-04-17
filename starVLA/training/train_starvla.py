@@ -638,6 +638,33 @@ def _shutdown_dataloader_workers(dataloader) -> None:
     _shutdown_dataloader_iterator(getattr(dataloader, "_iterator", None))
 
 
+def _shutdown_multiprocessing_resource_tracker_best_effort() -> None:
+    """
+    PyTorch DataLoader shutdown is sometimes not enough to reap Python's
+    multiprocessing resource_tracker process after interrupts on this machine.
+    Stop the per-process tracker explicitly once training teardown is complete.
+    """
+    try:
+        import multiprocessing.resource_tracker as resource_tracker
+    except Exception:
+        return
+
+    tracker = getattr(resource_tracker, "_resource_tracker", None)
+    stop = getattr(tracker, "_stop", None)
+    tracker_pid = getattr(tracker, "_pid", None)
+    if tracker is None or not callable(stop) or tracker_pid is None:
+        return
+
+    try:
+        stop()
+    except ChildProcessError:
+        pass
+    except OSError:
+        pass
+    except Exception as exc:
+        logger.warning(f"Failed to stop multiprocessing resource tracker: {exc}")
+
+
 class _RankVideoBatchPrefetcher:
     def __init__(self, trainer: "VLATrainer", queue_size: int):
         self.trainer = trainer
@@ -1209,7 +1236,54 @@ class VLATrainer(TrainerUtils):
                     self.accelerator.log(scalar_metrics, step=self.completed_steps)
                 if torch.cuda.is_available():
                     torch.cuda.reset_peak_memory_stats()
-                logger.info(f"Step {self.completed_steps}, Metrics: {scalar_metrics}")
+
+                max_train_steps = max(int(self.config.trainer.max_train_steps), 1)
+                progress_pct = 100.0 * self.completed_steps / max_train_steps
+                eta_seconds = self._estimate_remaining_seconds()
+                avg_wall_step_time = (
+                    sum(self._recent_wall_step_times) / len(self._recent_wall_step_times)
+                    if self._recent_wall_step_times
+                    else None
+                )
+                progress_parts = [
+                    f"Progress {self.completed_steps}/{max_train_steps} ({progress_pct:.2f}%)",
+                    f"epoch={scalar_metrics.get('epoch', 0.0):.4f}",
+                    f"eta={self._format_duration(eta_seconds)}",
+                ]
+
+                for metric_key, label in (
+                    ("data_time", "data"),
+                    ("model_time", "model"),
+                    ("wall_step_time", "wall"),
+                ):
+                    metric_value = scalar_metrics.get(metric_key, None)
+                    if metric_value is not None:
+                        progress_parts.append(f"{label}={metric_value:.3f}s")
+
+                if avg_wall_step_time is not None:
+                    progress_parts.append(f"avg_wall={avg_wall_step_time:.3f}s")
+
+                if self._runtime_timing_enabled():
+                    for metric_key, label in (
+                        ("raw_batch_fetch_time", "fetch"),
+                        ("video_tensor_to_cuda_time", "to_cuda"),
+                        ("video_decode_time", "decode"),
+                        ("video_postprocess_time", "post"),
+                        ("qwen_tensor_build_time", "qwen"),
+                        ("qwen_forward_time", "qfwd"),
+                        ("vj_encode_time", "vj"),
+                        ("predictor_action_head_time", "head"),
+                        ("forward_time", "fwd"),
+                        ("backward_only_time", "back"),
+                        ("grad_clip_time", "clip"),
+                        ("optimizer_step_time", "opt"),
+                        ("backward_optimizer_time", "bwd"),
+                    ):
+                        metric_value = scalar_metrics.get(metric_key, None)
+                        if metric_value is not None:
+                            progress_parts.append(f"{label}={metric_value:.3f}s")
+
+                logger.info(" | ".join(progress_parts))
 
     def _create_data_iterators(self):
         """create data iterators"""
@@ -1656,6 +1730,7 @@ class VLATrainer(TrainerUtils):
             setattr(self, attr_name, None)
         _shutdown_dataloader_workers(getattr(self, "vla_train_dataloader", None))
         gc.collect()
+        _shutdown_multiprocessing_resource_tracker_best_effort()
 
 
 def main(cfg) -> None:
@@ -1663,6 +1738,7 @@ def main(cfg) -> None:
     logger.info("VLA Training :: Warming Up")
     interrupted = False
     trainer = None
+    vla_train_dataloader = None
 
     try:
         # create output directory and save config
@@ -1711,6 +1787,12 @@ def main(cfg) -> None:
                 trainer._shutdown_data_runtime()
             except Exception as exc:
                 logger.warning(f"Training data shutdown failed: {exc}")
+        elif vla_train_dataloader is not None:
+            try:
+                _shutdown_dataloader_workers(vla_train_dataloader)
+            except Exception as exc:
+                logger.warning(f"Fallback dataloader shutdown failed: {exc}")
+            _shutdown_multiprocessing_resource_tracker_best_effort()
         if dist.is_initialized():
             if not interrupted:
                 try:
