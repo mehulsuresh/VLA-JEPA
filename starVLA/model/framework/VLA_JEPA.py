@@ -421,28 +421,33 @@ class VLA_JEPA(baseframework):
         input_ids = qwen_inputs["input_ids"]
         action_token_ids = self._action_token_ids_t.to(input_ids.device)
         embodied_token_id = self._embodied_token_id_t.to(input_ids.device)
+        batch_size = int(input_ids.shape[0]) if input_ids.ndim > 1 else 1
 
-        expected_action_count = (
+        expected_action_count_per_example = (
             self.config.framework.vj2_model.num_frames // self._get_vjepa_attr("tubelet_size") - 1
         ) * self.config.framework.vj2_model.num_action_tokens_per_timestep
+        expected_action_count = expected_action_count_per_example * batch_size
         action_count = int(torch.isin(input_ids, action_token_ids).sum().item())
         if action_count != expected_action_count:
             raise RuntimeError(
-                f"{stage}: expected {expected_action_count} action prompt tokens in Qwen inputs, "
-                f"found {action_count}. This usually means prompt placeholders were not expanded "
-                "before building Qwen inputs."
+                f"{stage}: expected {expected_action_count} total action prompt tokens in Qwen "
+                f"inputs ({expected_action_count_per_example} per sample across batch_size="
+                f"{batch_size}), found {action_count}. This usually means prompt placeholders "
+                "were not expanded before building Qwen inputs."
             )
 
         if has_actions:
-            expected_embodied_count = (
+            expected_embodied_count_per_example = (
                 self.config.framework.vj2_model.num_embodied_action_tokens_per_instruction
             )
+            expected_embodied_count = expected_embodied_count_per_example * batch_size
             embodied_count = int(torch.isin(input_ids, embodied_token_id).sum().item())
             if embodied_count != expected_embodied_count:
                 raise RuntimeError(
-                    f"{stage}: expected {expected_embodied_count} embodied-action prompt tokens in "
-                    f"Qwen inputs, found {embodied_count}. This usually means prompt placeholders "
-                    "were not expanded before building Qwen inputs."
+                    f"{stage}: expected {expected_embodied_count} total embodied-action prompt "
+                    f"tokens in Qwen inputs ({expected_embodied_count_per_example} per sample "
+                    f"across batch_size={batch_size}), found {embodied_count}. This usually means "
+                    "prompt placeholders were not expanded before building Qwen inputs."
                 )
 
     def _build_qwen_inputs_from_examples(self, examples: List[dict]) -> dict[str, torch.Tensor]:
