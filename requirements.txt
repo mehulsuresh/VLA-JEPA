@@ -3,6 +3,7 @@
 # Once released, replace with: transformers>=<version>
 transformers @ git+https://github.com/huggingface/transformers.git
 accelerate==1.5.2
+peft>=0.18.0
 tiktoken
 einops
 transformers_stream_generator==0.0.4

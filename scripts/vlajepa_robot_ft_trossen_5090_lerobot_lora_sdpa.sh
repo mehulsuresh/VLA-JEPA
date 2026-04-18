@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+export CONFIG_YAML="${CONFIG_YAML:-${REPO_ROOT}/scripts/config/vlajepa_robot_ft_trossen_vjepa21_small_5090_lerobot_lora_sdpa.yaml}"
+export STARVLA_DISABLE_FLASH_ATTN_PROMOTION="${STARVLA_DISABLE_FLASH_ATTN_PROMOTION:-1}"
+
+exec "${SCRIPT_DIR}/vlajepa_robot_ft_trossen_5090_lerobot.sh" "$@"

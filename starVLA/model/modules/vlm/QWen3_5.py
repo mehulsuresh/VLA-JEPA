@@ -92,8 +92,124 @@ class _QWen3_5_Interface(nn.Module):
 
         return normalized
 
+    @staticmethod
+    def _normalize_name_list(value) -> Optional[list[str]]:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            items = [item.strip() for item in value.split(",") if item.strip()]
+            return items or None
+        items = [str(item).strip() for item in value if str(item).strip()]
+        return items or None
+
+    @staticmethod
+    def _resolve_lora_layers(model, lora_config) -> Optional[list[int]]:
+        explicit_layers = lora_config.get("layers_to_transform", None)
+        if explicit_layers is not None:
+            if isinstance(explicit_layers, int):
+                return [int(explicit_layers)]
+            return [int(layer_idx) for layer_idx in explicit_layers]
+
+        train_last_n_layers = lora_config.get("train_last_n_layers", None)
+        if train_last_n_layers is None:
+            return None
+
+        train_last_n_layers = int(train_last_n_layers)
+        if train_last_n_layers <= 0:
+            return []
+
+        qwen_core = getattr(model, "model", None)
+        language_model = getattr(qwen_core, "language_model", None)
+        layers = getattr(language_model, "layers", None)
+        if layers is not None:
+            num_layers = len(layers)
+        else:
+            text_config = getattr(model.config, "text_config", None)
+            num_layers = getattr(text_config, "num_hidden_layers", None)
+        if num_layers is None:
+            raise RuntimeError("Unable to resolve Qwen3.5 language layer count for LoRA targeting")
+
+        start_idx = max(int(num_layers) - train_last_n_layers, 0)
+        return list(range(start_idx, int(num_layers)))
+
+    def _maybe_apply_lora(self, model, *, compile_qwen_model: bool):
+        qwenvl_config = self.config.framework.get("qwenvl", {})
+        lora_config = qwenvl_config.get("lora", {})
+        if not bool(lora_config.get("enabled", False)):
+            return model
+
+        try:
+            from peft import LoraConfig, TaskType
+        except ImportError as exc:
+            raise ImportError(
+                "Qwen LoRA is enabled but `peft` is not installed. Install `peft>=0.18.0`."
+            ) from exc
+
+        if not hasattr(model, "add_adapter"):
+            raise RuntimeError(
+                "Current transformers build does not expose `add_adapter()` on Qwen3.5. "
+                "Install a recent Transformers build with PEFT integration."
+            )
+
+        target_modules = self._normalize_name_list(lora_config.get("target_modules", None))
+        if not target_modules:
+            raise ValueError("Qwen LoRA is enabled but no target_modules were provided")
+
+        layers_to_transform = self._resolve_lora_layers(model, lora_config)
+        if layers_to_transform == []:
+            raise ValueError("Qwen LoRA resolved an empty set of layers_to_transform")
+
+        layers_pattern = lora_config.get("layers_pattern", None)
+        if layers_to_transform is not None and layers_pattern is None:
+            layers_pattern = "layers"
+
+        adapter_name = str(lora_config.get("adapter_name", "default"))
+        if compile_qwen_model:
+            self._safe_log(
+                "warning",
+                "Qwen LoRA is enabled while `trainer.compile_qwen_model=true`; "
+                "disabling Qwen compile is recommended for the first PEFT run",
+            )
+
+        hf_lora_config = LoraConfig(
+            task_type=TaskType.CAUSAL_LM,
+            inference_mode=False,
+            r=int(lora_config.get("r", 16)),
+            lora_alpha=int(lora_config.get("alpha", lora_config.get("lora_alpha", 32))),
+            lora_dropout=float(lora_config.get("dropout", lora_config.get("lora_dropout", 0.05))),
+            bias=str(lora_config.get("bias", "none")),
+            target_modules=target_modules,
+            exclude_modules=self._normalize_name_list(lora_config.get("exclude_modules", None)),
+            modules_to_save=self._normalize_name_list(lora_config.get("modules_to_save", None)),
+            layers_to_transform=layers_to_transform,
+            layers_pattern=layers_pattern,
+            use_rslora=bool(lora_config.get("use_rslora", False)),
+            use_dora=bool(lora_config.get("use_dora", False)),
+            ensure_weight_tying=bool(lora_config.get("ensure_weight_tying", False)),
+            trainable_token_indices=lora_config.get("trainable_token_indices", None),
+        )
+        model.add_adapter(hf_lora_config, adapter_name=adapter_name)
+        if hasattr(model, "set_adapter"):
+            model.set_adapter(adapter_name)
+        if hasattr(model, "enable_adapters"):
+            model.enable_adapters()
+
+        layer_summary = (
+            f"layers={layers_to_transform[0]}..{layers_to_transform[-1]}"
+            if layers_to_transform
+            else "layers=all"
+        )
+        self._safe_log(
+            "info",
+            "Enabled Qwen3.5 LoRA "
+            f"(adapter={adapter_name}, r={hf_lora_config.r}, alpha={hf_lora_config.lora_alpha}, "
+            f"dropout={hf_lora_config.lora_dropout}, targets={target_modules}, {layer_summary})",
+        )
+        return model
+
     def __init__(self, config: Optional[dict] = None, **kwargs):
         super().__init__()
+        self.config = config
 
         qwenvl_config = config.framework.get("qwenvl", {})
         model_id = qwenvl_config.get("base_vlm", "Qwen/Qwen3.5-2B")
@@ -122,6 +238,7 @@ class _QWen3_5_Interface(nn.Module):
         )
         if device_map is None and torch.cuda.is_available():
             model = model.to("cuda")
+        model = self._maybe_apply_lora(model, compile_qwen_model=compile_qwen_model)
         processor = AutoProcessor.from_pretrained(model_id)
         processor.tokenizer.padding_side = "left"
 

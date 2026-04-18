@@ -69,6 +69,21 @@ def build_param_lr_groups(model, cfg):
         freeze_modules = ""
     freeze_patterns = [p.strip() for p in freeze_modules.split(",") if p.strip()]
 
+    qwenvl_cfg = cfg.framework.get("qwenvl", {}) if hasattr(cfg, "framework") else {}
+    qwen_lora_cfg = qwenvl_cfg.get("lora", {}) if hasattr(qwenvl_cfg, "get") else {}
+    if bool(qwen_lora_cfg.get("enabled", False)):
+        conflicting_freeze_patterns = [
+            pattern
+            for pattern in freeze_patterns
+            if pattern == "qwen_vl_interface" or pattern.startswith("qwen_vl_interface.")
+        ]
+        if conflicting_freeze_patterns:
+            raise ValueError(
+                "Qwen LoRA is enabled, but freeze_modules also freezes the Qwen interface "
+                f"({conflicting_freeze_patterns}). Remove `qwen_vl_interface*` from freeze_modules; "
+                "PEFT already freezes the base Qwen weights."
+            )
+
     used_params = set()
     frozen_params = set()
     param_groups = []
@@ -92,7 +107,7 @@ def build_param_lr_groups(model, cfg):
             for attr in module_name.split("."):
                 module = getattr(module, attr)
             # filter out frozen parameters
-            params = [p for p in module.parameters() if id(p) not in frozen_params]
+            params = [p for p in module.parameters() if p.requires_grad and id(p) not in frozen_params]
             if params:  # only add param group if there are trainable parameters
                 param_groups.append({"params": params, "lr": lr, "name": module_name})
                 used_params.update(id(p) for p in params)
@@ -100,7 +115,11 @@ def build_param_lr_groups(model, cfg):
             ReferenceError(f"⚠️ module path `{module_name}` not found in vla")
 
     # assign base learning rate to the remaining unused parameters (exclude frozen ones)
-    other_params = [p for p in model.parameters() if id(p) not in used_params and id(p) not in frozen_params]
+    other_params = [
+        p
+        for p in model.parameters()
+        if p.requires_grad and id(p) not in used_params and id(p) not in frozen_params
+    ]
     if other_params:
         param_groups.append({"params": other_params, "lr": base_lr, "name": "base"})
 

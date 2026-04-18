@@ -1,0 +1,177 @@
+run_id: robot_ft_trossen_vjepa21_small_5090_lerobot_lora_wmwarm_20260417
+run_root_dir: checkpoints
+seed: 42
+trackers:
+  - tensorboard
+is_debug: false
+
+framework:
+  name: VLA_JEPA
+  qwenvl:
+    base_vlm: "Qwen/Qwen3.5-0.8B"
+    attn_implementation: flash_attention_2
+    enable_fast_linear_attention: true
+    vl_hidden_dim: 1024
+    lora:
+      enabled: true
+      adapter_name: temporal_policy
+      r: 16
+      alpha: 32
+      dropout: 0.05
+      bias: none
+      layers_pattern: layers
+      train_last_n_layers: 16
+      target_modules:
+        - q_proj
+        - k_proj
+        - v_proj
+        - o_proj
+        - gate_proj
+        - up_proj
+        - down_proj
+        - in_proj_qkv
+        - in_proj_z
+        - in_proj_a
+        - in_proj_b
+        - out_proj
+  action_model:
+    action_model_type: DiT-B
+    action_hidden_dim: 1024
+    hidden_size: 1024
+    add_pos_embed: true
+    max_seq_len: 1024
+    action_dim: 14
+    state_dim: 14
+    future_action_window_size: 49
+    action_horizon: 50
+    past_action_window_size: 0
+    noise_beta_alpha: 1.5
+    noise_beta_beta: 1.0
+    noise_s: 0.999
+    num_timestep_buckets: 1000
+    num_inference_timesteps: 4
+    num_target_vision_tokens: 32
+    diffusion_model_cfg:
+      cross_attention_dim: 1024
+      dropout: 0.2
+      final_dropout: true
+      interleave_self_attention: true
+      norm_type: ada_norm
+      num_layers: 16
+      output_dim: 1024
+      positional_embeddings: null
+  vj2_model:
+    source: torchhub
+    hub_repo_or_dir: /home/mehul/work/vjepa/vjepa2
+    hub_model_name: vjepa2_1_vit_base_384
+    hub_preprocessor_name: vjepa2_preprocessor
+    crop_size: 384
+    pretrained: true
+    freeze_encoder: true
+    num_video_views: 3
+    depth: 12
+    num_heads: 8
+    use_legacy_rope_bug: false
+    special_action_token: <|action_{}|>
+    num_action_tokens_per_timestep: 8
+    embodied_action_token: <|embodied_action|>
+    num_embodied_action_tokens_per_instruction: 32
+    num_frames: 8
+  reduce_in_full_precision: true
+
+datasets:
+  vla_data:
+    dataset_py: lerobot_datasets
+    data_root_dir: /home/mehul/work/reward_model_small/Subtask_dataset/subtask_labelled_combined
+    data_mix: trossen_subtask_combined
+    action_type: delta_qpos
+    CoT_prompt: "Your task is {instruction}. Infer the temporal dynamics from frames {actions} and produce the corresponding policy actions {e_actions}."
+    resolution_size: 224
+    video_resolution_size: 384
+    video_frame_stride: 10
+    video_target_shift_steps: 2
+    gpu_video_decode_on_rank: false
+    cpu_video_decode_drop_worker_images: true
+    runtime_timing_logging: true
+    # The frozen 5090 run fits batch 80 because Qwen executes under no_grad.
+    # LoRA through the upper language stack plus action_horizon=50 makes the
+    # prompt much longer, but the 5090 can still sustain batch 32 with a
+    # two-step accumulation schedule on this desktop setup.
+    per_device_batch_size: 32
+    num_workers: 4
+    prefetch_factor: 2
+    persistent_workers: false
+    multiprocessing_context: spawn
+    worker_torch_threads: 1
+    worker_cv2_threads: 1
+    video_backend_num_threads: 1
+    pin_memory: true
+    drop_last: true
+    load_all_data_for_training: true
+    with_state: true
+
+trainer:
+  epochs: 2
+  max_train_steps: auto
+  num_warmup_steps: auto
+  save_interval: 1000
+  eval_interval: 1000
+  save_best_only: false
+  best_metric_name: mae_score
+  best_metric_mode: min
+  learning_rate:
+    base: 3.0e-05
+    qwen_vl_interface: 2.0e-05
+    action_model: 1.0e-04
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 1.0e-06
+  freeze_modules: "vj_encoder"
+  loss_scale:
+    action: 1.0
+    wm: 0.1
+    wm_initial: 0.3
+    wm_warmup_steps: 2000
+  warmup_ratio: 0.01
+  logging_frequency: 50
+  eval_before_train: false
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 2
+  repeated_diffusion_steps: 2
+  find_unused_parameters: true
+
+  optimizer:
+    name: AdamW
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 1.0e-04
+    fused: true
+
+  is_resume: false
+  resume_epoch: null
+  resume_step: null
+  enable_gradient_checkpointing: true
+  enable_mixed_precision_training: false
+  mixed_precision: no
+  channels_last: true
+  compile_qwen_model: false
+  compile_qwen_model_dynamic: false
+  compile_action_model: false
+  compile_action_model_dynamic: false
+  compile_vj_predictor: false
+  compile_vj_predictor_dynamic: false
+  compile_vj_encoder: false
+  compile_vj_encoder_dynamic: true
+  compile_full_model: false
+  compile_full_model_dynamic: false
+  compile_mode: default
+  compile_dynamic: false
+  save_plain_weights_in_checkpoints: false
+  drop_checkpoint_page_cache: true
+  trim_process_memory_after_checkpoint: true
+  use_rabc: true
+  rabc_progress_key: rabc_progress_delta
+  rabc_fallback_progress_key: rabc_global_progress_delta
+  rabc_kappa: 0.01
+  rabc_epsilon: 1.0e-06
+  rabc_mistake_weight: 0.25

@@ -904,7 +904,12 @@ class VLATrainer(TrainerUtils):
         self.optimizer = optimizer
         self.lr_scheduler = lr_scheduler
         self.accelerator = accelerator
-        self.action_loss_scale, self.wm_loss_scale = self._resolve_loss_scales()
+        (
+            self.action_loss_scale,
+            self.wm_loss_scale,
+            self.wm_loss_scale_initial,
+            self.wm_loss_warmup_steps,
+        ) = self._resolve_loss_scales()
         self.best_metric_name = str(self.config.trainer.get("best_metric_name", "mae_score"))
         self.best_metric_mode = str(self.config.trainer.get("best_metric_mode", "min")).lower()
         self.best_metric_value = None
@@ -1355,7 +1360,15 @@ class VLATrainer(TrainerUtils):
         loss_scale_cfg = self.config.trainer.get("loss_scale", {})
         action_scale = float(loss_scale_cfg.get("action", loss_scale_cfg.get("vla", 1.0)))
         wm_scale = float(loss_scale_cfg.get("wm", loss_scale_cfg.get("vlm", 0.1)))
-        return action_scale, wm_scale
+        wm_initial_scale = float(loss_scale_cfg.get("wm_initial", loss_scale_cfg.get("wm_start", wm_scale)))
+        wm_warmup_steps = max(int(loss_scale_cfg.get("wm_warmup_steps", 0)), 0)
+        return action_scale, wm_scale, wm_initial_scale, wm_warmup_steps
+
+    def _current_wm_loss_scale(self) -> float:
+        if self.wm_loss_warmup_steps <= 0:
+            return self.wm_loss_scale
+        progress = min(max(float(self.completed_steps) / float(self.wm_loss_warmup_steps), 0.0), 1.0)
+        return self.wm_loss_scale_initial + (self.wm_loss_scale - self.wm_loss_scale_initial) * progress
 
     def train(self):
         """execute training loop"""
@@ -1643,9 +1656,10 @@ class VLATrainer(TrainerUtils):
             forward_start = time.perf_counter()
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 output_dict = self.model.forward(batch_vla, rabc_weights=rabc_weights)
+                current_wm_loss_scale = self._current_wm_loss_scale()
                 total_loss = (
                     output_dict.get("action_loss", 0.0) * self.action_loss_scale
-                    + output_dict.get("wm_loss", 0.0) * self.wm_loss_scale
+                    + output_dict.get("wm_loss", 0.0) * current_wm_loss_scale
                 )
             forward_time = time.perf_counter() - forward_start
             if self.completed_steps == 0 and self.accelerator.is_main_process:
@@ -1687,6 +1701,7 @@ class VLATrainer(TrainerUtils):
                 # Surface the non-prefetch Qwen build timing under the existing progress-bar key.
                 result_dict["qwen_tensor_build_time"] = result_dict["qwen_input_build_time"]
             result_dict["total_loss"] = total_loss.detach() if isinstance(total_loss, torch.Tensor) else total_loss
+            result_dict["wm_loss_scale"] = current_wm_loss_scale
             for key, value in rabc_stats.items():
                 result_dict[key] = value.detach() if isinstance(value, torch.Tensor) else value
             if grad_norm is not None:
