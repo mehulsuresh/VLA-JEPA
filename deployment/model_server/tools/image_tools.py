@@ -1,3 +1,5 @@
+from typing import Any
+
 import numpy as np
 from PIL import Image
 
@@ -57,7 +59,6 @@ def _resize_with_pad_pil(image: Image.Image, height: int, width: int, method: in
     assert zero_image.size == (width, height)
     return zero_image
 
-from typing import Sequence, Union, List, Tuple, Any
 def to_pil_preserve(images: Any, scale_float: bool = True):
     """
     Convert (possibly nested) numpy image arrays back to PIL.Image WITHOUT changing spatial shape

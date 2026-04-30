@@ -68,9 +68,6 @@ exclude = [
 
 ]
 
-[tool.setuptools.package-data]
-"cogact" = ["py.typed"]
-
 [tool.black]
 line-length = 121
 target-version = ["py310"]

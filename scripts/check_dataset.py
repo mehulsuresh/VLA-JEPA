@@ -15,10 +15,7 @@ Usage:
 
 import argparse
 import json
-import math
-import os
 import sys
-import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
