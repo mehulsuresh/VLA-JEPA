@@ -10,6 +10,7 @@ Flow-matching header is copyright from GR00T N1.5,
 from contextlib import nullcontext
 from functools import lru_cache
 import importlib
+import math
 from collections import OrderedDict
 from pathlib import Path
 import time
@@ -27,6 +28,11 @@ logger = initialize_overwatch(__name__)
 from starVLA.model.framework.base_framework import baseframework
 from starVLA.model.modules.vlm import get_vlm_model
 from starVLA.model.modules.action_model.GR00T_ActionHeader import get_action_model, FlowmatchingActionHead
+from starVLA.model.modules.geometry_teacher import (
+    DirectGeometryTeacherHead,
+    MoGeGeometryTeacher,
+    direct_feature_distillation_loss,
+)
 from starVLA.model.modules.world_model.vj2_predictor import VisionTransformerPredictorAC
 from starVLA.training.trainer_utils.trainer_tools import resize_images
 from starVLA.model.tools import FRAMEWORK_REGISTRY
@@ -129,6 +135,53 @@ class VLA_JEPA(baseframework):
         super().__init__()
         self.config = config
         self.qwen_vl_interface = get_vlm_model(config=self.config)
+        self.depth_teacher_aux_cfg = self.config.framework.get("depth_teacher_aux", {})
+        self.depth_teacher_aux_enabled = bool(self.depth_teacher_aux_cfg.get("enabled", False))
+        self.depth_teacher_aux_mode = str(self.depth_teacher_aux_cfg.get("mode", "direct")).lower()
+        if self.depth_teacher_aux_enabled:
+            if self.depth_teacher_aux_mode != "direct":
+                raise ValueError(
+                    "VLA_JEPA depth_teacher_aux currently supports only LingBot-style `direct` mode"
+                )
+            self._depth_teacher = MoGeGeometryTeacher(self.depth_teacher_aux_cfg, logger=logger)
+            self._depth_teacher.initialize(self._get_qwen_device())
+            teacher_feature_dim = self._depth_teacher.feature_dim()
+            configured_feature_dim = self.depth_teacher_aux_cfg.get("teacher_feature_dim", "auto")
+            if not (
+                configured_feature_dim is None
+                or (
+                    isinstance(configured_feature_dim, str)
+                    and configured_feature_dim.lower() == "auto"
+                )
+            ):
+                configured_feature_dim = int(configured_feature_dim)
+                if configured_feature_dim != teacher_feature_dim:
+                    raise ValueError(
+                        "depth_teacher_aux.teacher_feature_dim does not match the loaded MoGe "
+                        f"{self.depth_teacher_aux_cfg.get('teacher_feature_source', 'neck')} "
+                        f"level {self.depth_teacher_aux_cfg.get('teacher_feature_level', 0)} output: "
+                        f"configured {configured_feature_dim}, inferred {teacher_feature_dim}. "
+                        "Set teacher_feature_dim: auto or update it to the inferred value."
+                    )
+            self.depth_teacher_aux_head = DirectGeometryTeacherHead(
+                hidden_size=self.qwen_vl_interface.model.config.hidden_size,
+                output_size=teacher_feature_dim,
+                head_hidden_multiplier=float(
+                    self.depth_teacher_aux_cfg.get(
+                        "head_hidden_multiplier",
+                        self.depth_teacher_aux_cfg.get("hidden_multiplier", 2.0),
+                    )
+                ),
+                dropout=float(self.depth_teacher_aux_cfg.get("dropout", 0.0)),
+                use_layer_norm=bool(self.depth_teacher_aux_cfg.get("head_layer_norm", False)),
+                final_init_std=float(self.depth_teacher_aux_cfg.get("head_final_init_std", 0.0)),
+            )
+            self._qwen_image_token_id = self._resolve_qwen_image_token_id()
+        else:
+            self.depth_teacher_aux_head = None
+            self._depth_teacher = None
+            self._qwen_image_token_id = None
+
         embodied_action_token = self.config.framework.vj2_model.get("embodied_action_token", "<|embodied_action|>")
         action_tokens, self.action_token_ids, self.embodied_action_token_id = self.expand_tokenizer(
             tokenizer=self.qwen_vl_interface.processor.tokenizer,
@@ -380,6 +433,87 @@ class VLA_JEPA(baseframework):
     def refresh_runtime_caches(self) -> None:
         self._qwen_grad_cache = any(param.requires_grad for param in self.qwen_vl_interface.model.parameters())
 
+    def validate_depth_teacher_aux_training_state(
+        self,
+        *,
+        depth_teacher_loss_scale: Optional[float] = None,
+    ) -> None:
+        if not self.depth_teacher_aux_enabled:
+            return
+
+        trainer_cfg = self.config.get("trainer", {}) if self.config is not None else {}
+        if bool(trainer_cfg.get("compile_full_model", False)):
+            raise RuntimeError(
+                "depth_teacher_aux is enabled with trainer.compile_full_model=true. "
+                "The MoGe teacher is intentionally kept outside the trainable module state; "
+                "compile Qwen/action/V-JEPA submodules separately instead."
+            )
+        if bool(trainer_cfg.get("compile_qwen_model", False)) and bool(
+            trainer_cfg.get("find_unused_parameters", True)
+        ):
+            num_processes = int(trainer_cfg.get("_accelerate_num_processes", 1) or 1)
+            distributed_type = str(trainer_cfg.get("_accelerate_distributed_type", "")).lower()
+            if (
+                num_processes > 1
+                and "deepspeed" not in distributed_type
+                and not bool(trainer_cfg.get("allow_compile_with_ddp_find_unused", False))
+            ):
+                raise RuntimeError(
+                    "depth_teacher_aux is enabled with compile_qwen_model=true, "
+                    "find_unused_parameters=true, and multi-process DDP. This combination is "
+                    "disabled by default because torch.compile and DDP unused-parameter traversal "
+                    "can interact poorly. Set find_unused_parameters=false after an exact smoke "
+                    "test, or set trainer.allow_compile_with_ddp_find_unused=true to opt in."
+                )
+            logger.warning(
+                "depth_teacher_aux is enabled with compile_qwen_model=true and "
+                "find_unused_parameters=true. Smoke-test this exact DDP setup before long runs; "
+                "torch.compile and DDP unused-parameter traversal can interact poorly."
+            )
+
+        if depth_teacher_loss_scale is not None and float(depth_teacher_loss_scale) <= 0.0:
+            if not bool(self.depth_teacher_aux_cfg.get("allow_zero_loss_scale", False)):
+                raise RuntimeError(
+                    "depth_teacher_aux is enabled but its resolved loss scale is <= 0. "
+                    "Set trainer.loss_scale.depth_teacher or framework.depth_teacher_aux.loss_weight "
+                    "to a positive value, or set allow_zero_loss_scale=true for an explicit dry run."
+                )
+
+        if self.depth_teacher_aux_head is None or not any(
+            param.requires_grad for param in self.depth_teacher_aux_head.parameters()
+        ):
+            raise RuntimeError(
+                "depth_teacher_aux is enabled but depth_teacher_aux_head has no trainable parameters. "
+                "Remove it from freeze_modules so the projection head can learn the teacher feature space."
+            )
+
+        if not self._qwen_requires_grad():
+            if bool(self.depth_teacher_aux_cfg.get("allow_frozen_qwen", False)):
+                logger.warning(
+                    "depth_teacher_aux is enabled while Qwen has no trainable parameters; "
+                    "the auxiliary loss will train only depth_teacher_aux_head unless this is an explicit dry run."
+                )
+            else:
+                raise RuntimeError(
+                    "depth_teacher_aux is enabled but Qwen has no trainable parameters after freeze_modules. "
+                    "Unfreeze qwen_vl_interface.model or enable Qwen LoRA, or set "
+                    "framework.depth_teacher_aux.allow_frozen_qwen=true only for an explicit dry run."
+                )
+
+    def resolve_depth_teacher_detach_steps(self) -> int:
+        if not self.depth_teacher_aux_enabled:
+            return 0
+        detach_steps_value = self.depth_teacher_aux_cfg.get("detach_vlm_steps", None)
+        detach_steps = 0 if detach_steps_value is None else max(int(detach_steps_value), 0)
+        detach_fraction = float(self.depth_teacher_aux_cfg.get("detach_vlm_fraction", 0.0))
+        fraction_steps = 0
+        if detach_fraction > 0.0:
+            trainer_cfg = self.config.get("trainer", {}) if self.config is not None else {}
+            max_train_steps = int(trainer_cfg.get("max_train_steps", 0))
+            if max_train_steps > 0:
+                fraction_steps = int(math.ceil(detach_fraction * max_train_steps))
+        return max(detach_steps, fraction_steps)
+
     def _move_qwen_inputs(self, qwen_inputs: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         qwen_device = self._get_qwen_device()
         moved = {}
@@ -389,6 +523,152 @@ class VLA_JEPA(baseframework):
             else:
                 moved[key] = value
         return moved
+
+    def _resolve_qwen_image_token_id(self) -> int:
+        processor = self.qwen_vl_interface.processor
+        tokenizer = processor.tokenizer
+        candidates = [
+            getattr(processor, "image_token_id", None),
+            getattr(processor, "image_token", None),
+            "<|image_pad|>",
+            "<image>",
+        ]
+        unk_id = getattr(tokenizer, "unk_token_id", None)
+        for candidate in candidates:
+            if candidate is None:
+                continue
+            if isinstance(candidate, int):
+                return int(candidate)
+            token_id = tokenizer.convert_tokens_to_ids(candidate)
+            if token_id is not None and token_id != unk_id:
+                return int(token_id)
+        raise RuntimeError(
+            "Unable to resolve Qwen image token id for depth_teacher_aux. "
+            "Set a Qwen processor exposing `image_token`, or disable the auxiliary path."
+        )
+
+    def _qwen_image_merge_size(self) -> int:
+        image_processor = getattr(self.qwen_vl_interface.processor, "image_processor", None)
+        return max(int(getattr(image_processor, "merge_size", 1)), 1)
+
+    def _extract_qwen_image_hidden(
+        self,
+        *,
+        last_hidden: torch.Tensor,
+        qwen_inputs: dict[str, torch.Tensor],
+        batch_size: int,
+        num_views: int,
+    ) -> tuple[torch.Tensor, tuple[int, int]]:
+        input_ids = qwen_inputs["input_ids"]
+        image_mask = input_ids == int(self._qwen_image_token_id)
+        merge_size = self._qwen_image_merge_size()
+        image_grid_thw = qwen_inputs.get("image_grid_thw", None)
+        if image_grid_thw is None:
+            raise RuntimeError(
+                "depth_teacher_aux requires Qwen `image_grid_thw` metadata to align direct "
+                "feature targets with image tokens. Refusing to infer per-view grids from token counts."
+            )
+
+        image_grid_thw = image_grid_thw.detach().to(device="cpu", dtype=torch.long)
+        if image_grid_thw.shape[0] != batch_size * num_views:
+            raise RuntimeError(
+                "depth_teacher_aux is wired to the current Qwen builder, which passes exactly the "
+                f"last frame of each view ({batch_size * num_views} images). Found "
+                f"{image_grid_thw.shape[0]} Qwen image grids instead."
+            )
+        image_shapes = []
+        token_counts = []
+        for grid_t, grid_h, grid_w in image_grid_thw.tolist():
+            if int(grid_t) != 1:
+                raise RuntimeError(
+                    "depth_teacher_aux expects image-style Qwen grids with grid_t=1; "
+                    f"got image_grid_thw row {(grid_t, grid_h, grid_w)}"
+                )
+            token_h = max(int(grid_h) // merge_size, 1)
+            token_w = max(int(grid_w) // merge_size, 1)
+            image_shapes.append((token_h, token_w))
+            token_counts.append(token_h * token_w)
+
+        if len(set(image_shapes)) != 1:
+            raise RuntimeError(
+                "depth_teacher_aux currently expects all images in a batch to share the same token grid; "
+                f"got {sorted(set(image_shapes))}"
+            )
+        token_grid_hw = image_shapes[0]
+        per_view_tokens = int(token_counts[0])
+        expected_per_sample = per_view_tokens * num_views
+        sample_counts = image_mask.sum(dim=1)
+        if not torch.all(sample_counts == expected_per_sample):
+            bad_counts = sample_counts.detach().cpu().tolist()
+            raise RuntimeError(
+                "depth_teacher_aux image token counts did not match image_grid_thw: "
+                f"expected {expected_per_sample} per sample, got {bad_counts}"
+            )
+
+        image_positions = image_mask.nonzero(as_tuple=False)[:, 1].reshape(batch_size, expected_per_sample)
+        gathered = torch.gather(
+            last_hidden,
+            dim=1,
+            index=image_positions.unsqueeze(-1).expand(-1, -1, last_hidden.shape[-1]),
+        )
+        return gathered.reshape(batch_size * num_views, per_view_tokens, last_hidden.shape[-1]), token_grid_hw
+
+    def _last_frames_for_depth_teacher(
+        self,
+        batch_videos: np.ndarray | torch.Tensor,
+        *,
+        device: torch.device,
+    ) -> torch.Tensor:
+        # `_build_qwen_inputs_from_video_tensor` also uses only `batch_videos[:, :, -1]`,
+        # so the direct feature targets stay one-to-one with Qwen image tokens.
+        if isinstance(batch_videos, np.ndarray):
+            frames = torch.from_numpy(np.ascontiguousarray(batch_videos[:, :, -1]))
+        else:
+            frames = batch_videos[:, :, -1]
+        B, V, C, H, W = frames.shape
+        frames = frames.reshape(B * V, C, H, W)
+        return frames.to(device=device, dtype=torch.float32, non_blocking=True)
+
+    def _compute_depth_teacher_aux_loss(
+        self,
+        *,
+        last_hidden: torch.Tensor,
+        qwen_inputs: dict[str, torch.Tensor],
+        batch_videos: np.ndarray | torch.Tensor,
+        batch_size: int,
+        num_views: int,
+        train_step: Optional[int] = None,
+    ) -> dict[str, torch.Tensor]:
+        if not self.depth_teacher_aux_enabled:
+            return {}
+        image_tokens, token_grid_hw = self._extract_qwen_image_hidden(
+            last_hidden=last_hidden,
+            qwen_inputs=qwen_inputs,
+            batch_size=batch_size,
+            num_views=num_views,
+        )
+        detach_steps = self.resolve_depth_teacher_detach_steps()
+        step = 0 if train_step is None else int(train_step)
+        detach_vlm = step < detach_steps
+        if detach_vlm:
+            image_tokens = image_tokens.detach()
+        predictions = self.depth_teacher_aux_head(image_tokens)
+        teacher_frames = self._last_frames_for_depth_teacher(batch_videos, device=predictions.device)
+        teacher_output = self._depth_teacher.infer_features(teacher_frames)
+        loss, metrics = direct_feature_distillation_loss(
+            predictions,
+            teacher_output,
+            token_grid_hw,
+            self.depth_teacher_aux_cfg,
+            train_step=train_step,
+        )
+        metrics["depth_teacher_loss"] = loss
+        metrics["depth_teacher_vlm_detached"] = torch.tensor(
+            1.0 if detach_vlm else 0.0,
+            device=loss.device,
+            dtype=loss.dtype,
+        )
+        return metrics
 
     def _resolve_qwen_prompt_args(
         self,
@@ -1149,6 +1429,28 @@ class VLA_JEPA(baseframework):
             }
         return merged
 
+    def _input_embedding_vocab_size(self) -> int:
+        embeddings = self.qwen_vl_interface.model.get_input_embeddings()
+        weight = embeddings.weight
+        ds_shape = getattr(weight, "ds_shape", None)
+        if ds_shape is not None:
+            try:
+                if len(ds_shape) > 0 and int(ds_shape[0]) > 0:
+                    return int(ds_shape[0])
+            except (TypeError, ValueError):
+                pass
+
+        local_size = int(weight.shape[0])
+        if local_size > 0:
+            return local_size
+
+        # ZeRO-3 can expose an empty local shard before DeepSpeed materializes the
+        # full parameter; the model config still carries the global vocab size.
+        config_vocab_size = getattr(self.qwen_vl_interface.model.config, "vocab_size", None)
+        if config_vocab_size is not None and int(config_vocab_size) > 0:
+            return int(config_vocab_size)
+        return local_size
+
     def expand_tokenizer(self, 
                          tokenizer: AutoTokenizer,
                          special_action_token: str = "<|action_{}|>",
@@ -1171,9 +1473,10 @@ class VLA_JEPA(baseframework):
                 logger.warning(f"Warning: 0 tokens added (they may already exist) embodied_action_token: {embodied_action_token}.")
         embodied_action_token_id = tokenizer.convert_tokens_to_ids(embodied_action_token)
 
-        vla_embedding_size = self.qwen_vl_interface.model.get_input_embeddings().weight.size(0)
+        vla_embedding_size = self._input_embedding_vocab_size()
         if vla_embedding_size < len(tokenizer):
             self.qwen_vl_interface.model.resize_token_embeddings(len(tokenizer))
+            vla_embedding_size = self._input_embedding_vocab_size()
         logger.info(f"Model embedding size: {vla_embedding_size} ;tokenizer.vocab_size: {len(tokenizer)}")
         return action_tokens, action_token_ids, embodied_action_token_id
 
@@ -1181,6 +1484,7 @@ class VLA_JEPA(baseframework):
         self,
         examples: List[dict] = None,
         rabc_weights: Optional[torch.Tensor] = None,
+        train_step: Optional[int] = None,
         **kwargs,
     ) -> Tuple:
         timing_stats = {
@@ -1188,6 +1492,7 @@ class VLA_JEPA(baseframework):
             "qwen_input_build_time": 0.0,
             "qwen_forward_time": 0.0,
             "vj_encode_time": 0.0,
+            "depth_teacher_time": 0.0,
             "predictor_action_head_time": 0.0,
         }
         batch_videos, batch_target_videos = self._extract_training_videos(examples)
@@ -1242,6 +1547,19 @@ class VLA_JEPA(baseframework):
             action_tokens = last_hidden[action_indices[0], action_indices[1], :].view(B, -1, H)
             embodied_action_tokens = last_hidden[embodied_action_indices[0], embodied_action_indices[1], :].view(B, -1, H)
         timing_stats["qwen_forward_time"] += time.perf_counter() - qwen_forward_start
+        depth_teacher_metrics = {}
+        if self.depth_teacher_aux_enabled:
+            depth_teacher_start = time.perf_counter()
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                depth_teacher_metrics = self._compute_depth_teacher_aux_loss(
+                    last_hidden=last_hidden,
+                    qwen_inputs=qwen_inputs,
+                    batch_videos=batch_videos,
+                    batch_size=batch_videos.shape[0],
+                    num_views=batch_videos.shape[1],
+                    train_step=train_step,
+                )
+            timing_stats["depth_teacher_time"] += time.perf_counter() - depth_teacher_start
 
         # Step 2: JEPA Encoder
         with torch.autocast("cuda", dtype=torch.bfloat16):
@@ -1286,7 +1604,7 @@ class VLA_JEPA(baseframework):
         
         if not has_actions:
             timing_stats["predictor_action_head_time"] += time.perf_counter() - predictor_head_start
-            return {"wm_loss": teacher_forcing_wm_loss, **timing_stats}
+            return {"wm_loss": teacher_forcing_wm_loss, **depth_teacher_metrics, **timing_stats}
 
         with torch.autocast("cuda", dtype=torch.bfloat16):
             if isinstance(actions, torch.Tensor):
@@ -1336,7 +1654,7 @@ class VLA_JEPA(baseframework):
                 action_loss = per_sample_action_loss.mean()
 
         timing_stats["predictor_action_head_time"] += time.perf_counter() - predictor_head_start
-        result = {"action_loss": action_loss, "wm_loss": teacher_forcing_wm_loss, **timing_stats}
+        result = {"action_loss": action_loss, "wm_loss": teacher_forcing_wm_loss, **depth_teacher_metrics, **timing_stats}
         if rabc_weights is not None:
             result["rabc_mean_weight"] = rabc_weights.detach().mean()
         return result

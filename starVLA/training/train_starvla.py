@@ -81,6 +81,8 @@ from transformers import AutoProcessor, get_scheduler
 from starVLA.training.trainer_utils.trainer_tools import normalize_dotlist_args
 from starVLA.training.trainer_utils.trainer_tools import TrainerUtils
 from starVLA.training.trainer_utils.trainer_tools import build_param_lr_groups
+from starVLA.training.trainer_utils.trainer_tools import is_depth_teacher_aux_missing_key_allowed
+from starVLA.training.trainer_utils.trainer_tools import is_depth_teacher_aux_unexpected_key_allowed
 
 # Sane Defaults
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -374,6 +376,21 @@ def build_accelerator(cfg) -> Accelerator:
     if torch.cuda.is_available():
         # Ensure NCCL collectives run on the process-local device before any early barrier().
         torch.cuda.set_device(accelerator.local_process_index)
+    try:
+        OmegaConf.update(
+            cfg,
+            "trainer._accelerate_distributed_type",
+            str(accelerator.distributed_type).lower(),
+            force_add=True,
+        )
+        OmegaConf.update(
+            cfg,
+            "trainer._accelerate_num_processes",
+            int(accelerator.num_processes),
+            force_add=True,
+        )
+    except Exception as exc:
+        logger.warning(f"Could not record Accelerator runtime state in trainer config: {exc}")
     accelerator.print(accelerator.state)
     return accelerator
 
@@ -423,14 +440,56 @@ def setup_directories(cfg) -> Path:
     return output_dir
 
 
+_TORCH_COMPILE_MODEL_FLAGS = (
+    "compile_qwen_model",
+    "compile_action_model",
+    "compile_vj_predictor",
+    "compile_vj_encoder",
+    "compile_full_model",
+)
+
+
+def _requested_torch_compile_flags(trainer_cfg) -> list[str]:
+    return [flag for flag in _TORCH_COMPILE_MODEL_FLAGS if bool(trainer_cfg.get(flag, False))]
+
+
+def _training_uses_deepspeed(cfg) -> bool:
+    trainer_cfg = cfg.get("trainer", {}) if cfg is not None else {}
+    distributed_type = str(trainer_cfg.get("_accelerate_distributed_type", "")).lower()
+    if "deepspeed" in distributed_type:
+        return True
+    if os.environ.get("STARVLA_USE_DEEPSPEED", "0") == "1":
+        return True
+    accelerate_distributed_type = os.environ.get("ACCELERATE_DISTRIBUTED_TYPE", "")
+    if "deepspeed" in accelerate_distributed_type.lower():
+        return True
+    accelerate_use_deepspeed = os.environ.get("ACCELERATE_USE_DEEPSPEED", "")
+    return accelerate_use_deepspeed.lower() in {"1", "true", "yes"}
+
+
 def build_model(cfg) -> torch.nn.Module:
     """build model framework"""
+    trainer_cfg = cfg.get("trainer", {})
+    requested_compile_flags = _requested_torch_compile_flags(trainer_cfg)
+    if (
+        requested_compile_flags
+        and _training_uses_deepspeed(cfg)
+        and not bool(trainer_cfg.get("allow_compile_with_deepspeed", False))
+    ):
+        raise RuntimeError(
+            "DeepSpeed training was requested with torch.compile flags enabled "
+            f"({', '.join(requested_compile_flags)}). This combination is disabled by default "
+            "because compiled module wrappers can interact badly with ZeRO partitioning and "
+            "Accelerate prepare order. Set these compile flags to false for production DeepSpeed "
+            "runs, or set trainer.allow_compile_with_deepspeed=true only after smoke-testing the "
+            "exact ZeRO stage, world size, precision, and freeze policy."
+        )
+
     from starVLA.model.framework import build_framework
 
     logger.info(f"Loading Base VLM `{cfg.framework.qwenvl.base_vlm}` from ID/Path")
     model = build_framework(cfg)
 
-    trainer_cfg = cfg.get("trainer", {})
     compile_mode = trainer_cfg.get("compile_mode", "reduce-overhead")
     compile_dynamic = bool(trainer_cfg.get("compile_dynamic", True))
     if torch.cuda.is_available():
@@ -909,6 +968,7 @@ class VLATrainer(TrainerUtils):
             self.wm_loss_scale,
             self.wm_loss_scale_initial,
             self.wm_loss_warmup_steps,
+            self.depth_teacher_loss_scale,
         ) = self._resolve_loss_scales()
         self.best_metric_name = str(self.config.trainer.get("best_metric_name", "mae_score"))
         self.best_metric_mode = str(self.config.trainer.get("best_metric_mode", "min")).lower()
@@ -992,6 +1052,10 @@ class VLATrainer(TrainerUtils):
         self.model = self.freeze_backbones(self.model, freeze_modules=freeze_modules)
         if hasattr(self.model, "refresh_runtime_caches"):
             self.model.refresh_runtime_caches()
+        if hasattr(self.model, "validate_depth_teacher_aux_training_state"):
+            self.model.validate_depth_teacher_aux_training_state(
+                depth_teacher_loss_scale=self.depth_teacher_loss_scale,
+            )
 
         #  print model trainable parameters:
         self.print_trainable_parameters(self.model)
@@ -1094,8 +1158,18 @@ class VLATrainer(TrainerUtils):
                 strict=False,
             )
             allowed_missing_keys = {"qwen_vl_interface.model.lm_head.weight"}
-            missing_keys = set(incompatible_keys.missing_keys) - allowed_missing_keys
+            missing_keys = {
+                key
+                for key in incompatible_keys.missing_keys
+                if key not in allowed_missing_keys
+                and not is_depth_teacher_aux_missing_key_allowed(self.config, key)
+            }
             unexpected_keys = set(incompatible_keys.unexpected_keys)
+            unexpected_keys = {
+                key
+                for key in unexpected_keys
+                if not is_depth_teacher_aux_unexpected_key_allowed(self.config, key)
+            }
             if missing_keys or unexpected_keys:
                 raise RuntimeError(
                     "Model-only checkpoint load mismatch: "
@@ -1268,6 +1342,16 @@ class VLATrainer(TrainerUtils):
                 if avg_wall_step_time is not None:
                     progress_parts.append(f"avg_wall={avg_wall_step_time:.3f}s")
 
+                if bool(self.config.trainer.get("profile_cuda_memory", False)) and torch.cuda.is_available():
+                    progress_parts.extend(
+                        [
+                            f"gpu_alloc={scalar_metrics.get('gpu_mem_allocated_gb', 0.0):.2f}GiB",
+                            f"gpu_reserved={scalar_metrics.get('gpu_mem_reserved_gb', 0.0):.2f}GiB",
+                            f"gpu_peak={scalar_metrics.get('gpu_mem_peak_allocated_gb', 0.0):.2f}GiB",
+                            f"gpu_peak_reserved={scalar_metrics.get('gpu_mem_peak_reserved_gb', 0.0):.2f}GiB",
+                        ]
+                    )
+
                 if self._runtime_timing_enabled():
                     for metric_key, label in (
                         ("raw_batch_fetch_time", "fetch"),
@@ -1276,6 +1360,7 @@ class VLATrainer(TrainerUtils):
                         ("video_postprocess_time", "post"),
                         ("qwen_tensor_build_time", "qwen"),
                         ("qwen_forward_time", "qfwd"),
+                        ("depth_teacher_time", "depth"),
                         ("vj_encode_time", "vj"),
                         ("predictor_action_head_time", "head"),
                         ("forward_time", "fwd"),
@@ -1362,7 +1447,17 @@ class VLATrainer(TrainerUtils):
         wm_scale = float(loss_scale_cfg.get("wm", loss_scale_cfg.get("vlm", 0.1)))
         wm_initial_scale = float(loss_scale_cfg.get("wm_initial", loss_scale_cfg.get("wm_start", wm_scale)))
         wm_warmup_steps = max(int(loss_scale_cfg.get("wm_warmup_steps", 0)), 0)
-        return action_scale, wm_scale, wm_initial_scale, wm_warmup_steps
+        depth_teacher_default = 0.0
+        depth_teacher_cfg = self.config.framework.get("depth_teacher_aux", {})
+        if bool(depth_teacher_cfg.get("enabled", False)):
+            depth_teacher_default = float(depth_teacher_cfg.get("loss_weight", 0.004))
+        depth_teacher_scale = float(
+            loss_scale_cfg.get(
+                "depth_teacher",
+                loss_scale_cfg.get("depth_aux", depth_teacher_default),
+            )
+        )
+        return action_scale, wm_scale, wm_initial_scale, wm_warmup_steps, depth_teacher_scale
 
     def _current_wm_loss_scale(self) -> float:
         if self.wm_loss_warmup_steps <= 0:
@@ -1451,6 +1546,7 @@ class VLATrainer(TrainerUtils):
                         ("video_postprocess_time", "post"),
                         ("qwen_tensor_build_time", "qwen"),
                         ("qwen_forward_time", "qfwd"),
+                        ("depth_teacher_time", "depth"),
                         ("vj_encode_time", "vj"),
                         ("predictor_action_head_time", "head"),
                         ("forward_time", "fwd"),
@@ -1549,6 +1645,18 @@ class VLATrainer(TrainerUtils):
             if resolve_mixed_precision_mode(self.config) == "no":
                 logger.info(
                     "  Mixed precision: Accelerator disabled; training uses manual torch.autocast(..., bfloat16) in the train/model path"
+                )
+            if bool(self.config.framework.get("depth_teacher_aux", {}).get("enabled", False)):
+                logger.info(f"  Depth teacher auxiliary loss scale = {self.depth_teacher_loss_scale}")
+                depth_teacher_model = self.accelerator.unwrap_model(self.model)
+                detach_steps = (
+                    depth_teacher_model.resolve_depth_teacher_detach_steps()
+                    if hasattr(depth_teacher_model, "resolve_depth_teacher_detach_steps")
+                    else int(self.config.framework.depth_teacher_aux.get("detach_vlm_steps", 0) or 0)
+                )
+                logger.info(
+                    "  Depth teacher VLM detach warmup steps = "
+                    f"{detach_steps}"
                 )
             if self.config.trainer.get("use_rabc", False) and float(self.config.trainer.get("rabc_mistake_weight", 0.0)) <= 0.0:
                 logger.warning(
@@ -1665,11 +1773,16 @@ class VLATrainer(TrainerUtils):
                 logger.info("Step 0 debug: starting model.forward")
             forward_start = time.perf_counter()
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                output_dict = self.model.forward(batch_vla, rabc_weights=rabc_weights)
+                output_dict = self.model.forward(
+                    batch_vla,
+                    rabc_weights=rabc_weights,
+                    train_step=self.completed_steps,
+                )
                 current_wm_loss_scale = self._current_wm_loss_scale()
                 total_loss = (
                     output_dict.get("action_loss", 0.0) * self.action_loss_scale
                     + output_dict.get("wm_loss", 0.0) * current_wm_loss_scale
+                    + output_dict.get("depth_teacher_loss", 0.0) * self.depth_teacher_loss_scale
                 )
             forward_time = time.perf_counter() - forward_start
             if self.completed_steps == 0 and self.accelerator.is_main_process:
@@ -1724,6 +1837,24 @@ class VLATrainer(TrainerUtils):
             if self._last_prefetch_timing:
                 for key, value in self._last_prefetch_timing.items():
                     result_dict[key] = value
+            if bool(self.config.trainer.get("profile_cuda_memory", False)) and torch.cuda.is_available():
+                device = torch.cuda.current_device()
+                allocated_gb = torch.cuda.memory_allocated(device) / (1024 ** 3)
+                reserved_gb = torch.cuda.memory_reserved(device) / (1024 ** 3)
+                max_allocated_gb = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
+                max_reserved_gb = torch.cuda.max_memory_reserved(device) / (1024 ** 3)
+                result_dict["cuda_memory_allocated_gb"] = allocated_gb
+                result_dict["cuda_memory_reserved_gb"] = reserved_gb
+                result_dict["cuda_max_memory_allocated_gb"] = max_allocated_gb
+                result_dict["cuda_max_memory_reserved_gb"] = max_reserved_gb
+                log_step = int(self.config.trainer.get("profile_cuda_memory_log_step", 10))
+                step_index = self.completed_steps + 1
+                if self.accelerator.is_main_process and step_index == log_step:
+                    self.accelerator.print(
+                        "CUDA memory after step "
+                        f"{step_index}: allocated={allocated_gb:.2f} GiB, reserved={reserved_gb:.2f} GiB, "
+                        f"max_allocated={max_allocated_gb:.2f} GiB, max_reserved={max_reserved_gb:.2f} GiB"
+                    )
 
         return result_dict
 

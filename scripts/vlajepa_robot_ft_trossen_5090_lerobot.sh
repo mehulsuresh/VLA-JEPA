@@ -133,22 +133,24 @@ NUM_PROCESSES="${NUM_PROCESSES:-1}"
 NUM_MACHINES="${NUM_MACHINES:-1}"
 MAIN_PROCESS_PORT="${MAIN_PROCESS_PORT:-29511}"
 RUN_ID="${RUN_ID:-robot_ft_trossen_vjepa21_small_5090_lerobot_$(date +%Y%m%d_%H%M%S)}"
-OPTIMIZER_NAME="${OPTIMIZER_NAME:-AdamW}"
-SAVE_BEST_ONLY="${SAVE_BEST_ONLY:-false}"
 COMPILE_FULL_MODEL="${COMPILE_FULL_MODEL:-false}"
 RUNTIME_TIMING_LOGGING="${RUNTIME_TIMING_LOGGING:-true}"
 GPU_VIDEO_DECODE_ON_RANK="${GPU_VIDEO_DECODE_ON_RANK:-false}"
 CPU_VIDEO_DECODE_DROP_WORKER_IMAGES="${CPU_VIDEO_DECODE_DROP_WORKER_IMAGES:-true}"
 EXTRA_TRAIN_ARGS=(
-  --trainer.save_best_only "${SAVE_BEST_ONLY}"
-  --trainer.optimizer.name "${OPTIMIZER_NAME}"
   --trainer.compile_full_model "${COMPILE_FULL_MODEL}"
   --datasets.vla_data.runtime_timing_logging "${RUNTIME_TIMING_LOGGING}"
   --datasets.vla_data.gpu_video_decode_on_rank "${GPU_VIDEO_DECODE_ON_RANK}"
   --datasets.vla_data.cpu_video_decode_drop_worker_images "${CPU_VIDEO_DECODE_DROP_WORKER_IMAGES}"
 )
-if [[ "${OPTIMIZER_NAME}" == "AdamW" ]]; then
-  EXTRA_TRAIN_ARGS+=(--trainer.optimizer.fused true)
+if [[ -n "${SAVE_BEST_ONLY:-}" ]]; then
+  EXTRA_TRAIN_ARGS+=(--trainer.save_best_only "${SAVE_BEST_ONLY}")
+fi
+if [[ -n "${OPTIMIZER_NAME:-}" ]]; then
+  EXTRA_TRAIN_ARGS+=(--trainer.optimizer.name "${OPTIMIZER_NAME}")
+  if [[ "${OPTIMIZER_NAME}" == "AdamW" ]]; then
+    EXTRA_TRAIN_ARGS+=(--trainer.optimizer.fused true)
+  fi
 fi
 
 cd "${REPO_ROOT}"

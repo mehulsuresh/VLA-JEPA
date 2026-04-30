@@ -5,7 +5,7 @@ Utility classes defining a Metrics container and multiple Trackers to enable mod
 endpoints (e.g., JSONL local logs, Weights & Biases).
 """
 
-from typing import Tuple
+from typing import Any, Tuple
 import re
 import json
 import numpy as np
@@ -14,6 +14,30 @@ import torch
 from accelerate.logging import get_logger
 
 logger = get_logger(__name__)
+
+
+def _cfg_get(cfg: Any, key: str, default: Any = None) -> Any:
+    if cfg is None:
+        return default
+    if hasattr(cfg, "get"):
+        return cfg.get(key, default)
+    return getattr(cfg, key, default)
+
+
+def is_depth_teacher_aux_missing_key_allowed(config: Any, key: str) -> bool:
+    framework_cfg = _cfg_get(config, "framework", {})
+    depth_teacher_aux_cfg = _cfg_get(framework_cfg, "depth_teacher_aux", {})
+    return bool(_cfg_get(depth_teacher_aux_cfg, "enabled", False)) and is_depth_teacher_aux_key(key)
+
+
+def is_depth_teacher_aux_unexpected_key_allowed(config: Any, key: str) -> bool:
+    framework_cfg = _cfg_get(config, "framework", {})
+    depth_teacher_aux_cfg = _cfg_get(framework_cfg, "depth_teacher_aux", {})
+    return (not bool(_cfg_get(depth_teacher_aux_cfg, "enabled", False))) and is_depth_teacher_aux_key(key)
+
+
+def is_depth_teacher_aux_key(key: str) -> bool:
+    return key.startswith("depth_teacher_aux_head.")
 
 
 # === Define Tracker Interface ===
@@ -273,7 +297,26 @@ class TrainerUtils:
                     print("✅ loaded <full_model> model parameters")
                 loaded_modules = ["<full_model>"]
             except Exception as e:
-                raise RuntimeError(f"❌ loading full model failed: {e}")
+                model_cfg = getattr(model, "config", None)
+                incompatible_keys = model.load_state_dict(checkpoint, strict=False)
+                missing_keys = [
+                    key
+                    for key in incompatible_keys.missing_keys
+                    if not is_depth_teacher_aux_missing_key_allowed(model_cfg, key)
+                ]
+                unexpected_keys = [
+                    key
+                    for key in incompatible_keys.unexpected_keys
+                    if not is_depth_teacher_aux_unexpected_key_allowed(model_cfg, key)
+                ]
+                if missing_keys or unexpected_keys:
+                    raise RuntimeError(
+                        "❌ loading full model failed after applying depth teacher aux compatibility filter: "
+                        f"missing_keys={missing_keys} unexpected_keys={unexpected_keys}"
+                    ) from e
+                if not dist.is_initialized() or dist.get_rank() == 0:
+                    print("✅ loaded <full_model> model parameters with depth_teacher_aux compatibility filter")
+                loaded_modules = ["<full_model>"]
         return model
 
     @staticmethod

@@ -116,6 +116,19 @@ if [[ "${DEEPSPEED_STAGE}" == "3" || "${DEEPSPEED_STAGE,,}" == "zero3" ]]; then
   DEFAULT_ACCELERATE_CONFIG="${REPO_ROOT}/starVLA/config/deepseeds/deepspeed_zero3.yaml"
   EXTRA_TRAIN_ARGS+=(--framework.qwenvl.device_map null)
 fi
+if [[ "${STARVLA_USE_DEEPSPEED}" == "1" ]]; then
+  if [[ "${STARVLA_ALLOW_COMPILE_WITH_DEEPSPEED:-0}" == "1" ]]; then
+    EXTRA_TRAIN_ARGS+=(--trainer.allow_compile_with_deepspeed true)
+  else
+    EXTRA_TRAIN_ARGS+=(
+      --trainer.compile_qwen_model false
+      --trainer.compile_action_model false
+      --trainer.compile_vj_predictor false
+      --trainer.compile_vj_encoder false
+      --trainer.compile_full_model false
+    )
+  fi
+fi
 ACCELERATE_CONFIG="${ACCELERATE_CONFIG:-${DEFAULT_ACCELERATE_CONFIG}}"
 NUM_PROCESSES="${NUM_PROCESSES:-4}"
 MAIN_PROCESS_PORT="${MAIN_PROCESS_PORT:-29500}"

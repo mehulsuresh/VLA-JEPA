@@ -242,11 +242,10 @@ class _QWen3_5_Interface(nn.Module):
         processor = AutoProcessor.from_pretrained(model_id)
         processor.tokenizer.padding_side = "left"
 
-        logger.info(
-            "Loaded `%s` with attention backend `%s` (requested `%s`)",
-            model_id,
-            attn_implementation,
-            requested_attn_implementation,
+        self._safe_log(
+            "info",
+            f"Loaded `{model_id}` with attention backend `{attn_implementation}` "
+            f"(requested `{requested_attn_implementation}`)",
         )
         if enable_fast_linear_attention:
             has_fast_delta = all(
