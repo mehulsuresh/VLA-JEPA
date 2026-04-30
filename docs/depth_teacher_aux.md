@@ -2,11 +2,31 @@
 
 This document describes only the technical implementation of the geometry teacher auxiliary path in VLA-JEPA. It is intended for implementation review.
 
-## Summary
+## Goal
 
-The auxiliary path implements LingBot-style direct feature distillation from a frozen geometry teacher into Qwen image-token hidden states.
+The auxiliary path was inspired by LingBot-VLA's direct geometry alignment path, but adapted for VLA-JEPA and Qwen-VL. The important point is that this is feature-embedding distillation, not raw depth or normal regression.
 
-It does not regress raw depth, metric depth, point maps, or surface normals. MoGe-2 is used as a frozen geometry-aware feature teacher, and VLA-JEPA learns a projection from Qwen image-token embeddings into MoGe feature space.
+Instead of asking the VLA model to directly regress metric depth or surface normals, the path projects Qwen image-token hidden states into the frozen teacher feature space and applies:
+
+- pooled teacher-feature L1 loss
+- teacher/prediction feature-similarity loss
+
+The teacher is `Ruicheng/moge-2-vitl-normal`, which is useful because MoGe-2 provides metric-scale geometry and surface-normal supervision internally. We use its learned feature maps as the distillation target.
+
+## Implementation
+
+The implementation lives in:
+
+- `starVLA/model/modules/geometry_teacher.py`
+- `starVLA/model/framework/VLA_JEPA.py`
+- `starVLA/training/train_starvla.py`
+- `starVLA/training/trainer_utils/trainer_tools.py`
+
+The main pieces are:
+
+- `MoGeGeometryTeacher`: frozen MoGe teacher kept outside the trainable model state dict.
+- `DirectGeometryTeacherHead`: trainable MLP that projects Qwen image-token hidden states into MoGe feature space.
+- `direct_feature_distillation_loss`: LingBot-style direct feature loss.
 
 The auxiliary branch is disabled by default and is gated by:
 
@@ -17,6 +37,14 @@ framework:
 ```
 
 When disabled, no teacher is loaded, no auxiliary head is constructed, and no auxiliary loss is added.
+
+## Direct-Mode Alignment
+
+Qwen image-token hidden states are extracted from the same image tokens Qwen saw. The branch requires Qwen `image_grid_thw` metadata so target grids are explicit. It does not use the unsafe fallback that inferred grids from token counts.
+
+The current Qwen input builder passes only the last temporal frame from each view into Qwen. The geometry teacher path mirrors that behavior by taking `batch_videos[:, :, -1]`, keeping teacher targets one-to-one with Qwen image tokens.
+
+All images in a batch are expected to share the same Qwen image-token grid. If this assumption breaks, the branch raises instead of silently misaligning teacher targets.
 
 ## Teacher
 
@@ -139,7 +167,7 @@ The image token id is resolved from the Qwen processor or tokenizer using:
 
 The implementation requires Qwen `image_grid_thw`. If it is absent, the auxiliary path raises. This is deliberate: inferring image grids from token counts is unsafe when image sizes or view resolutions differ.
 
-The current Qwen input builder passes the last temporal frame from each view. The geometry teacher branch mirrors this by using:
+As noted above, the current Qwen input builder passes the last temporal frame from each view. The geometry teacher branch mirrors this by using:
 
 ```text
 batch_videos[:, :, -1]
@@ -404,4 +432,3 @@ The teacher feature target uses average pooling from MoGe grid to Qwen grid. Thi
 For multi-node training, the teacher weights should be pre-staged to avoid every rank downloading the same model from Hugging Face Hub.
 
 `compile_qwen_model: true` with `find_unused_parameters: true` is warned about because `torch.compile` and DDP unused-parameter traversal can interact poorly. This needs a real multi-GPU smoke test before long runs.
-
