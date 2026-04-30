@@ -143,6 +143,57 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe", model=None): # TODO
                 output_dir.mkdir(parents=True, exist_ok=True)
                 vla_dataset.save_dataset_statistics(output_dir / "dataset_statistics.json")
         return vla_train_dataloader
+    elif dataset_py == "canonical_subset_vla":
+        from starVLA.dataloader.canonical_subset_dataset import get_vla_dataset, collate_fn
+
+        vla_dataset_cfg = cfg.datasets.vla_data
+        num_workers = int(vla_dataset_cfg.get("num_workers", 0))
+        pin_memory = bool(vla_dataset_cfg.get("pin_memory", torch.cuda.is_available()))
+        drop_last = bool(vla_dataset_cfg.get("drop_last", True))
+
+        vla_dataset = get_vla_dataset(
+            data_cfg=vla_dataset_cfg,
+            action_horizon=cfg.framework.action_model.action_horizon,
+            video_horizon=cfg.framework.vj2_model.num_frames,
+            video_frame_stride=vla_dataset_cfg.get("video_frame_stride", 1),
+        )
+        try:
+            logger.info(
+                "Canonical subset dataloader will use the existing CPU-worker video_compact path; "
+                "gpu_video_decode_on_rank is intentionally not required"
+            )
+        except RuntimeError:
+            print(
+                "Canonical subset dataloader will use the existing CPU-worker video_compact path; "
+                "gpu_video_decode_on_rank is intentionally not required"
+            )
+
+        loader_kwargs = dict(
+            dataset=vla_dataset,
+            batch_size=cfg.datasets.vla_data.per_device_batch_size,
+            collate_fn=collate_fn,
+            shuffle=True,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            drop_last=drop_last,
+        )
+        if num_workers > 0:
+            loader_kwargs["prefetch_factor"] = max(2, int(vla_dataset_cfg.get("prefetch_factor", 2)))
+            loader_kwargs["persistent_workers"] = bool(vla_dataset_cfg.get("persistent_workers", True))
+            loader_kwargs["multiprocessing_context"] = vla_dataset_cfg.get("multiprocessing_context", "spawn")
+            loader_kwargs["worker_init_fn"] = partial(
+                _configure_lerobot_worker,
+                torch_threads=max(1, int(vla_dataset_cfg.get("worker_torch_threads", 1))),
+                cv2_threads=max(1, int(vla_dataset_cfg.get("worker_cv2_threads", 1))),
+            )
+
+        vla_train_dataloader = DataLoader(**loader_kwargs)
+        if not dist.is_initialized() or dist.get_rank() == 0:
+            output_dir = _resolve_output_dir(cfg)
+            if output_dir is not None:
+                output_dir.mkdir(parents=True, exist_ok=True)
+                vla_dataset.save_dataset_statistics(output_dir / "dataset_statistics.json")
+        return vla_train_dataloader
     elif dataset_py == "preprocessed_subtask_dataset":
         from starVLA.dataloader.preprocessed_subtask_dataset import (
             PreprocessedSubtaskCollator,

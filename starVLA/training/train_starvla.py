@@ -1491,6 +1491,9 @@ class VLATrainer(TrainerUtils):
         infer_model = self.accelerator.unwrap_model(self.model)
         if isinstance(examples, dict):
             actions = examples["action"].cpu().numpy()
+            action_mask = examples.get("action_mask")
+            if action_mask is not None:
+                action_mask = action_mask.cpu().numpy()
             with torch.no_grad():
                 output_dict = infer_model.predict_action(
                     batch=examples,
@@ -1499,6 +1502,7 @@ class VLATrainer(TrainerUtils):
                 )
         else:
             actions = [example["action"] for example in examples]
+            action_mask = [example["action_mask"] for example in examples] if "action_mask" in examples[0] else None
             state = [example["state"] for example in examples] if "state" in examples[0] else None
             with torch.no_grad():
                 output_dict = infer_model.predict_action(
@@ -1511,11 +1515,17 @@ class VLATrainer(TrainerUtils):
         actions = np.asarray(actions, dtype=np.float32)
         normalized_actions = np.asarray(output_dict["normalized_actions"], dtype=np.float32)
         diff = normalized_actions - actions
+        if action_mask is not None:
+            mask = np.asarray(action_mask, dtype=np.float32)
+            diff = diff * mask
+            metric_count = float(mask.sum())
+        else:
+            metric_count = float(diff.size)
         local_metrics = torch.tensor(
             [
                 float(np.abs(diff).sum()),
                 float(np.square(diff).sum()),
-                float(diff.size),
+                metric_count,
             ],
             device=self.accelerator.device,
             dtype=torch.float64,

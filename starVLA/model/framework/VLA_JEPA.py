@@ -1193,6 +1193,7 @@ class VLA_JEPA(baseframework):
         batch_videos, batch_target_videos = self._extract_training_videos(examples)
         if isinstance(examples, dict):
             actions = examples.get("action")
+            action_mask = examples.get("action_mask")
             state = examples.get("state")
             if "qwen_inputs" in examples:
                 qwen_inputs = self._move_qwen_inputs(examples["qwen_inputs"])
@@ -1209,6 +1210,7 @@ class VLA_JEPA(baseframework):
             has_actions = actions is not None
         else:
             actions = [example["action"] for example in examples] if "action" in examples[0] else None
+            action_mask = [example["action_mask"] for example in examples] if "action_mask" in examples[0] else None
             state = [example["state"] for example in examples] if "state" in examples[0] else None
             if "qwen_inputs" in examples[0]:
                 qwen_inputs = self._move_qwen_inputs(examples[0]["qwen_inputs"])
@@ -1299,6 +1301,17 @@ class VLA_JEPA(baseframework):
             actions_target_repeated = actions_target.repeat(repeated_diffusion_steps, 1, 1)
             embodied_action_repeated = embodied_action_tokens.repeat(repeated_diffusion_steps, 1, 1)
 
+            action_mask_repeated = None
+            if action_mask is not None:
+                if isinstance(action_mask, torch.Tensor):
+                    action_mask = action_mask.to(device=last_hidden.device, dtype=torch.float32, non_blocking=True)
+                else:
+                    action_mask = torch.from_numpy(np.asarray(action_mask, dtype=np.float32)).to(
+                        device=last_hidden.device, non_blocking=True
+                    )
+                action_mask_target = action_mask[:, -(self.future_action_window_size + 1) :, :]
+                action_mask_repeated = action_mask_target.repeat(repeated_diffusion_steps, 1, 1)
+
             state_repeated = None
             if state is not None:
                 if isinstance(state, torch.Tensor):
@@ -1313,6 +1326,7 @@ class VLA_JEPA(baseframework):
                 embodied_action_repeated,
                 actions_target_repeated,
                 state_repeated,
+                action_mask=action_mask_repeated,
                 reduction="none",
             ).float()
             if rabc_weights is not None:

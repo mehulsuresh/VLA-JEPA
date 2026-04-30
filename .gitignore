@@ -10,6 +10,7 @@ build/
 checkpoints/
 results/
 cache/
+.cache/
 wandb/
 runs/
 *.pt

@@ -298,6 +298,7 @@ class FlowmatchingActionHead(nn.Module):
         vl_embs: torch.Tensor,
         actions: torch.Tensor,
         state: torch.Tensor = None,
+        action_mask: torch.Tensor = None,
         reduction: str = "mean",
     ):
         """
@@ -346,7 +347,17 @@ class FlowmatchingActionHead(nn.Module):
 
         # Slice out only the action portion of pred and target.
         per_token_loss = (pred_actions - velocity) ** 2
-        per_sample_loss = per_token_loss.mean(dim=(1, 2))
+        if action_mask is not None:
+            action_mask = action_mask.to(device=per_token_loss.device, dtype=per_token_loss.dtype)
+            if action_mask.shape != per_token_loss.shape:
+                raise ValueError(
+                    f"action_mask shape {tuple(action_mask.shape)} does not match "
+                    f"action loss shape {tuple(per_token_loss.shape)}"
+                )
+            masked_loss = per_token_loss * action_mask
+            per_sample_loss = masked_loss.sum(dim=(1, 2)) / action_mask.sum(dim=(1, 2)).clamp_min(1.0)
+        else:
+            per_sample_loss = per_token_loss.mean(dim=(1, 2))
         if reduction == "none":
             return per_sample_loss
         if reduction == "mean":
