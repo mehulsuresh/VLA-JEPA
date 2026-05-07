@@ -5,6 +5,7 @@
 
 
 from dataclasses import dataclass, field
+import warnings
 
 import torch
 import torch.nn.functional as F
@@ -19,6 +20,16 @@ from starVLA.model.modules.action_model.flow_matching_head.action_encoder import
 )
 
 from starVLA.model.modules.action_model.flow_matching_head.cross_attention_dit import DiT, SelfAttentionTransformer
+from starVLA.model.modules.action_model.rtc_training import (
+    apply_rtc_time_conditioning,
+    build_sequence_timesteps,
+    cfg_get,
+    get_rtc_training_config,
+    get_total_training_steps,
+    reduce_masked_loss,
+    rtc_training_enabled,
+    sample_rtc_training_delays,
+)
 
 # TODO try to meger DiT Modules with follow_match_head, they are just the same arch, but diff loss, use diffusers package will be simple
 
@@ -72,20 +83,18 @@ class ActionEncoder(nn.Module):
     def forward(self, actions, timesteps):
         """
         actions:   shape (B, T, action_dim)
-        timesteps: shape (B,)  -- a single scalar per batch item
+        timesteps: shape (B,) or (B, T)
         returns:   shape (B, T, hidden_size)
         """
         B, T, _ = actions.shape
 
-        # 1) Expand each batch's single scalar time 'tau' across all T steps
-        #    so that shape => (B, T)
-        #    e.g. if timesteps is (B,), replicate across T
         if timesteps.dim() == 1 and timesteps.shape[0] == B:
-            # shape (B,) => (B,T)
             timesteps = timesteps.unsqueeze(1).expand(-1, T)
+        elif timesteps.dim() == 2 and timesteps.shape == (B, T):
+            pass
         else:
             raise ValueError(
-                "Expected `timesteps` to have shape (B,) so we can replicate across T."
+                f"Expected `timesteps` to have shape (B,) or (B, T), got {tuple(timesteps.shape)}."
             )
 
         # 2) Standard action MLP step for shape => (B, T, w)
@@ -119,21 +128,19 @@ class MultiEmbodimentActionEncoder(nn.Module):
     def forward(self, actions, timesteps, cat_ids):
         """
         actions:   shape (B, T, action_dim)
-        timesteps: shape (B,)  -- a single scalar per batch item
+        timesteps: shape (B,) or (B, T)
         cat_ids:   shape (B,)
         returns:   shape (B, T, hidden_size)
         """
         B, T, _ = actions.shape
 
-        # 1) Expand each batch's single scalar time 'tau' across all T steps
-        #    so that shape => (B, T)
-        #    e.g. if timesteps is (B,), replicate across T
         if timesteps.dim() == 1 and timesteps.shape[0] == B:
-            # shape (B,) => (B,T)
             timesteps = timesteps.unsqueeze(1).expand(-1, T)
+        elif timesteps.dim() == 2 and timesteps.shape == (B, T):
+            pass
         else:
             raise ValueError(
-                "Expected `timesteps` to have shape (B,) so we can replicate across T."
+                f"Expected `timesteps` to have shape (B,) or (B, T), got {tuple(timesteps.shape)}."
             )
 
         # 2) Standard action MLP step for shape => (B, T, w)
@@ -199,6 +206,8 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
     num_target_vision_tokens: int = field(
         default=32, metadata={"help": "Number of target vision tokens."}
     )
+    rtc_training: dict = field(default=None)
+    rtc_training_config: dict = field(default=None)
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -217,6 +226,7 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
     ):
         super().__init__()
         config = full_config.framework.action_model
+        self.full_config = full_config
         self.hidden_size = config.hidden_size
 
         action_model_cfg = full_config.framework.action_model.DiTConfig
@@ -254,6 +264,7 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         self.beta_dist = Beta(config.noise_beta_alpha, config.noise_beta_beta)
         self.num_timestep_buckets = config.num_timestep_buckets
         self.config = config
+        self.rtc_training_config = get_rtc_training_config(config)
 
     def sample_time(self, batch_size, device, dtype):
         sample = self.beta_dist.sample([batch_size]).to(device, dtype=dtype)
@@ -262,8 +273,31 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
     def prepare_input(self, batch: dict) -> BatchFeature:
         return BatchFeature(data=batch)
 
+    def _rtc_condition_dit_tokens(self) -> bool:
+        return rtc_training_enabled(self.rtc_training_config) and bool(
+            cfg_get(self.rtc_training_config, "condition_dit_tokens", False)
+        )
 
-    def forward(self, vl_embs_list: list, actions: torch.Tensor, state: torch.Tensor = None):
+    def _build_model_timestep(
+        self,
+        global_timesteps: torch.Tensor,
+        action_timesteps: torch.Tensor,
+        n_context_tokens: int,
+    ) -> torch.Tensor:
+        if not self._rtc_condition_dit_tokens():
+            return global_timesteps
+        return build_sequence_timesteps(global_timesteps, action_timesteps, n_context_tokens)
+
+    def forward(
+        self,
+        vl_embs_list: list,
+        actions: torch.Tensor,
+        state: torch.Tensor = None,
+        action_mask: torch.Tensor = None,
+        reduction: str = "mean",
+        train_step: int = None,
+        return_loss_components: bool = False,
+    ):
         """
         vl_embs: list of torch.Tensor, each shape (B, seq_length, feature_dim)
         actions: shape (B, future_action_window_size, D_action)
@@ -271,16 +305,35 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         device = actions.device
         num_layers = len(vl_embs_list)
         B, L, D = vl_embs_list[0].shape
-        # Embed noised action trajectory.
         noise = torch.randn(actions.shape, device=actions.device, dtype=actions.dtype)
-        t = self.sample_time(actions.shape[0], device=actions.device, dtype=actions.dtype)
-        t = t[:, None, None]  # shape (B,1,1) for broadcast
+        t_scalar = self.sample_time(actions.shape[0], device=actions.device, dtype=actions.dtype)
+        action_horizon = actions.shape[1]
+        prefix_mask = None
 
-        noisy_trajectory = (1 - t) * noise + t * actions
+        if rtc_training_enabled(self.rtc_training_config):
+            delays = sample_rtc_training_delays(
+                self.rtc_training_config,
+                batch_size=actions.shape[0],
+                n_action_steps=action_horizon,
+                device=actions.device,
+                train_step=train_step,
+                total_steps=get_total_training_steps(self.full_config),
+            )
+            t, prefix_mask = apply_rtc_time_conditioning(
+                t_scalar,
+                delays,
+                n_action_steps=action_horizon,
+                clean_time=float(cfg_get(self.rtc_training_config, "clean_time", 1.0)),
+            )
+        else:
+            t = t_scalar[:, None].expand(-1, action_horizon)
+
+        noisy_trajectory = (1 - t.unsqueeze(-1)) * noise + t.unsqueeze(-1) * actions
         velocity = actions - noise
 
         # Convert (continuous) t -> discrete if needed
-        t_discretized = (t[:, 0, 0] * self.num_timestep_buckets).long()
+        t_discretized = (t * self.num_timestep_buckets).long()
+        t_global = (t_scalar * self.num_timestep_buckets).long()
         action_features = self.action_encoder(noisy_trajectory, t_discretized)
 
         # Embed state
@@ -296,9 +349,11 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         future_tokens = self.future_tokens.weight.unsqueeze(0).expand(B, -1, -1)
         sa_embs = torch.cat((state_features, future_tokens, action_features), dim=1) \
             if state_features is not None else torch.cat((future_tokens, action_features), dim=1)
+        n_context_tokens = sa_embs.shape[1] - action_horizon
+        model_timestep = self._build_model_timestep(t_global, t_discretized, n_context_tokens)
         
         # Encode timesteps
-        temb = self.model.timestep_encoder(t_discretized)
+        temb = self.model.timestep_encoder(model_timestep)
 
         # Layerwise cross-attention with vl_embs
         model_output = sa_embs
@@ -321,11 +376,35 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         pred_actions = pred[:, -actions.shape[1] :]
 
         # Slice out only the action portion of pred and target.
-        loss = ((pred_actions - velocity) ** 2).mean()
-        return loss
+        per_token_loss = (pred_actions - velocity) ** 2
+        loss_mask = None
+        if action_mask is not None:
+            loss_mask = action_mask.to(device=per_token_loss.device, dtype=per_token_loss.dtype)
+            if loss_mask.shape != per_token_loss.shape:
+                raise ValueError(
+                    f"action_mask shape {tuple(action_mask.shape)} does not match "
+                    f"action loss shape {tuple(per_token_loss.shape)}"
+                )
+        if prefix_mask is not None:
+            prefix_loss_mask = (~prefix_mask).unsqueeze(-1).to(dtype=per_token_loss.dtype)
+            prefix_loss_mask = prefix_loss_mask.expand_as(per_token_loss)
+            loss_mask = prefix_loss_mask if loss_mask is None else loss_mask * prefix_loss_mask
+        return reduce_masked_loss(
+            per_token_loss,
+            loss_mask=loss_mask,
+            reduction=reduction,
+            return_components=return_loss_components,
+        )
 
     @torch.no_grad()
-    def predict_action(self, vl_embs_list: list, state: torch.Tensor = None) -> torch.Tensor:
+    def predict_action(
+        self,
+        vl_embs_list: list,
+        state: torch.Tensor = None,
+        prev_actions: torch.Tensor = None,
+        prefix_len: int = 0,
+        rtc_config: dict = None,
+    ) -> torch.Tensor:
         # Set initial actions as the sampled noise.
         batch_size = vl_embs_list[0].shape[0]
         device = vl_embs_list[0].device
@@ -339,17 +418,58 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         dt = 1.0 / num_steps
 
         state_features = self.state_encoder(state) if state is not None else None
+        rtc_requested = bool(cfg_get(rtc_config, "enabled", False))
+        rtc_enabled = (
+            prev_actions is not None
+            and prefix_len > 0
+            and (rtc_config is None or bool(cfg_get(rtc_config, "enabled", True)))
+        )
+        if rtc_requested and not rtc_enabled:
+            warnings.warn(
+                "RTC inference was requested but disabled because prev_actions is missing "
+                "or prefix_len <= 0.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        rtc_method = cfg_get(rtc_config, "method", "prefix") if rtc_enabled else None
+        if rtc_method not in (None, "prefix"):
+            raise ValueError(f"Unsupported RTC inference method {rtc_method!r}; only 'prefix' is implemented.")
+        if rtc_enabled:
+            prefix_len = int(prefix_len)
+            if prefix_len > self.action_horizon:
+                raise ValueError(f"prefix_len={prefix_len} exceeds action_horizon={self.action_horizon}.")
+            if prev_actions.shape[0] != batch_size or prev_actions.shape[1] < prefix_len:
+                raise ValueError(
+                    f"prev_actions shape {tuple(prev_actions.shape)} is incompatible with "
+                    f"batch_size={batch_size}, prefix_len={prefix_len}."
+                )
+            if prev_actions.shape[-1] != self.action_dim:
+                raise ValueError(
+                    f"prev_actions last dimension {prev_actions.shape[-1]} must match action_dim={self.action_dim}."
+                )
+            prev_actions = prev_actions.to(device=device, dtype=actions.dtype)
 
         # Run denoising steps.
         for t in range(num_steps):
             t_cont = t / float(num_steps)
             t_discretized_int = int(t_cont * self.num_timestep_buckets)
+            if rtc_enabled:
+                actions[:, :prefix_len] = prev_actions[:, :prefix_len]
             timesteps_tensor = torch.full(
                 size=(batch_size,), fill_value=t_discretized_int, device=device, dtype=torch.long
             )
 
             # Embed current action trajectory with timestep
-            action_features = self.action_encoder(actions, timesteps_tensor)
+            action_timesteps = timesteps_tensor
+            if rtc_enabled:
+                action_timesteps = torch.full(
+                    (batch_size, self.action_horizon),
+                    fill_value=t_discretized_int,
+                    device=device,
+                    dtype=torch.long,
+                )
+                action_timesteps[:, :prefix_len] = self.num_timestep_buckets
+            action_features = self.action_encoder(actions, action_timesteps)
 
             # Maybe add position embedding.
             if self.config.add_pos_embed:
@@ -363,9 +483,15 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
                 if state_features is not None
                 else torch.cat((future_tokens, action_features), dim=1)
             )
+            n_context_tokens = sa_embs.shape[1] - self.action_horizon
+            model_timestep = self._build_model_timestep(
+                timesteps_tensor,
+                action_timesteps,
+                n_context_tokens,
+            )
 
             # Encode timestep
-            temb = self.model.timestep_encoder(timesteps_tensor)
+            temb = self.model.timestep_encoder(model_timestep)
 
             # Layerwise cross-attention with vl_embs_list
             model_output = sa_embs
@@ -381,6 +507,8 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
 
             # Euler integration
             actions = actions + dt * pred_velocity
+            if rtc_enabled:
+                actions[:, :prefix_len] = prev_actions[:, :prefix_len]
         return actions
 
     @property

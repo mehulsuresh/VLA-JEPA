@@ -51,6 +51,17 @@ framework:
     noise_s: 0.999
     num_timestep_buckets: 1000
     num_inference_timesteps: 4
+    rtc_training:
+      enabled: false
+      method: prefix
+      # max_delay is exclusive; 11 samples 0..10-step prefixes.
+      max_delay: 11
+      distribution: uniform
+      rtc_prob: 1.0
+      warmup_steps: 0
+      ramp_steps: 0
+      clean_time: 1.0
+      condition_dit_tokens: false
     num_target_vision_tokens: 32
     diffusion_model_cfg:
       cross_attention_dim: 1024

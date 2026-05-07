@@ -1640,18 +1640,34 @@ class VLA_JEPA(baseframework):
                     )
                 state_repeated = state.repeat(repeated_diffusion_steps, 1, 1)
 
-            per_sample_action_loss = self.action_model(
-                embodied_action_repeated,
-                actions_target_repeated,
-                state_repeated,
-                action_mask=action_mask_repeated,
-                reduction="none",
-            ).float()
             if rabc_weights is not None:
-                expanded_weights = rabc_weights.repeat(repeated_diffusion_steps)
-                action_loss = (per_sample_action_loss * expanded_weights).sum() / (expanded_weights.sum() + 1e-6)
+                loss_sum, loss_count = self.action_model(
+                    embodied_action_repeated,
+                    actions_target_repeated,
+                    state_repeated,
+                    action_mask=action_mask_repeated,
+                    reduction="none",
+                    train_step=train_step,
+                    return_loss_components=True,
+                )
+                loss_sum = loss_sum.float()
+                loss_count = loss_count.float()
+                expanded_weights = rabc_weights.repeat(repeated_diffusion_steps).to(
+                    device=loss_sum.device,
+                    dtype=loss_sum.dtype,
+                )
+                action_loss = (loss_sum * expanded_weights).sum() / (
+                    (loss_count * expanded_weights).sum() + 1e-6
+                )
             else:
-                action_loss = per_sample_action_loss.mean()
+                action_loss = self.action_model(
+                    embodied_action_repeated,
+                    actions_target_repeated,
+                    state_repeated,
+                    action_mask=action_mask_repeated,
+                    reduction="mean",
+                    train_step=train_step,
+                ).float()
 
         timing_stats["predictor_action_head_time"] += time.perf_counter() - predictor_head_start
         result = {"action_loss": action_loss, "wm_loss": teacher_forcing_wm_loss, **depth_teacher_metrics, **timing_stats}
@@ -1666,7 +1682,7 @@ class VLA_JEPA(baseframework):
         instructions: Optional[List[str]] = None,
         state: Optional[np.ndarray] = None,
         batch: Optional[dict | List[dict]] = None,
-        **kwargs: str,
+        **kwargs,
     ) -> np.ndarray:
         """
         Inference: single forward pass to predict future actions via flow matching.
@@ -1749,8 +1765,24 @@ class VLA_JEPA(baseframework):
                 state = state.to(last_hidden.device, dtype=torch.float32, non_blocking=True)
             else:
                 state = torch.from_numpy(np.asarray(state, dtype=np.float32)).to(last_hidden.device, dtype=torch.float32)
+        prev_actions = kwargs.get("prev_actions")
+        prefix_len = int(kwargs.get("prefix_len", 0) or 0)
+        rtc_config = kwargs.get("rtc_config")
+        if prev_actions is not None:
+            if isinstance(prev_actions, torch.Tensor):
+                prev_actions = prev_actions.to(last_hidden.device, dtype=torch.float32, non_blocking=True)
+            else:
+                prev_actions = torch.from_numpy(np.asarray(prev_actions, dtype=np.float32)).to(
+                    last_hidden.device, dtype=torch.float32
+                )
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            pred_actions = self.action_model.predict_action(embodied_action_tokens, state)
+            pred_actions = self.action_model.predict_action(
+                embodied_action_tokens,
+                state,
+                prev_actions=prev_actions,
+                prefix_len=prefix_len,
+                rtc_config=rtc_config,
+            )
 
         normalized_actions = pred_actions.float().detach().cpu().numpy()
         return {"normalized_actions": normalized_actions, "embodied_action_tokens": embodied_action_tokens.to(dtype=torch.float32).detach().cpu().numpy()}

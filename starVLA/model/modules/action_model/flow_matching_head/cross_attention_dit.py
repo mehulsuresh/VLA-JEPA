@@ -36,8 +36,13 @@ class TimestepEncoder(nn.Module):
 
     def forward(self, timesteps):
         dtype = next(self.parameters()).dtype
+        original_shape = timesteps.shape
+        if timesteps.dim() == 2:
+            timesteps = timesteps.reshape(-1)
         timesteps_proj = self.time_proj(timesteps).to(dtype)
-        timesteps_emb = self.timestep_embedder(timesteps_proj)  # (N, D)
+        timesteps_emb = self.timestep_embedder(timesteps_proj)  # (..., D)
+        if len(original_shape) == 2:
+            timesteps_emb = timesteps_emb.reshape(*original_shape, -1)
         return timesteps_emb
 
 
@@ -62,8 +67,18 @@ class AdaLayerNorm(nn.Module):
         temb: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         temb = self.linear(self.silu(temb))
-        scale, shift = temb.chunk(2, dim=1)
-        x = self.norm(x) * (1 + scale[:, None]) + shift[:, None]
+        scale, shift = temb.chunk(2, dim=-1)
+        if scale.dim() == 2:
+            x = self.norm(x) * (1 + scale[:, None]) + shift[:, None]
+        elif scale.dim() == 3:
+            if scale.shape[1] != x.shape[1]:
+                raise ValueError(
+                    f"Per-token timestep shape {tuple(scale.shape)} does not match "
+                    f"hidden state shape {tuple(x.shape)}"
+                )
+            x = self.norm(x) * (1 + scale) + shift
+        else:
+            raise ValueError(f"Unsupported timestep embedding shape: {tuple(temb.shape)}")
         return x
 
 
@@ -295,8 +310,18 @@ class DiT(ModelMixin, ConfigMixin):
 
         # Output processing
         conditioning = temb
-        shift, scale = self.proj_out_1(F.silu(conditioning)).chunk(2, dim=1)
-        hidden_states = self.norm_out(hidden_states) * (1 + scale[:, None]) + shift[:, None]
+        shift, scale = self.proj_out_1(F.silu(conditioning)).chunk(2, dim=-1)
+        if scale.dim() == 2:
+            hidden_states = self.norm_out(hidden_states) * (1 + scale[:, None]) + shift[:, None]
+        elif scale.dim() == 3:
+            if scale.shape[1] != hidden_states.shape[1]:
+                raise ValueError(
+                    f"Per-token timestep shape {tuple(scale.shape)} does not match "
+                    f"hidden state shape {tuple(hidden_states.shape)}"
+                )
+            hidden_states = self.norm_out(hidden_states) * (1 + scale) + shift
+        else:
+            raise ValueError(f"Unsupported timestep embedding shape: {tuple(conditioning.shape)}")
         if return_all_hidden_states:
             return self.proj_out_2(hidden_states), all_hidden_states
         else:
