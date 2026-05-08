@@ -1,0 +1,249 @@
+# A100x8 canonical GCS full-run profile:
+# - Full Qwen fine-tuning under the stable DeepSpeed ZeRO-2 profile; no LoRA adapter.
+# - V-JEPA teacher stays frozen by design.
+# - MoGe teacher uses the smallest normal-capable MoGe-2 checkpoint.
+# - Canonical dataset indexes compatible GCS shards lazily instead of
+#   materializing every stride window up front.
+run_id: robot_ft_canonical_full_a100x8_qwen_full_zero2stable_b26_moge_vits
+run_root_dir: /mnt/vla-jepa/checkpoints
+seed: 42
+trackers:
+  - tensorboard
+is_debug: false
+
+framework:
+  name: VLA_JEPA
+  qwenvl:
+    base_vlm: "Qwen/Qwen3.5-0.8B"
+    attn_implementation: flash_attention_2
+    enable_fast_linear_attention: false
+    device_map: null
+    vl_hidden_dim: 1024
+    lora:
+      enabled: false
+      adapter_name: temporal_policy
+      r: 16
+      alpha: 32
+      dropout: 0.05
+      bias: none
+      layers_pattern: layers
+      train_last_n_layers: 16
+      target_modules:
+        - q_proj
+        - k_proj
+        - v_proj
+        - o_proj
+        - gate_proj
+        - up_proj
+        - down_proj
+    strict_attn_implementation: true
+    strict_tensor_input_fast_path: true
+    strict_full_trainable: true
+  action_model:
+    action_model_type: DiT-B
+    action_hidden_dim: 1024
+    hidden_size: 1024
+    add_pos_embed: true
+    max_seq_len: 1024
+    action_dim: 49
+    state_dim: 53
+    future_action_window_size: 49
+    action_horizon: 50
+    past_action_window_size: 0
+    noise_beta_alpha: 1.5
+    noise_beta_beta: 1.0
+    noise_s: 0.999
+    num_timestep_buckets: 1000
+    num_inference_timesteps: 4
+    rtc_training:
+      enabled: true
+      method: prefix
+      max_delay: 11
+      distribution: uniform
+      rtc_prob: 1.0
+      warmup_steps: 100000
+      ramp_steps: 500000
+      clean_time: 1.0
+      condition_dit_tokens: true
+    num_target_vision_tokens: 32
+    diffusion_model_cfg:
+      cross_attention_dim: 1024
+      dropout: 0.2
+      final_dropout: true
+      interleave_self_attention: true
+      norm_type: ada_norm
+      num_layers: 16
+      output_dim: 1024
+      positional_embeddings: null
+  depth_teacher_aux:
+    enabled: true
+    mode: direct
+    teacher_model: Ruicheng/moge-2-vits-normal
+    moge_repo_path: /mnt/vla-jepa/src/MoGe
+    input_size: 224
+    num_tokens: 256
+    teacher_feature_source: neck
+    teacher_feature_level: 0
+    teacher_feature_dim: auto
+    frame_value_range: uint8
+    loss_weight: 0.004
+    detach_vlm_steps: 5
+    detach_vlm_fraction: 0.01
+    head_hidden_multiplier: 2.0
+    head_layer_norm: false
+    head_final_init_std: 0.0
+    feature_l1_weight: 1.0
+    feature_similarity_weight: 1.0
+    similarity_max_tokens: 4096
+    similarity_sample_seed: 0
+    use_fp16: true
+    allow_frozen_qwen: false
+    allow_zero_loss_scale: false
+  vj2_model:
+    source: torchhub
+    hub_repo_or_dir: /mnt/vla-jepa/src/vjepa2
+    hub_model_name: vjepa2_1_vit_base_384
+    hub_preprocessor_name: vjepa2_preprocessor
+    hub_checkpoint_url: https://dl.fbaipublicfiles.com/vjepa2/vjepa2_1_vitb_dist_vitG_384.pt
+    hub_checkpoint_key: ema_encoder
+    crop_size: 384
+    pretrained: true
+    freeze_encoder: true
+    num_video_views: 3
+    depth: 12
+    num_heads: 8
+    use_legacy_rope_bug: false
+    special_action_token: <|action_{}|>
+    num_action_tokens_per_timestep: 8
+    embodied_action_token: <|embodied_action|>
+    num_embodied_action_tokens_per_instruction: 32
+    num_frames: 8
+  reduce_in_full_precision: true
+
+datasets:
+  vla_data:
+    dataset_py: canonical_subset_vla
+    data_root_dir: /mnt/vla-jepa/datasets/canonical_gcs
+    dataset_canonicalization_root: /mnt/vla-jepa/src/dataset-canonicalization
+    manifest_path: /mnt/vla-jepa/src/dataset-canonicalization/configs/manifests/dataset_manifests.jsonl.gz
+    adapter_dir: /mnt/vla-jepa/src/dataset-canonicalization/configs/dataset_adapters
+    cache_dir: /mnt/vla-jepa/datasets/canonical_gcs
+    metadata_index_cache: true
+    metadata_index_cache_dir: /mnt/vla-jepa/datasets/canonical_gcs/.canonical_index_cache
+    bucket_root: gs://robotics-datasets-yonduai/raw
+    dataset_ids: []
+    exclude_dataset_ids_path: []
+    exclude_dataset_ids: []
+    exclude_sids: []
+    adapter_group_ids: []
+    camera_slots: [left, right, main]
+    preferred_fps: []  # Empty means allow all manifest FPS values.
+    allow_gcs_download: true
+    max_shards: 0
+    max_shards_per_dataset: 0
+    max_windows: 0
+    max_windows_per_dataset: 0
+    sample_stride: 8
+    sidecar_normalization: shard_q01_q99
+    sidecar_dtype: float16
+    video_decode_backend: pyav
+    pyav_reader_cache_size: 64
+    pyav_thread_type: SLICE
+    pyav_decode_retry_extra_frames: 900
+    pyav_corrupt_warning_limit: 20
+    lazy_cache_shards: true
+    index_windows_lazily: true
+    prefetch_metadata_across_ranks: true
+    shuffle_shards: true
+    shuffle_seed: 42
+    shuffle: false
+    CoT_prompt: "Your task is {instruction}. Infer the temporal dynamics from frames {actions} and produce the corresponding policy actions {e_actions}."
+    resolution_size: 224
+    video_resolution_size: 384
+    video_frame_stride: 10
+    video_target_shift_steps: 2
+    gpu_video_decode_on_rank: false
+    cpu_video_decode_drop_worker_images: true
+    runtime_timing_logging: true
+    per_device_batch_size: 26
+    num_workers: 2
+    prefetch_factor: 2
+    dataloader_timeout_seconds: 120
+    reader_cache_size: 32
+    sidecar_cache_size: 32
+    slow_sample_log_seconds: 30
+    persistent_workers: false
+    multiprocessing_context: spawn
+    worker_torch_threads: 1
+    worker_cv2_threads: 1
+    pin_memory: true
+    drop_last: true
+    with_state: true
+
+trainer:
+  epochs: 1
+  max_train_steps: auto
+  num_warmup_steps: 10000
+  save_interval: 10000
+  eval_interval: 10000
+  checkpoint_max_to_keep: 3
+  save_best_only: false
+  best_metric_name: mae_score
+  best_metric_mode: min
+  learning_rate:
+    base: 2.0e-05
+    qwen_vl_interface: 1.0e-05
+    action_model: 1.0e-04
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 1.0e-06
+  freeze_modules: "vj_encoder"
+  loss_scale:
+    action: 1.0
+    wm: 0.1
+    wm_initial: 0.3
+    wm_warmup_steps: 2000
+    depth_teacher: 0.004
+  warmup_ratio: 0.0
+  logging_frequency: 10
+  progress_eta_window: 50
+  progress_eta_warmup_steps: 10
+  eval_before_train: false
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 1
+  repeated_diffusion_steps: 1
+  find_unused_parameters: true
+
+  optimizer:
+    name: AdamW
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 1.0e-04
+    fused: true
+
+  is_resume: false
+  resume_epoch: null
+  resume_step: null
+  enable_gradient_checkpointing: true
+  enable_mixed_precision_training: false
+  mixed_precision: no
+  channels_last: true
+  compile_qwen_model: false
+  compile_qwen_model_dynamic: false
+  compile_action_model: false
+  compile_action_model_dynamic: false
+  compile_vj_predictor: false
+  compile_vj_predictor_dynamic: false
+  compile_vj_encoder: false
+  compile_vj_encoder_dynamic: false
+  compile_full_model: false
+  compile_full_model_dynamic: false
+  compile_mode: default
+  compile_backend: inductor
+  compile_dynamic: false
+  save_plain_weights_in_checkpoints: false
+  drop_checkpoint_page_cache: true
+  trim_process_memory_after_checkpoint: true
+  profile_cuda_memory: true
+  profile_cuda_memory_log_step: 10
+  use_rabc: false

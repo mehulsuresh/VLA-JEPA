@@ -27,6 +27,7 @@ from starVLA.model.modules.action_model.rtc_training import (
     cfg_get,
     get_rtc_training_config,
     get_total_training_steps,
+    plain_config,
     reduce_masked_loss,
     rtc_training_enabled,
     sample_rtc_training_delays,
@@ -230,6 +231,7 @@ class FlowmatchingActionHead(nn.Module):
         config = full_config.framework.action_model
         self.hidden_size = config.hidden_size
         self.full_config = full_config
+        self.total_training_steps = get_total_training_steps(full_config)
         action_model_type = config.action_model_type
         action_model_cfg = DiTConfig[action_model_type]
         
@@ -265,7 +267,9 @@ class FlowmatchingActionHead(nn.Module):
 
         self.beta_dist = Beta(config.noise_beta_alpha, config.noise_beta_beta)
         self.num_timestep_buckets = config.num_timestep_buckets
-        self.config = config
+        self.noise_s = float(config.noise_s)
+        self.add_pos_embed = bool(config.add_pos_embed)
+        self.config = plain_config(config)
         self.rtc_training_config = get_rtc_training_config(config)
         self._compile_prepared = False
 
@@ -297,7 +301,7 @@ class FlowmatchingActionHead(nn.Module):
 
     def sample_time(self, batch_size, device, dtype):
         sample = self.beta_dist.sample([batch_size]).to(device, dtype=dtype)
-        return (self.config.noise_s - sample) / self.config.noise_s
+        return (self.noise_s - sample) / self.noise_s
 
     def prepare_input(self, batch: dict) -> BatchFeature:
         return BatchFeature(data=batch)
@@ -346,7 +350,7 @@ class FlowmatchingActionHead(nn.Module):
                 n_action_steps=action_horizon,
                 device=actions.device,
                 train_step=train_step,
-                total_steps=get_total_training_steps(self.full_config),
+                total_steps=self.total_training_steps,
             )
             t, prefix_mask = apply_rtc_time_conditioning(
                 t_scalar,
@@ -371,7 +375,7 @@ class FlowmatchingActionHead(nn.Module):
 
 
         # Maybe add position embedding.
-        if self.config.add_pos_embed:
+        if self.add_pos_embed:
             pos_ids = torch.arange(action_features.shape[1], dtype=torch.long, device=device)
             pos_embs = self.position_embedding(pos_ids).unsqueeze(0)
             action_features = action_features + pos_embs
@@ -489,7 +493,7 @@ class FlowmatchingActionHead(nn.Module):
                 action_timesteps[:, :prefix_len] = self.num_timestep_buckets
             action_features = self.action_encoder(actions, action_timesteps)
             # Maybe add position embedding.
-            if self.config.add_pos_embed:
+            if self.add_pos_embed:
                 pos_ids = torch.arange(action_features.shape[1], dtype=torch.long, device=device)
                 pos_embs = self.position_embedding(pos_ids).unsqueeze(0)
                 action_features = action_features + pos_embs

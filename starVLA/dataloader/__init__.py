@@ -1,13 +1,24 @@
 import json
 import os
 import signal
+import sys
 from accelerate.logging import get_logger
+import atexit
+import faulthandler
 from functools import partial
 import torch
 import numpy as np
 from torch.utils.data import DataLoader
 import torch.distributed as dist
 from pathlib import Path
+
+try:
+    import av as _av
+
+    _av.logging.set_level(_av.logging.PANIC)
+except Exception:
+    pass
+
 from starVLA.dataloader.vlm_datasets import make_vlm_dataloader
 
 logger = get_logger(__name__)
@@ -46,6 +57,24 @@ def _resolve_output_dir(cfg) -> Path | None:
     return None
 
 
+def _close_worker_dataset_readers(dataset) -> None:
+    """Best-effort cleanup for native video readers held by worker-local dataset copies."""
+    if dataset is None:
+        return
+    wrapped = getattr(dataset, "dataset", None)
+    if wrapped is not None and wrapped is not dataset:
+        _close_worker_dataset_readers(wrapped)
+    close_readers = getattr(dataset, "close_video_readers", None)
+    if callable(close_readers):
+        close_readers()
+    readers = getattr(dataset, "_decord_readers", None)
+    if readers is not None:
+        try:
+            readers.clear()
+        except Exception:
+            pass
+
+
 def _configure_lerobot_worker(worker_id: int, *, torch_threads: int, cv2_threads: int) -> None:
     """
     Keep each LeRobot dataloader worker close to single-threaded so we do not
@@ -53,6 +82,20 @@ def _configure_lerobot_worker(worker_id: int, *, torch_threads: int, cv2_threads
     Also ask Linux to terminate the worker if its training-rank parent dies, so
     failed runs do not leave multi-GB orphan workers behind.
     """
+    try:
+        faulthandler.enable(file=sys.stderr, all_threads=True)
+        faulthandler.register(signal.SIGUSR2, file=sys.stderr, all_threads=True, chain=False)
+        print(f"DataLoader worker {worker_id} started pid={os.getpid()}", file=sys.stderr, flush=True)
+    except Exception:
+        pass
+
+    try:
+        worker_info = torch.utils.data.get_worker_info()
+        if worker_info is not None:
+            atexit.register(_close_worker_dataset_readers, worker_info.dataset)
+    except Exception:
+        pass
+
     try:
         import ctypes
 
@@ -121,7 +164,7 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe", model=None): # TODO
             dataset=vla_dataset,
             batch_size=cfg.datasets.vla_data.per_device_batch_size,
             collate_fn=collate_fn,
-            shuffle=True,
+            shuffle=bool(vla_dataset_cfg.get("shuffle", True)),
             num_workers=num_workers,
             pin_memory=pin_memory,
             drop_last=drop_last,
@@ -130,6 +173,9 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe", model=None): # TODO
             loader_kwargs["prefetch_factor"] = max(2, int(vla_dataset_cfg.get("prefetch_factor", 2)))
             loader_kwargs["persistent_workers"] = bool(vla_dataset_cfg.get("persistent_workers", True))
             loader_kwargs["multiprocessing_context"] = vla_dataset_cfg.get("multiprocessing_context", "spawn")
+            dataloader_timeout_seconds = int(vla_dataset_cfg.get("dataloader_timeout_seconds", 0))
+            if dataloader_timeout_seconds > 0:
+                loader_kwargs["timeout"] = dataloader_timeout_seconds
             loader_kwargs["worker_init_fn"] = partial(
                 _configure_lerobot_worker,
                 torch_threads=max(1, int(vla_dataset_cfg.get("worker_torch_threads", 1))),
@@ -172,7 +218,7 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe", model=None): # TODO
             dataset=vla_dataset,
             batch_size=cfg.datasets.vla_data.per_device_batch_size,
             collate_fn=collate_fn,
-            shuffle=True,
+            shuffle=bool(vla_dataset_cfg.get("shuffle", True)),
             num_workers=num_workers,
             pin_memory=pin_memory,
             drop_last=drop_last,
@@ -181,6 +227,9 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe", model=None): # TODO
             loader_kwargs["prefetch_factor"] = max(2, int(vla_dataset_cfg.get("prefetch_factor", 2)))
             loader_kwargs["persistent_workers"] = bool(vla_dataset_cfg.get("persistent_workers", True))
             loader_kwargs["multiprocessing_context"] = vla_dataset_cfg.get("multiprocessing_context", "spawn")
+            dataloader_timeout_seconds = int(vla_dataset_cfg.get("dataloader_timeout_seconds", 0))
+            if dataloader_timeout_seconds > 0:
+                loader_kwargs["timeout"] = dataloader_timeout_seconds
             loader_kwargs["worker_init_fn"] = partial(
                 _configure_lerobot_worker,
                 torch_threads=max(1, int(vla_dataset_cfg.get("worker_torch_threads", 1))),

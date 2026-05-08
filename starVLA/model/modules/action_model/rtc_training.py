@@ -12,6 +12,19 @@ from typing import Any
 import torch
 
 
+def plain_config(config: Any) -> Any:
+    if config is None or isinstance(config, dict):
+        return config
+    try:
+        from omegaconf import OmegaConf
+
+        if OmegaConf.is_config(config):
+            return OmegaConf.to_container(config, resolve=True)
+    except Exception:
+        pass
+    return config
+
+
 def cfg_get(config: Any, key: str, default: Any = None) -> Any:
     if config is None:
         return default
@@ -28,7 +41,7 @@ def cfg_get(config: Any, key: str, default: Any = None) -> Any:
 
 
 def get_rtc_training_config(action_config: Any) -> Any:
-    return (
+    return plain_config(
         cfg_get(action_config, "rtc_training", None)
         or cfg_get(action_config, "rtc_training_config", None)
     )
@@ -112,7 +125,9 @@ def sample_rtc_training_delays(
     total_steps: int | None = None,
 ) -> torch.Tensor:
     """Sample per-example RTC delays, with optional no-RTC mixing via rtc_prob."""
-    max_delay = cfg_get(config, "max_delay", cfg_get(config, "simulated_delay", 0))
+    max_delay = cfg_get(config, "max_delay", None)
+    if max_delay is None:
+        max_delay = cfg_get(config, "simulated_delay", 0)
     if max_delay is None:
         max_delay = 0
     max_delay = min(int(max_delay), max(int(n_action_steps), 0))

@@ -34,6 +34,7 @@ video_image_*.png
 Thumbs.db
 
 # Environment
+.venv
 .env
 *.log
 # Local benchmarks

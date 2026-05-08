@@ -323,9 +323,26 @@ def test_predict_action_warns_when_rtc_requested_without_prefix():
 
 
 def test_robot_ft_configs_keep_rtc_and_per_token_dit_disabled():
+    explicit_rtc_configs = {
+        Path("scripts/config/vlajepa_robot_ft_canonical_full_a100x8_qwen_full_zero3_moge_vits.yaml"),
+    }
     for path in sorted(Path("scripts/config").glob("vlajepa_robot_ft*.yaml")):
+        if path in explicit_rtc_configs:
+            continue
         with path.open("r", encoding="utf-8") as f:
             cfg = yaml.safe_load(f)
         rtc_config = cfg["framework"]["action_model"]["rtc_training"]
         assert rtc_config["enabled"] is False, path
         assert rtc_config["condition_dit_tokens"] is False, path
+
+
+def test_full_qwen_zero3_config_enables_rtc_warmup():
+    path = Path("scripts/config/vlajepa_robot_ft_canonical_full_a100x8_qwen_full_zero3_moge_vits.yaml")
+    with path.open("r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)
+
+    rtc_config = cfg["framework"]["action_model"]["rtc_training"]
+    assert rtc_config["enabled"] is True
+    assert rtc_config["condition_dit_tokens"] is True
+    assert rtc_config["warmup_steps"] > 0
+    assert rtc_config["ramp_steps"] > 0

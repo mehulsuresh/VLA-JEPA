@@ -38,6 +38,13 @@ from starVLA.training.trainer_utils.trainer_tools import resize_images
 from starVLA.model.tools import FRAMEWORK_REGISTRY
 
 try:
+    import av as _av
+
+    _av.logging.set_level(_av.logging.PANIC)
+except Exception:
+    pass
+
+try:
     import decord
 
     DECORD_AVAILABLE = True
@@ -367,6 +374,7 @@ class VLA_JEPA(baseframework):
                 )
 
             manual_checkpoint = checkpoint_url is not None or checkpoint_path is not None
+            prefetched_url_state_dict = None
 
             if hub_source == "github" and torch.distributed.is_available() and torch.distributed.is_initialized():
                 cache_sentinel = Path(torch.hub.get_dir()) / f".{repo_or_dir.replace('/', '_')}_ready"
@@ -387,6 +395,30 @@ class VLA_JEPA(baseframework):
                             )
                         time.sleep(1.0)
 
+            if (
+                checkpoint_url is not None
+                and checkpoint_path is None
+                and torch.distributed.is_available()
+                and torch.distributed.is_initialized()
+            ):
+                checkpoint_name = Path(str(checkpoint_url)).name
+                cache_sentinel = Path(torch.hub.get_dir()) / "checkpoints" / f".{checkpoint_name}.ready"
+                if torch.distributed.get_rank() == 0:
+                    prefetched_url_state_dict = torch.hub.load_state_dict_from_url(
+                        str(checkpoint_url),
+                        map_location="cpu",
+                    )
+                    cache_sentinel.parent.mkdir(parents=True, exist_ok=True)
+                    cache_sentinel.write_text("ready\n")
+                else:
+                    deadline = time.time() + 1800
+                    while not cache_sentinel.exists():
+                        if time.time() > deadline:
+                            raise TimeoutError(
+                                f"Timed out waiting for checkpoint cache warmup for `{checkpoint_url}`"
+                            )
+                        time.sleep(1.0)
+
             loaded = _hub_load(
                 model_name,
                 pretrained=False if manual_checkpoint else pretrained,
@@ -402,6 +434,8 @@ class VLA_JEPA(baseframework):
                 if checkpoint_path is not None:
                     checkpoint_file = Path(str(checkpoint_path)).expanduser()
                     state_dict = torch.load(checkpoint_file, map_location="cpu")
+                elif prefetched_url_state_dict is not None:
+                    state_dict = prefetched_url_state_dict
                 else:
                     state_dict = torch.hub.load_state_dict_from_url(str(checkpoint_url), map_location="cpu")
 
@@ -499,6 +533,65 @@ class VLA_JEPA(baseframework):
                     "Unfreeze qwen_vl_interface.model or enable Qwen LoRA, or set "
                     "framework.depth_teacher_aux.allow_frozen_qwen=true only for an explicit dry run."
                 )
+
+    def validate_runtime_feature_state(self) -> None:
+        qwenvl_cfg = self.config.framework.get("qwenvl", {})
+        lora_cfg = qwenvl_cfg.get("lora", {})
+        if bool(lora_cfg.get("enabled", False)):
+            adapter_name = str(lora_cfg.get("adapter_name", "default"))
+            active_adapters = getattr(self.qwen_vl_interface.model, "active_adapters", None)
+            if callable(active_adapters):
+                active_adapters = active_adapters()
+            if isinstance(active_adapters, str):
+                active_adapter_names = [active_adapters]
+            elif active_adapters is None:
+                active_adapter_names = None
+            else:
+                active_adapter_names = list(active_adapters)
+            if active_adapter_names is not None and adapter_name not in active_adapter_names:
+                raise RuntimeError(
+                    f"Qwen LoRA adapter `{adapter_name}` was requested, but active adapters are {active_adapters}."
+                )
+            lora_trainable_params = sum(
+                param.numel()
+                for name, param in self.qwen_vl_interface.model.named_parameters()
+                if param.requires_grad and "lora_" in name
+            )
+            if lora_trainable_params <= 0:
+                raise RuntimeError(
+                    "Qwen LoRA is enabled, but no trainable LoRA parameters are active after freezing."
+                )
+        elif bool(qwenvl_cfg.get("strict_full_trainable", False)):
+            frozen_qwen_params = [
+                name
+                for name, param in self.qwen_vl_interface.model.named_parameters()
+                if not param.requires_grad
+            ]
+            if frozen_qwen_params:
+                preview = ", ".join(frozen_qwen_params[:5])
+                if len(frozen_qwen_params) > 5:
+                    preview += ", ..."
+                raise RuntimeError(
+                    "Qwen full fine-tuning was requested with strict_full_trainable=true, "
+                    f"but {len(frozen_qwen_params)} Qwen parameters are frozen: {preview}"
+                )
+
+        if bool(qwenvl_cfg.get("strict_attn_implementation", False)):
+            requested_attn = str(qwenvl_cfg.get("attn_implementation", "flash_attention_2")).lower()
+            actual_attn = str(getattr(self.qwen_vl_interface, "attn_implementation", "")).lower()
+            if requested_attn in {"flash", "flash2", "flash_attn", "flash_attn_2", "flash-attn", "flash-attn-2"}:
+                requested_attn = "flash_attention_2"
+            if requested_attn != actual_attn:
+                raise RuntimeError(
+                    f"Qwen attention backend mismatch under strict mode: requested `{requested_attn}`, "
+                    f"loaded `{actual_attn}`."
+                )
+
+        rtc_cfg = self.config.framework.action_model.get("rtc_training", {})
+        if bool(rtc_cfg.get("enabled", False)):
+            action_model_rtc_cfg = getattr(self.action_model, "rtc_training_config", {})
+            if not bool(action_model_rtc_cfg.get("enabled", False)):
+                raise RuntimeError("RTC training is enabled in config but not active on the action model.")
 
     def resolve_depth_teacher_detach_steps(self) -> int:
         if not self.depth_teacher_aux_enabled:
@@ -804,6 +897,12 @@ class VLA_JEPA(baseframework):
                     "qwen_input_build_time": time.perf_counter() - build_start,
                 }
             return qwen_inputs
+
+        if bool(self.config.framework.qwenvl.get("strict_tensor_input_fast_path", False)):
+            raise RuntimeError(
+                "Qwen tensor input fast path was required, but `build_qwenvl_inputs_from_frames_tensor` "
+                "is not available."
+            )
 
         image_batches = [
             [frames[b, v].permute(1, 2, 0).contiguous() for v in range(V)]
@@ -1480,6 +1579,12 @@ class VLA_JEPA(baseframework):
         logger.info(f"Model embedding size: {vla_embedding_size} ;tokenizer.vocab_size: {len(tokenizer)}")
         return action_tokens, action_token_ids, embodied_action_token_id
 
+    def _training_action_chunk_size(self) -> int:
+        return int(self.future_action_window_size) + 1
+
+    def _slice_training_action_chunk(self, action_tensor: torch.Tensor) -> torch.Tensor:
+        return action_tensor[:, -self._training_action_chunk_size() :, ...]
+
     def forward(
         self,
         examples: List[dict] = None,
@@ -1613,7 +1718,7 @@ class VLA_JEPA(baseframework):
                 actions = torch.from_numpy(np.asarray(actions, dtype=np.float32)).to(
                     device=last_hidden.device, non_blocking=True
                 )
-            actions_target = actions[:, -(self.future_action_window_size + 1) :, :]
+            actions_target = self._slice_training_action_chunk(actions)
 
             repeated_diffusion_steps = self._repeated_diffusion_steps
             actions_target_repeated = actions_target.repeat(repeated_diffusion_steps, 1, 1)
@@ -1627,7 +1732,7 @@ class VLA_JEPA(baseframework):
                     action_mask = torch.from_numpy(np.asarray(action_mask, dtype=np.float32)).to(
                         device=last_hidden.device, non_blocking=True
                     )
-                action_mask_target = action_mask[:, -(self.future_action_window_size + 1) :, :]
+                action_mask_target = self._slice_training_action_chunk(action_mask)
                 action_mask_repeated = action_mask_target.repeat(repeated_diffusion_steps, 1, 1)
 
             state_repeated = None

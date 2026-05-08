@@ -12,13 +12,16 @@ CONFIG_YAML="${CONFIG_YAML:-${REPO_ROOT}/scripts/config/vlajepa_robot_ft_trossen
 starvla_configure_deepspeed_launch "${REPO_ROOT}"
 ACCELERATE_CONFIG="${ACCELERATE_CONFIG:-${STARVLA_DEFAULT_ACCELERATE_CONFIG}}"
 NUM_PROCESSES="${NUM_PROCESSES:-4}"
+NUM_MACHINES="${NUM_MACHINES:-1}"
 MAIN_PROCESS_PORT="${MAIN_PROCESS_PORT:-29500}"
+starvla_configure_accelerate_cluster_args
 
 cd "${REPO_ROOT}"
 
 "${ACCELERATE_BIN}" launch \
   --config_file "${ACCELERATE_CONFIG}" \
   --num_processes "${NUM_PROCESSES}" \
+  "${STARVLA_ACCELERATE_CLUSTER_ARGS[@]}" \
   --main_process_port "${MAIN_PROCESS_PORT}" \
   ./starVLA/training/train_starvla.py \
   --config_yaml "${CONFIG_YAML}" \

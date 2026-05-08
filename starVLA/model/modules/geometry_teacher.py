@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import sys
 import os
+import hashlib
+import time
 from pathlib import Path
 from typing import Any, Optional
 from contextlib import nullcontext
@@ -111,6 +113,45 @@ class MoGeGeometryTeacher:
 
         return MoGeModel.from_pretrained(model_name)
 
+    @staticmethod
+    def _distributed_rank_world() -> tuple[int, int]:
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            return int(torch.distributed.get_rank()), int(torch.distributed.get_world_size())
+        return 0, 1
+
+    @staticmethod
+    def _download_ready_path(model_name: str) -> Path:
+        hf_home = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface")).expanduser()
+        digest = hashlib.sha256(model_name.encode("utf-8")).hexdigest()[:16]
+        return hf_home / "starvla" / "moge" / f".{digest}.ready"
+
+    def _load_pretrained_rank_safe(self, model_name: str):
+        model_name_str = str(model_name)
+        if Path(model_name_str).expanduser().exists():
+            return self._load_pretrained(model_name_str)
+
+        rank, world_size = self._distributed_rank_world()
+        if world_size <= 1:
+            return self._load_pretrained(model_name_str)
+
+        ready_path = self._download_ready_path(model_name_str)
+        timeout_seconds = float(_cfg_get(self.cfg, "download_wait_timeout_seconds", 1800))
+        if rank == 0:
+            model = self._load_pretrained(model_name_str)
+            ready_path.parent.mkdir(parents=True, exist_ok=True)
+            ready_path.write_text(model_name_str, encoding="utf-8")
+            return model
+
+        start_time = time.monotonic()
+        while not ready_path.exists():
+            if time.monotonic() - start_time > timeout_seconds:
+                raise TimeoutError(
+                    "Timed out waiting for rank 0 to cache MoGe geometry teacher "
+                    f"`{model_name_str}` at {ready_path}"
+                )
+            time.sleep(1.0)
+        return self._load_pretrained(model_name_str)
+
     def initialize(self, device: torch.device) -> None:
         device = torch.device(device)
         if device.type == "cpu" and not bool(_cfg_get(self.cfg, "eager_load_on_cpu", False)):
@@ -215,7 +256,7 @@ class MoGeGeometryTeacher:
 
         model_name = _cfg_get(self.cfg, "teacher_model", "Ruicheng/moge-2-vitl-normal")
         self._log(f"Loading MoGe geometry teacher `{model_name}`")
-        model = self._load_pretrained(model_name)
+        model = self._load_pretrained_rank_safe(model_name)
 
         model.requires_grad_(False)
         model.eval()

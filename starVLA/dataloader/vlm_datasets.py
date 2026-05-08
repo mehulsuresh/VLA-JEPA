@@ -18,6 +18,14 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 from PIL import Image
+
+try:
+    import av as _av
+
+    _av.logging.set_level(_av.logging.PANIC)
+except Exception:
+    pass
+
 from decord import VideoReader
 import transformers
 from omegaconf import OmegaConf

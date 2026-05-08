@@ -242,12 +242,51 @@ class TrainerUtils:
         """
         if dist.is_initialized() and dist.get_rank() != 0:
             return
+
+        def _parameter_counts(module):
+            if module is None or not hasattr(module, "parameters"):
+                return 0, 0
+            def _numel(param):
+                # DeepSpeed ZeRO-3 can replace full tensors with local shards before logging.
+                return int(getattr(param, "ds_numel", param.numel()))
+
+            total = sum(_numel(p) for p in module.parameters())
+            trainable = sum(_numel(p) for p in module.parameters() if p.requires_grad)
+            return total, trainable
+
+        def _print_counts(label, module):
+            total, trainable = _parameter_counts(module)
+            if total <= 0:
+                return
+            print(
+                f"  - {label}: {total / 10**6:.3f}M total, "
+                f"{trainable / 10**6:.3f}M trainable"
+            )
+
         print("📊 model parameter statistics:")
-        num_params = sum(p.numel() for p in model.parameters())
-        num_trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        def _numel(param):
+            return int(getattr(param, "ds_numel", param.numel()))
+
+        num_params = sum(_numel(p) for p in model.parameters())
+        num_trainable_params = sum(_numel(p) for p in model.parameters() if p.requires_grad)
         print(
             f"# Parameters (in millions): {num_params / 10**6:.3f} Total, {num_trainable_params / 10**6:.3f} Trainable"
         )
+        qwen_interface = getattr(model, "qwen_vl_interface", None)
+        _print_counts("qwen_vl_interface.model", getattr(qwen_interface, "model", None))
+        _print_counts("depth_teacher_aux_head", getattr(model, "depth_teacher_aux_head", None))
+        _print_counts("action_model", getattr(model, "action_model", None))
+        _print_counts("vj_predictor", getattr(model, "vj_predictor", None))
+        _print_counts("vj_encoder", getattr(model, "vj_encoder", None))
+
+        depth_teacher = getattr(model, "_depth_teacher", None)
+        teacher_model = getattr(depth_teacher, "model", None)
+        if teacher_model is not None:
+            total, trainable = _parameter_counts(teacher_model)
+            print(
+                f"  - depth_teacher_moge.external_model: {total / 10**6:.3f}M total, "
+                f"{trainable / 10**6:.3f}M trainable (kept outside optimizer)"
+            )
         return num_params, num_trainable_params
 
     @staticmethod

@@ -1,5 +1,14 @@
-run_id: robot_ft_canonical_subset_5090_smoke
-run_root_dir: checkpoints
+# Reference machine for this smoke config:
+# - 8 x NVIDIA A100-SXM4-80GB (80 GiB VRAM each)
+# - 96 logical CPUs
+# - 1.3 TiB system RAM
+# - scratch/cache/checkpoints on /mnt/vla-jepa
+#
+# This is intentionally a plumbing smoke test for the canonical GCS
+# streaming-subset path. It keeps batch size small, disables torch.compile, and
+# lets the canonical dataloader populate a local cache from GCS.
+run_id: robot_ft_canonical_multi_subset_a100x8_smoke
+run_root_dir: /mnt/vla-jepa/checkpoints
 seed: 42
 trackers:
   - tensorboard
@@ -10,7 +19,8 @@ framework:
   qwenvl:
     base_vlm: "Qwen/Qwen3.5-0.8B"
     attn_implementation: flash_attention_2
-    enable_fast_linear_attention: true
+    enable_fast_linear_attention: false
+    device_map: null
     vl_hidden_dim: 1024
   action_model:
     action_model_type: DiT-B
@@ -31,7 +41,6 @@ framework:
     rtc_training:
       enabled: false
       method: prefix
-      # max_delay is exclusive; 11 samples 0..10-step prefixes.
       max_delay: 11
       distribution: uniform
       rtc_prob: 1.0
@@ -51,9 +60,11 @@ framework:
       positional_embeddings: null
   vj2_model:
     source: torchhub
-    hub_repo_or_dir: /home/mehul/work/vjepa/vjepa2
+    hub_repo_or_dir: /mnt/vla-jepa/src/vjepa2
     hub_model_name: vjepa2_1_vit_base_384
     hub_preprocessor_name: vjepa2_preprocessor
+    hub_checkpoint_url: https://dl.fbaipublicfiles.com/vjepa2/vjepa2_1_vitb_dist_vitG_384.pt
+    hub_checkpoint_key: ema_encoder
     crop_size: 384
     pretrained: true
     freeze_encoder: true
@@ -71,22 +82,28 @@ framework:
 datasets:
   vla_data:
     dataset_py: canonical_subset_vla
-    data_root_dir: /home/mehul/work/vjepa/VLA-JEPA/.cache/canonical_gcs
-    dataset_canonicalization_root: /home/mehul/work/dataset-canonicalization
-    manifest_path: /home/mehul/work/dataset-canonicalization/configs/manifests/dataset_manifests.jsonl.gz
-    adapter_dir: /home/mehul/work/dataset-canonicalization/configs/dataset_adapters
-    cache_dir: /home/mehul/work/vjepa/VLA-JEPA/.cache/canonical_gcs
+    data_root_dir: /mnt/vla-jepa/datasets/canonical_gcs
+    dataset_canonicalization_root: /mnt/vla-jepa/src/dataset-canonicalization
+    manifest_path: /mnt/vla-jepa/src/dataset-canonicalization/configs/manifests/dataset_manifests.jsonl.gz
+    adapter_dir: /mnt/vla-jepa/src/dataset-canonicalization/configs/dataset_adapters
+    cache_dir: /mnt/vla-jepa/datasets/canonical_gcs
     bucket_root: gs://robotics-datasets-yonduai/raw
     dataset_ids:
       - BAAI-DataCube/robomind_benchmark1_1_release_franka_3rgb_yellow_square_placed_on_ceramic_plate
+      - BAAI-DataCube/robomind_benchmark1_0_release_franka_3rgb_pick_apple_into_chest
+      - BAAI-DataCube/robomind_benchmark1_0_release_franka_3rgb_slide_close_drawer
     adapter_group_ids:
       - BAAI-DataCube_franka_3rgb__16197072458c
+      - BAAI-DataCube_franka_3rgb__fd31f11d43e5
+      - BAAI-DataCube_franka_3rgb__fcc2a73ac3e4
     camera_slots: [left, right, main]
     preferred_fps: []  # Empty means allow all manifest FPS values.
     allow_gcs_download: true
-    max_shards: 1
-    max_windows: 4
-    sample_stride: 64
+    max_shards: 3
+    max_shards_per_dataset: 1
+    max_windows: 0
+    max_windows_per_dataset: 16
+    sample_stride: 16
     sidecar_normalization: shard_q01_q99
     sidecar_dtype: float16
     video_decode_backend: auto
