@@ -53,7 +53,7 @@ class _QWen3_5_Interface(nn.Module):
             print(message)
 
     @staticmethod
-    def _resolve_attn_implementation(requested: Optional[str]) -> str:
+    def _resolve_attn_implementation(requested: Optional[str], *, strict: bool = False) -> str:
         normalized = (requested or "flash_attention_2").strip().lower()
         alias_map = {
             "flash": "flash_attention_2",
@@ -79,11 +79,21 @@ class _QWen3_5_Interface(nn.Module):
 
         if normalized == "flash_attention_2":
             if not torch.cuda.is_available():
+                if strict:
+                    raise RuntimeError(
+                        "Qwen FlashAttention was requested with strict attention enabled, "
+                        "but CUDA is unavailable."
+                    )
                 _QWen3_5_Interface._safe_log(
                     "warning", "FlashAttention requested but CUDA is unavailable; falling back to sdpa"
                 )
                 return "sdpa"
             if not is_flash_attn_2_available():
+                if strict:
+                    raise RuntimeError(
+                        "Qwen FlashAttention was requested with strict attention enabled, "
+                        "but `flash-attn` is unavailable."
+                    )
                 _QWen3_5_Interface._safe_log(
                     "warning", "FlashAttention requested but `flash-attn` is unavailable; falling back to sdpa"
                 )
@@ -194,6 +204,16 @@ class _QWen3_5_Interface(nn.Module):
         if hasattr(model, "enable_adapters"):
             model.enable_adapters()
 
+        lora_trainable_params = sum(
+            param.numel()
+            for name, param in model.named_parameters()
+            if param.requires_grad and "lora_" in name
+        )
+        if bool(lora_config.get("strict_trainable", True)) and lora_trainable_params <= 0:
+            raise RuntimeError(
+                "Qwen LoRA is enabled, but no trainable LoRA parameters were found after adapter setup."
+            )
+
         layer_summary = (
             f"layers={layers_to_transform[0]}..{layers_to_transform[-1]}"
             if layers_to_transform
@@ -203,7 +223,8 @@ class _QWen3_5_Interface(nn.Module):
             "info",
             "Enabled Qwen3.5 LoRA "
             f"(adapter={adapter_name}, r={hf_lora_config.r}, alpha={hf_lora_config.lora_alpha}, "
-            f"dropout={hf_lora_config.lora_dropout}, targets={target_modules}, {layer_summary})",
+            f"dropout={hf_lora_config.lora_dropout}, targets={target_modules}, {layer_summary}, "
+            f"trainable_lora_params={lora_trainable_params})",
         )
         return model
 
@@ -214,10 +235,15 @@ class _QWen3_5_Interface(nn.Module):
         qwenvl_config = config.framework.get("qwenvl", {})
         model_id = qwenvl_config.get("base_vlm", "Qwen/Qwen3.5-2B")
         requested_attn_implementation = qwenvl_config.get("attn_implementation", "flash_attention_2")
-        attn_implementation = self._resolve_attn_implementation(requested_attn_implementation)
+        strict_attn_implementation = bool(qwenvl_config.get("strict_attn_implementation", False))
+        attn_implementation = self._resolve_attn_implementation(
+            requested_attn_implementation,
+            strict=strict_attn_implementation,
+        )
         compile_qwen_model = bool(config.get("trainer", {}).get("compile_qwen_model", False))
         device_map = qwenvl_config.get("device_map", None if compile_qwen_model else "cuda")
         enable_fast_linear_attention = bool(qwenvl_config.get("enable_fast_linear_attention", False))
+        strict_fast_linear_attention = bool(qwenvl_config.get("strict_fast_linear_attention", False))
 
         if not enable_fast_linear_attention:
             # Force the safe torch path. On this machine the custom causal-conv1d build
@@ -229,6 +255,19 @@ class _QWen3_5_Interface(nn.Module):
             modeling_qwen3_5.FusedRMSNormGated = None
         else:
             _enable_partial_fast_linear_attention_logging()
+            if strict_fast_linear_attention and not all(
+                (
+                    modeling_qwen3_5.chunk_gated_delta_rule,
+                    modeling_qwen3_5.fused_recurrent_gated_delta_rule,
+                    modeling_qwen3_5.FusedRMSNormGated,
+                    modeling_qwen3_5.causal_conv1d_fn,
+                    modeling_qwen3_5.causal_conv1d_update,
+                )
+            ):
+                raise RuntimeError(
+                    "Qwen fast linear attention was requested with strict_fast_linear_attention=true, "
+                    "but one or more fused kernels are unavailable."
+                )
 
         model = Qwen3_5ForConditionalGeneration.from_pretrained(
             model_id,
@@ -264,6 +303,9 @@ class _QWen3_5_Interface(nn.Module):
         self.model = model
         self.processor = processor
         self.config = config
+        self.requested_attn_implementation = requested_attn_implementation
+        self.attn_implementation = attn_implementation
+        self.enable_fast_linear_attention = enable_fast_linear_attention
         self.model.config.hidden_size = self.model.config.text_config.hidden_size
         self._compile_prepared = False
         self._chat_wrapper_cache: dict[tuple[int, bool], tuple[str, str]] = {}

@@ -86,7 +86,7 @@ datasets:
       - BAAI-DataCube_franka_3rgb__fd31f11d43e5
       - BAAI-DataCube_franka_3rgb__fcc2a73ac3e4
     camera_slots: [left, right, main]
-    preferred_fps: [30]
+    preferred_fps: []  # Empty means allow all manifest FPS values.
     allow_gcs_download: true
     max_shards: 3
     max_shards_per_dataset: 1

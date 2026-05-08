@@ -67,6 +67,28 @@ starvla_configure_deepspeed_launch() {
   fi
 }
 
+starvla_configure_accelerate_cluster_args() {
+  STARVLA_ACCELERATE_CLUSTER_ARGS=(
+    --num_machines "${NUM_MACHINES:-1}"
+  )
+
+  if [[ -n "${MACHINE_RANK:-}" ]]; then
+    STARVLA_ACCELERATE_CLUSTER_ARGS+=(--machine_rank "${MACHINE_RANK}")
+  fi
+  if [[ -n "${MAIN_PROCESS_IP:-}" ]]; then
+    STARVLA_ACCELERATE_CLUSTER_ARGS+=(--main_process_ip "${MAIN_PROCESS_IP}")
+  fi
+  if [[ -n "${RDZV_BACKEND:-}" ]]; then
+    STARVLA_ACCELERATE_CLUSTER_ARGS+=(--rdzv_backend "${RDZV_BACKEND}")
+  fi
+  if [[ -n "${RDZV_CONF:-}" ]]; then
+    STARVLA_ACCELERATE_CLUSTER_ARGS+=(--rdzv_conf "${RDZV_CONF}")
+  fi
+  if [[ "${SAME_NETWORK:-0}" == "1" ]]; then
+    STARVLA_ACCELERATE_CLUSTER_ARGS+=(--same_network)
+  fi
+}
+
 starvla_cleanup_stale_training_sidecars() {
   python3 - <<'PY'
 import os

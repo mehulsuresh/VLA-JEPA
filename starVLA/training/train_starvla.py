@@ -20,6 +20,7 @@ import gc
 import math
 import json
 import os
+import shutil
 import sys
 import logging
 import queue
@@ -83,6 +84,7 @@ from starVLA.training.trainer_utils.trainer_tools import TrainerUtils
 from starVLA.training.trainer_utils.trainer_tools import build_param_lr_groups
 from starVLA.training.trainer_utils.trainer_tools import is_depth_teacher_aux_missing_key_allowed
 from starVLA.training.trainer_utils.trainer_tools import is_depth_teacher_aux_unexpected_key_allowed
+from starVLA.model.modules.action_model.rtc_training import rtc_training_probability
 
 # Sane Defaults
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -131,7 +133,10 @@ def _install_compiled_forward(
     module: torch.nn.Module,
     module_name: str,
     compile_mode: str,
+    compile_backend: Optional[str],
     dynamic_attempts: list[bool],
+    *,
+    allow_eager_fallback: bool = True,
 ) -> None:
     eager_forward = module.forward
     attempted_compile_labels: set[str] = set()
@@ -140,17 +145,26 @@ def _install_compiled_forward(
     active_impl = "uninitialized"
     compiled_forward_cache: dict[bool, Callable] = {}
 
+    compile_backend = None if compile_backend in {None, "", "default", "none", "null"} else str(compile_backend)
+
     def _compile_forward(dynamic: bool):
         if dynamic not in compiled_forward_cache:
-            compiled_forward_cache[dynamic] = torch.compile(
-                eager_forward,
-                dynamic=dynamic,
-                mode=compile_mode,
-            )
+            compile_kwargs = {
+                "dynamic": dynamic,
+                "mode": compile_mode,
+            }
+            if compile_backend is not None:
+                compile_kwargs["backend"] = compile_backend
+            compiled_forward_cache[dynamic] = torch.compile(eager_forward, **compile_kwargs)
         return compiled_forward_cache[dynamic]
 
+    last_compile_exc: Optional[BaseException] = None
+
     def _log_compile_failure(dynamic: bool, exc: BaseException) -> None:
-        compile_label = f"torch.compile(dynamic={dynamic}, mode='{compile_mode}')"
+        compile_label = (
+            f"torch.compile(dynamic={dynamic}, mode='{compile_mode}', "
+            f"backend='{compile_backend or 'default'}')"
+        )
         if compile_label in attempted_compile_labels:
             return
         attempted_compile_labels.add(compile_label)
@@ -159,7 +173,7 @@ def _install_compiled_forward(
         )
 
     def compiled_forward(*args, **kwargs):
-        nonlocal active_dynamic, active_impl
+        nonlocal active_dynamic, active_impl, last_compile_exc
 
         if active_impl == "eager":
             return eager_forward(*args, **kwargs)
@@ -187,14 +201,21 @@ def _install_compiled_forward(
                 module._starvla_active_compile_impl = "compiled"
                 module._starvla_active_compile_dynamic = dynamic
                 logger.info(
-                    f"Compiled {module_name} with torch.compile(dynamic={dynamic}, mode='{compile_mode}')"
+                    f"Compiled {module_name} with torch.compile(dynamic={dynamic}, "
+                    f"mode='{compile_mode}', backend='{compile_backend or 'default'}')"
                 )
                 return output
             except Exception as exc:
                 if not _is_torch_compile_exception(exc):
                     raise
+                last_compile_exc = exc
                 _log_compile_failure(dynamic, exc)
                 attempted_dynamics.add(dynamic)
+
+        if not allow_eager_fallback:
+            raise RuntimeError(
+                f"torch.compile failed for {module_name}, and eager fallback is disabled."
+            ) from last_compile_exc
 
         active_dynamic = None
         active_impl = "eager"
@@ -205,7 +226,26 @@ def _install_compiled_forward(
 
     module._starvla_eager_forward = eager_forward
     module._starvla_compile_mode = compile_mode
+    module._starvla_compile_backend = compile_backend or "default"
     module._starvla_compile_dynamic_attempts = tuple(dynamic_attempts)
+    if not allow_eager_fallback:
+        strict_dynamic = dynamic_attempts[0]
+        compile_kwargs = {
+            "dynamic": strict_dynamic,
+            "mode": compile_mode,
+        }
+        if compile_backend is not None:
+            compile_kwargs["backend"] = compile_backend
+        module._starvla_active_compile_impl = "compiled"
+        module._starvla_active_compile_dynamic = strict_dynamic
+        module.forward = torch.compile(eager_forward, **compile_kwargs)
+        logger.info(
+            f"Installed strict compiled forward for {module_name} with "
+            f"torch.compile(dynamic={strict_dynamic}, mode='{compile_mode}', "
+            f"backend='{compile_backend or 'default'}')"
+        )
+        return
+
     module._starvla_active_compile_impl = "uninitialized"
     module._starvla_active_compile_dynamic = None
     module.forward = compiled_forward
@@ -216,7 +256,10 @@ def _install_compiled_callable_attr(
     attr_name: str,
     target_name: str,
     compile_mode: str,
+    compile_backend: Optional[str],
     dynamic_attempts: list[bool],
+    *,
+    allow_eager_fallback: bool = True,
 ) -> None:
     eager_callable = getattr(owner, attr_name)
     if not callable(eager_callable):
@@ -227,18 +270,26 @@ def _install_compiled_callable_attr(
     active_dynamic: Optional[bool] = None
     active_impl = "uninitialized"
     compiled_callable_cache: dict[bool, Callable] = {}
+    compile_backend = None if compile_backend in {None, "", "default", "none", "null"} else str(compile_backend)
 
     def _compile_callable(dynamic: bool):
         if dynamic not in compiled_callable_cache:
-            compiled_callable_cache[dynamic] = torch.compile(
-                eager_callable,
-                dynamic=dynamic,
-                mode=compile_mode,
-            )
+            compile_kwargs = {
+                "dynamic": dynamic,
+                "mode": compile_mode,
+            }
+            if compile_backend is not None:
+                compile_kwargs["backend"] = compile_backend
+            compiled_callable_cache[dynamic] = torch.compile(eager_callable, **compile_kwargs)
         return compiled_callable_cache[dynamic]
 
+    last_compile_exc: Optional[BaseException] = None
+
     def _log_compile_failure(dynamic: bool, exc: BaseException) -> None:
-        compile_label = f"torch.compile(dynamic={dynamic}, mode='{compile_mode}')"
+        compile_label = (
+            f"torch.compile(dynamic={dynamic}, mode='{compile_mode}', "
+            f"backend='{compile_backend or 'default'}')"
+        )
         if compile_label in attempted_compile_labels:
             return
         attempted_compile_labels.add(compile_label)
@@ -247,7 +298,7 @@ def _install_compiled_callable_attr(
         )
 
     def compiled_callable(*args, **kwargs):
-        nonlocal active_dynamic, active_impl
+        nonlocal active_dynamic, active_impl, last_compile_exc
 
         if active_impl == "eager":
             return eager_callable(*args, **kwargs)
@@ -273,19 +324,42 @@ def _install_compiled_callable_attr(
                 active_dynamic = dynamic
                 active_impl = "compiled"
                 logger.info(
-                    f"Compiled {target_name} with torch.compile(dynamic={dynamic}, mode='{compile_mode}')"
+                    f"Compiled {target_name} with torch.compile(dynamic={dynamic}, "
+                    f"mode='{compile_mode}', backend='{compile_backend or 'default'}')"
                 )
                 return output
             except Exception as exc:
                 if not _is_torch_compile_exception(exc):
                     raise
+                last_compile_exc = exc
                 _log_compile_failure(dynamic, exc)
                 attempted_dynamics.add(dynamic)
+
+        if not allow_eager_fallback:
+            raise RuntimeError(
+                f"torch.compile failed for {target_name}, and eager fallback is disabled."
+            ) from last_compile_exc
 
         active_dynamic = None
         active_impl = "eager"
         logger.warning(f"Falling back to eager callable for {target_name}")
         return eager_callable(*args, **kwargs)
+
+    if not allow_eager_fallback:
+        strict_dynamic = dynamic_attempts[0]
+        compile_kwargs = {
+            "dynamic": strict_dynamic,
+            "mode": compile_mode,
+        }
+        if compile_backend is not None:
+            compile_kwargs["backend"] = compile_backend
+        setattr(owner, attr_name, torch.compile(eager_callable, **compile_kwargs))
+        logger.info(
+            f"Installed strict compiled callable for {target_name} with "
+            f"torch.compile(dynamic={strict_dynamic}, mode='{compile_mode}', "
+            f"backend='{compile_backend or 'default'}')"
+        )
+        return
 
     setattr(owner, attr_name, compiled_callable)
 
@@ -491,7 +565,9 @@ def build_model(cfg) -> torch.nn.Module:
     model = build_framework(cfg)
 
     compile_mode = trainer_cfg.get("compile_mode", "reduce-overhead")
+    compile_backend = trainer_cfg.get("compile_backend", "inductor")
     compile_dynamic = bool(trainer_cfg.get("compile_dynamic", True))
+    allow_compile_eager_fallback = not bool(trainer_cfg.get("strict_torch_compile", False))
     if torch.cuda.is_available():
         if trainer_cfg.get("compile_qwen_model", False):
             try:
@@ -509,7 +585,9 @@ def build_model(cfg) -> torch.nn.Module:
                     qwen_iface.model,
                     "qwen_vl_interface.model",
                     compile_mode=compile_mode,
+                    compile_backend=compile_backend,
                     dynamic_attempts=[qwen_dynamic] if not qwen_dynamic else [True, False],
+                    allow_eager_fallback=allow_compile_eager_fallback,
                 )
                 if hasattr(qwen_iface, "forward_features"):
                     _install_compiled_callable_attr(
@@ -517,9 +595,13 @@ def build_model(cfg) -> torch.nn.Module:
                         "forward_features",
                         "qwen_vl_interface.forward_features",
                         compile_mode=compile_mode,
+                        compile_backend=compile_backend,
                         dynamic_attempts=[qwen_dynamic] if not qwen_dynamic else [True, False],
+                        allow_eager_fallback=allow_compile_eager_fallback,
                     )
             except Exception as exc:
+                if not allow_compile_eager_fallback:
+                    raise
                 logger.warning(f"torch.compile failed for qwen_vl_interface.model, continuing without it: {exc}")
 
         if trainer_cfg.get("compile_action_model", False):
@@ -535,9 +617,13 @@ def build_model(cfg) -> torch.nn.Module:
                     model.action_model,
                     "action_model",
                     compile_mode=compile_mode,
+                    compile_backend=compile_backend,
                     dynamic_attempts=[action_dynamic] if not action_dynamic else [True, False],
+                    allow_eager_fallback=allow_compile_eager_fallback,
                 )
             except Exception as exc:
+                if not allow_compile_eager_fallback:
+                    raise
                 logger.warning(f"torch.compile failed for action_model, continuing without it: {exc}")
 
         if trainer_cfg.get("compile_vj_predictor", False):
@@ -553,9 +639,13 @@ def build_model(cfg) -> torch.nn.Module:
                     model.vj_predictor,
                     "vj_predictor",
                     compile_mode=compile_mode,
+                    compile_backend=compile_backend,
                     dynamic_attempts=[vj_dynamic] if not vj_dynamic else [True, False],
+                    allow_eager_fallback=allow_compile_eager_fallback,
                 )
             except Exception as exc:
+                if not allow_compile_eager_fallback:
+                    raise
                 logger.warning(f"torch.compile failed for vj_predictor, continuing without it: {exc}")
 
         if trainer_cfg.get("compile_vj_encoder", False):
@@ -572,7 +662,9 @@ def build_model(cfg) -> torch.nn.Module:
                     model.vj_encoder,
                     "vj_encoder",
                     compile_mode=compile_mode,
+                    compile_backend=compile_backend,
                     dynamic_attempts=vj_encoder_attempts,
+                    allow_eager_fallback=allow_compile_eager_fallback,
                 )
                 if hasattr(model.vj_encoder, "get_vision_features"):
                     _install_compiled_callable_attr(
@@ -580,9 +672,13 @@ def build_model(cfg) -> torch.nn.Module:
                         "get_vision_features",
                         "vj_encoder.get_vision_features",
                         compile_mode=compile_mode,
+                        compile_backend=compile_backend,
                         dynamic_attempts=vj_encoder_attempts,
+                        allow_eager_fallback=allow_compile_eager_fallback,
                     )
             except Exception as exc:
+                if not allow_compile_eager_fallback:
+                    raise
                 logger.warning(f"torch.compile failed for vj_encoder, continuing without it: {exc}")
 
         if trainer_cfg.get("compile_full_model", False):
@@ -596,9 +692,13 @@ def build_model(cfg) -> torch.nn.Module:
                     model,
                     f"{type(model).__name__}.forward",
                     compile_mode=compile_mode,
+                    compile_backend=compile_backend,
                     dynamic_attempts=[full_model_dynamic] if not full_model_dynamic else [True, False],
+                    allow_eager_fallback=allow_compile_eager_fallback,
                 )
             except Exception as exc:
+                if not allow_compile_eager_fallback:
+                    raise
                 logger.warning(f"torch.compile failed for full model forward, continuing without it: {exc}")
 
     return model
@@ -1056,6 +1156,8 @@ class VLATrainer(TrainerUtils):
             self.model.validate_depth_teacher_aux_training_state(
                 depth_teacher_loss_scale=self.depth_teacher_loss_scale,
             )
+        if hasattr(self.model, "validate_runtime_feature_state"):
+            self.model.validate_runtime_feature_state()
 
         #  print model trainable parameters:
         self.print_trainable_parameters(self.model)
@@ -1063,11 +1165,12 @@ class VLATrainer(TrainerUtils):
         # initialize distributed training components
         if self.accelerator.is_main_process:
             logger.info("Step 0 debug: calling accelerator.prepare")
-        self.model, self.optimizer, self.vla_train_dataloader = self.setup_distributed_training(
+        self.model, self.optimizer, self.vla_train_dataloader, self.lr_scheduler = self.setup_distributed_training(
             self.accelerator,  # must be the first param
             self.model,
             self.optimizer,
             self.vla_train_dataloader,
+            self.lr_scheduler,
             # self.vlm_train_dataloader
         )
         if self.accelerator.is_main_process:
@@ -1237,10 +1340,38 @@ class VLATrainer(TrainerUtils):
                 _drop_file_cache_best_effort(checkpoint_path)
 
             self.accelerator.print(f"✅ Checkpoint saved at {checkpoint_path}")
+            self._prune_old_checkpoints()
 
         if bool(self.config.trainer.get("trim_process_memory_after_checkpoint", True)):
             _trim_process_memory_best_effort()
         distributed_wait(self.accelerator)
+
+    def _prune_old_checkpoints(self):
+        max_to_keep = int(self.config.trainer.get("checkpoint_max_to_keep", 0) or 0)
+        if max_to_keep <= 0:
+            return
+
+        checkpoints = []
+        for name in os.listdir(self.checkpoint_dir):
+            if not name.startswith("steps_"):
+                continue
+            try:
+                step = int(name.split("_", 1)[1])
+            except ValueError:
+                continue
+            checkpoints.append((step, os.path.join(self.checkpoint_dir, name)))
+
+        checkpoints.sort(key=lambda item: item[0])
+        for step, path in checkpoints[:-max_to_keep]:
+            if step == self.completed_steps:
+                continue
+            try:
+                shutil.rmtree(path)
+                logger.info(f"Pruned old checkpoint at {path}")
+            except FileNotFoundError:
+                pass
+            except Exception as exc:
+                logger.warning(f"Unable to prune old checkpoint `{path}`: {exc}")
 
     def _should_save_checkpoint(self, step_metrics: dict) -> bool:
         if not bool(self.config.trainer.get("save_best_only", False)):
@@ -1310,6 +1441,14 @@ class VLATrainer(TrainerUtils):
                 for group in self.optimizer.param_groups:
                     group_name = group.get("name", "default")
                     scalar_metrics[f"lr_{group_name}"] = float(group["lr"])
+
+                rtc_cfg = self.config.framework.action_model.get("rtc_training", {})
+                if bool(rtc_cfg.get("enabled", False)):
+                    scalar_metrics["rtc_training_probability"] = rtc_training_probability(
+                        rtc_cfg,
+                        train_step=self.completed_steps,
+                        total_steps=int(self.config.trainer.max_train_steps),
+                    )
 
                 if self.accelerator.trackers:
                     self.accelerator.log(scalar_metrics, step=self.completed_steps)
@@ -1658,6 +1797,24 @@ class VLATrainer(TrainerUtils):
                     "  Depth teacher VLM detach warmup steps = "
                     f"{detach_steps}"
                 )
+            rtc_cfg = self.config.framework.action_model.get("rtc_training", {})
+            if bool(rtc_cfg.get("enabled", False)):
+                max_steps = int(self.config.trainer.max_train_steps)
+                warmup_steps = int(rtc_cfg.get("warmup_steps", rtc_cfg.get("start_step", 0)) or 0)
+                ramp_steps = int(rtc_cfg.get("ramp_steps", 0) or 0)
+                probe_steps = sorted({0, max(warmup_steps - 1, 0), warmup_steps, warmup_steps + ramp_steps - 1})
+                schedule = ", ".join(
+                    f"step {step}: {rtc_training_probability(rtc_cfg, train_step=step, total_steps=max_steps):.4f}"
+                    for step in probe_steps
+                    if step >= 0
+                )
+                logger.info(
+                    "  RTC training enabled: "
+                    f"target_prob={float(rtc_cfg.get('rtc_prob', 1.0)):.4f}, "
+                    f"warmup_steps={warmup_steps}, ramp_steps={ramp_steps}, "
+                    f"condition_dit_tokens={bool(rtc_cfg.get('condition_dit_tokens', False))}, "
+                    f"schedule=[{schedule}]"
+                )
             if self.config.trainer.get("use_rabc", False) and float(self.config.trainer.get("rabc_mistake_weight", 0.0)) <= 0.0:
                 logger.warning(
                     "RABC is enabled with rabc_mistake_weight <= 0.0; mistake-labeled samples are excluded from action_loss while still incurring full forward compute"
@@ -1859,16 +2016,19 @@ class VLATrainer(TrainerUtils):
         return result_dict
 
     def _finalize_training(self):
-        state_dict = self.accelerator.get_state_dict(self.model)
-        if self.accelerator.is_main_process:
-            final_checkpoint = os.path.join(self.config.output_dir, "final_model")
-            os.makedirs(final_checkpoint, exist_ok=True)
-            torch.save(state_dict, os.path.join(final_checkpoint, "pytorch_model.pt"))
-            if bool(self.config.trainer.get("drop_checkpoint_page_cache", True)):
-                _drop_file_cache_best_effort(final_checkpoint)
-            logger.info(f"Training complete. Final model saved at {final_checkpoint}")
-        if bool(self.config.trainer.get("trim_process_memory_after_checkpoint", True)):
-            _trim_process_memory_best_effort()
+        if bool(self.config.trainer.get("save_final_model", True)):
+            state_dict = self.accelerator.get_state_dict(self.model)
+            if self.accelerator.is_main_process:
+                final_checkpoint = os.path.join(self.config.output_dir, "final_model")
+                os.makedirs(final_checkpoint, exist_ok=True)
+                torch.save(state_dict, os.path.join(final_checkpoint, "pytorch_model.pt"))
+                if bool(self.config.trainer.get("drop_checkpoint_page_cache", True)):
+                    _drop_file_cache_best_effort(final_checkpoint)
+                logger.info(f"Training complete. Final model saved at {final_checkpoint}")
+            if bool(self.config.trainer.get("trim_process_memory_after_checkpoint", True)):
+                _trim_process_memory_best_effort()
+        elif self.accelerator.is_main_process:
+            logger.info("Training complete. Final model save skipped because trainer.save_final_model=false.")
         self._shutdown_data_runtime()
         distributed_wait(self.accelerator)
         finish_trackers(self.accelerator)
