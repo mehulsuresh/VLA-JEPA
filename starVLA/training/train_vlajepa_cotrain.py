@@ -140,6 +140,21 @@ class VLAMTrainer(TrainerUtils):
         self.completed_steps = 0
         self.total_batch_size = self._calculate_total_batch_size()
 
+    @staticmethod
+    def _detach_metric_value(value):
+        if isinstance(value, torch.Tensor):
+            return value.detach()
+        return value
+
+    @staticmethod
+    def _metric_value_for_logging(value):
+        if isinstance(value, torch.Tensor):
+            detached = value.detach()
+            if detached.numel() == 1:
+                return detached.item()
+            return f"tensor(shape={tuple(detached.shape)}, dtype={detached.dtype}, device={detached.device})"
+        return value
+
     def prepare_training(self):
         rank = dist.get_rank() if dist.is_initialized() else 0
         seed = self.config.seed + rank if hasattr(self.config, "seed") else rank + 3047
@@ -241,6 +256,11 @@ class VLAMTrainer(TrainerUtils):
             self.completed_steps % self.config.trainer.logging_frequency == 0
         ):  # some parameters should be initialized for the class
             if dist.get_rank() == 0:
+                log_metrics = {
+                    key: self._metric_value_for_logging(value)
+                    for key, value in metrics.items()
+                }
+
                 # calculate gradient norm
                 # total_norm = 0.0
                 # for p in self.model.parameters():
@@ -249,15 +269,15 @@ class VLAMTrainer(TrainerUtils):
                 # metrics["grad_norm"] = total_norm ** 0.5
 
                 # add learning rate
-                metrics["learning_rate"] = self.lr_scheduler.get_last_lr()[0]
+                log_metrics["learning_rate"] = self.lr_scheduler.get_last_lr()[0]
 
                 # add epoch information
-                metrics["epoch"] = round(self.completed_steps / len(self.vla_train_dataloader), 2)
+                log_metrics["epoch"] = round(self.completed_steps / len(self.vla_train_dataloader), 2)
 
                 # record to W&B
-                #wandb.log(metrics, step=self.completed_steps)
+                #wandb.log(log_metrics, step=self.completed_steps)
                 # debug output
-                logger.info(f"Step {self.completed_steps}, Loss: {metrics})")
+                logger.info(f"Step {self.completed_steps}, Loss: {log_metrics})")
 
     def _create_data_iterators(self):
         """create data iterators"""
@@ -449,9 +469,9 @@ class VLAMTrainer(TrainerUtils):
             """
 
         for k, v in output_dict.items():
-            log_dict[f"vla_{k}"] = v.item()
+            log_dict[f"vla_{k}"] = self._detach_metric_value(v)
         for k, v in vlm_output.items():
-            log_dict[f"vlm_{k}"] = v.item()
+            log_dict[f"vlm_{k}"] = self._detach_metric_value(v)
         return log_dict
 
     def _finalize_training(self):
