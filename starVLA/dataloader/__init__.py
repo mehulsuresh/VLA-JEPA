@@ -27,6 +27,67 @@ logger = get_logger(__name__)
 def _identity_collate(batch):
     return batch
 
+
+def _host_memory_gib() -> float | None:
+    try:
+        with open("/proc/meminfo", "r", encoding="utf-8") as handle:
+            for line in handle:
+                if line.startswith("MemTotal:"):
+                    return float(line.split()[1]) / 1024.0 / 1024.0
+    except OSError:
+        return None
+    return None
+
+
+def _distributed_world_size() -> int:
+    if dist.is_available() and dist.is_initialized():
+        return max(1, int(dist.get_world_size()))
+    for key in ("WORLD_SIZE", "SLURM_NTASKS"):
+        value = os.environ.get(key)
+        if value:
+            try:
+                return max(1, int(value))
+            except ValueError:
+                continue
+    return 1
+
+
+def _maybe_clamp_canonical_workers_for_memory(vla_dataset_cfg, num_workers: int) -> int:
+    if num_workers <= 0:
+        return num_workers
+    if not bool(vla_dataset_cfg.get("enforce_worker_memory_budget", True)):
+        return num_workers
+
+    total_gib = _host_memory_gib()
+    if total_gib is None or total_gib <= 0:
+        return num_workers
+
+    worker_budget_gib = float(vla_dataset_cfg.get("estimated_worker_memory_gb", 5.0) or 5.0)
+    host_fraction = float(vla_dataset_cfg.get("worker_memory_budget_fraction", 0.65) or 0.65)
+    worker_budget_gib = max(0.5, worker_budget_gib)
+    host_fraction = min(0.95, max(0.1, host_fraction))
+    world_size = _distributed_world_size()
+
+    max_total_workers = max(1, int((total_gib * host_fraction) // worker_budget_gib))
+    max_workers_per_rank = max(1, max_total_workers // max(1, world_size))
+    if num_workers <= max_workers_per_rank:
+        return num_workers
+
+    message = (
+        "Clamping canonical_subset_vla num_workers from "
+        f"{num_workers} to {max_workers_per_rank} based on host RAM budget "
+        f"(MemTotal={total_gib:.1f}GiB, world_size={world_size}, "
+        f"estimated_worker_memory_gb={worker_budget_gib:.1f}, "
+        f"worker_memory_budget_fraction={host_fraction:.2f}). "
+        "Set datasets.vla_data.enforce_worker_memory_budget=false to override."
+    )
+    try:
+        logger.warning(message)
+    except RuntimeError:
+        print(message, file=sys.stderr, flush=True)
+    return max_workers_per_rank
+
+
 def save_dataset_statistics(dataset_statistics, run_dir):
     """Saves a `dataset_statistics.json` file."""
     out_path = run_dir / "dataset_statistics.json"
@@ -194,6 +255,7 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe", model=None): # TODO
 
         vla_dataset_cfg = cfg.datasets.vla_data
         num_workers = int(vla_dataset_cfg.get("num_workers", 0))
+        num_workers = _maybe_clamp_canonical_workers_for_memory(vla_dataset_cfg, num_workers)
         pin_memory = bool(vla_dataset_cfg.get("pin_memory", torch.cuda.is_available()))
         drop_last = bool(vla_dataset_cfg.get("drop_last", True))
 
@@ -224,7 +286,7 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe", model=None): # TODO
             drop_last=drop_last,
         )
         if num_workers > 0:
-            loader_kwargs["prefetch_factor"] = max(2, int(vla_dataset_cfg.get("prefetch_factor", 2)))
+            loader_kwargs["prefetch_factor"] = max(1, int(vla_dataset_cfg.get("prefetch_factor", 2)))
             loader_kwargs["persistent_workers"] = bool(vla_dataset_cfg.get("persistent_workers", True))
             loader_kwargs["multiprocessing_context"] = vla_dataset_cfg.get("multiprocessing_context", "spawn")
             dataloader_timeout_seconds = int(vla_dataset_cfg.get("dataloader_timeout_seconds", 0))

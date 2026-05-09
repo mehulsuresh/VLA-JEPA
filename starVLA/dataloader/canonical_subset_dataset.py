@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from bisect import bisect_right
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import OrderedDict
 from contextlib import contextmanager
 import fcntl
@@ -81,6 +82,17 @@ def _as_float_filter_set(value: Any) -> set[float]:
     return values
 
 
+def _parse_pyav_thread_count(value: Any) -> int:
+    if value is None:
+        return 1
+    if isinstance(value, str):
+        token = value.strip().lower()
+        if token in {"", "auto", "default"}:
+            return 1
+        value = token
+    return max(int(value), 0)
+
+
 def _read_jsonl_gz(path: Path) -> list[dict[str, Any]]:
     with gzip.open(path, "rt", encoding="utf-8") as handle:
         return [json.loads(line) for line in handle if line.strip()]
@@ -144,30 +156,89 @@ def _gcs_join(*parts: str) -> str:
     return f"{head}/{tail}" if tail else head
 
 
-def _run_gcloud_cp(source: str, destination: Path, timeout_seconds: int = 300, recursive: bool = False) -> None:
+def _cleanup_gcloud_temp_path(path: Path, *, recursive: bool) -> None:
+    if recursive:
+        return
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _run_gcloud_cp(
+    source: str,
+    destination: Path,
+    timeout_seconds: int = 900,
+    recursive: bool = False,
+    retries: int = 3,
+    retry_backoff_seconds: float = 5.0,
+) -> None:
     if recursive:
         destination.mkdir(parents=True, exist_ok=True)
     else:
         destination.parent.mkdir(parents=True, exist_ok=True)
-    cmd = ["gcloud", "storage", "cp"]
-    if recursive:
-        cmd.append("--recursive")
-    cmd.extend([source, str(destination)])
-    try:
-        subprocess.run(
-            cmd,
-            check=True,
-            text=True,
-            capture_output=True,
-            timeout=timeout_seconds,
-        )
-    except subprocess.CalledProcessError as exc:
-        stderr = (exc.stderr or "").strip()
-        raise RuntimeError(
-            "Failed to copy canonical dataset shard from GCS. "
-            "Refresh gcloud auth with `gcloud auth login` if credentials expired. "
-            f"Command: {' '.join(cmd)}\n{stderr}"
-        ) from exc
+
+    attempts = max(1, int(retries))
+    timeout_seconds = max(1, int(timeout_seconds))
+    retry_backoff_seconds = max(0.0, float(retry_backoff_seconds))
+    last_error: Exception | None = None
+
+    for attempt in range(1, attempts + 1):
+        if not recursive:
+            copy_destination = destination.with_name(
+                f".{destination.name}.{os.getpid()}.{time.time_ns()}.attempt{attempt}.tmp"
+            )
+        else:
+            copy_destination = destination
+
+        cmd = ["gcloud", "storage", "cp"]
+        if recursive:
+            cmd.append("--recursive")
+        cmd.extend([source, str(copy_destination)])
+
+        try:
+            subprocess.run(
+                cmd,
+                check=True,
+                text=True,
+                capture_output=True,
+                timeout=timeout_seconds,
+            )
+            if not recursive:
+                copy_destination.replace(destination)
+            return
+        except subprocess.CalledProcessError as exc:
+            _cleanup_gcloud_temp_path(copy_destination, recursive=recursive)
+            stderr = (exc.stderr or "").strip()
+            last_error = RuntimeError(
+                "Failed to copy canonical dataset shard from GCS. "
+                "Refresh gcloud auth with `gcloud auth login` if credentials expired. "
+                f"Attempt {attempt}/{attempts}. Command: {' '.join(cmd)}\n{stderr}"
+            )
+        except subprocess.TimeoutExpired as exc:
+            _cleanup_gcloud_temp_path(copy_destination, recursive=recursive)
+            last_error = RuntimeError(
+                "Timed out copying canonical dataset shard from GCS. "
+                f"Attempt {attempt}/{attempts}, timeout_seconds={timeout_seconds}. "
+                f"Command: {' '.join(cmd)}"
+            )
+        except Exception as exc:
+            _cleanup_gcloud_temp_path(copy_destination, recursive=recursive)
+            last_error = exc
+
+        if attempt < attempts:
+            print(
+                "Canonical GCS copy failed; retrying "
+                f"attempt={attempt}/{attempts} timeout_seconds={timeout_seconds} "
+                f"source={source}",
+                file=sys.stderr,
+                flush=True,
+            )
+            if retry_backoff_seconds > 0:
+                time.sleep(retry_backoff_seconds * attempt)
+
+    assert last_error is not None
+    raise last_error
 
 
 @contextmanager
@@ -181,10 +252,48 @@ def _exclusive_file_lock(lock_path: Path):
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
+@contextmanager
+def _shared_file_lock(lock_path: Path):
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+@contextmanager
+def _try_exclusive_file_lock(lock_path: Path):
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a", encoding="utf-8") as handle:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 def _relative_copy_lock_path(root: Path, relative_path: str) -> Path:
     digest = hashlib.sha1(relative_path.encode("utf-8")).hexdigest()
     readable_stem = relative_path.replace("/", "__")[-96:]
     return root / ".locks" / f"{readable_stem}.{digest}.lock"
+
+
+def _cache_file_copy_lock_path(cache_dir: Path, path: Path) -> Path | None:
+    try:
+        relative = path.relative_to(cache_dir)
+    except ValueError:
+        return None
+    if len(relative.parts) < 4 or relative.parts[2] != "videos":
+        return None
+    root = cache_dir / relative.parts[0] / relative.parts[1]
+    inner_relative = Path(*relative.parts[2:]).as_posix()
+    return _relative_copy_lock_path(root, inner_relative)
 
 
 def _ensure_metadata_root(
@@ -192,6 +301,9 @@ def _ensure_metadata_root(
     root: Path,
     gcs_prefix: str,
     allow_gcs_download: bool,
+    gcs_timeout_seconds: int = 900,
+    gcs_retries: int = 3,
+    gcs_retry_backoff_seconds: float = 5.0,
 ) -> Path | None:
     info_path = root / "meta/info.json"
     if info_path.exists():
@@ -203,7 +315,14 @@ def _ensure_metadata_root(
     with _exclusive_file_lock(lock_path):
         if info_path.exists():
             return root
-        _run_gcloud_cp(_gcs_join(gcs_prefix, "files/meta"), root, recursive=True)
+        _run_gcloud_cp(
+            _gcs_join(gcs_prefix, "files/meta"),
+            root,
+            timeout_seconds=gcs_timeout_seconds,
+            recursive=True,
+            retries=gcs_retries,
+            retry_backoff_seconds=gcs_retry_backoff_seconds,
+        )
     return root if info_path.exists() else None
 
 
@@ -213,17 +332,27 @@ def _ensure_relative_path(
     gcs_prefix: str,
     relative_path: str,
     allow_gcs_download: bool,
+    force_download: bool = False,
+    gcs_timeout_seconds: int = 900,
+    gcs_retries: int = 3,
+    gcs_retry_backoff_seconds: float = 5.0,
 ) -> Path | None:
     local_path = root / relative_path
-    if local_path.exists():
+    if local_path.exists() and not force_download:
         return local_path
     if not allow_gcs_download:
         return None
 
     with _exclusive_file_lock(_relative_copy_lock_path(root, relative_path)):
-        if local_path.exists():
+        if local_path.exists() and not force_download:
             return local_path
-        _run_gcloud_cp(_gcs_join(gcs_prefix, "files", relative_path), local_path)
+        _run_gcloud_cp(
+            _gcs_join(gcs_prefix, "files", relative_path),
+            local_path,
+            timeout_seconds=gcs_timeout_seconds,
+            retries=gcs_retries,
+            retry_backoff_seconds=gcs_retry_backoff_seconds,
+        )
     return local_path
 
 
@@ -358,6 +487,13 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
         )
         self.bucket_root = str(_cfg_get(data_cfg, "bucket_root", DEFAULT_BUCKET_ROOT)).rstrip("/")
         self.allow_gcs_download = bool(_cfg_get(data_cfg, "allow_gcs_download", False))
+        self.gcs_download_timeout_seconds = max(
+            1, int(_cfg_get(data_cfg, "gcs_download_timeout_seconds", 900))
+        )
+        self.gcs_download_retries = max(1, int(_cfg_get(data_cfg, "gcs_download_retries", 3)))
+        self.gcs_download_retry_backoff_seconds = max(
+            0.0, float(_cfg_get(data_cfg, "gcs_download_retry_backoff_seconds", 5.0) or 0.0)
+        )
         self.camera_slots = _as_list(_cfg_get(data_cfg, "camera_slots", ["left", "right", "main"]))
         self.dataset_id_list = [str(value) for value in _as_list(_cfg_get(data_cfg, "dataset_ids", []))]
         self.dataset_ids = set(self.dataset_id_list)
@@ -389,6 +525,8 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
         self.action_horizon = int(action_horizon)
         self.video_frame_stride = max(1, int(video_frame_stride))
         self.video_target_shift_steps = max(0, int(_cfg_get(data_cfg, "video_target_shift_steps", 0)))
+        self._action_offsets = np.arange(self.action_horizon, dtype=np.int64)
+        self._compact_offsets_cache: np.ndarray | None = None
         self.video_resolution_size = int(_cfg_get(data_cfg, "video_resolution_size", 384))
         self.video_decode_backend = str(_cfg_get(data_cfg, "video_decode_backend", "auto")).lower()
         self.sidecar_normalization = str(_cfg_get(data_cfg, "sidecar_normalization", "shard_q01_q99")).lower()
@@ -397,6 +535,8 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
         self.index_windows_lazily = bool(_cfg_get(data_cfg, "index_windows_lazily", False))
         self.prefetch_metadata_across_ranks = bool(_cfg_get(data_cfg, "prefetch_metadata_across_ranks", False))
         self.metadata_index_cache = bool(_cfg_get(data_cfg, "metadata_index_cache", True))
+        self.metadata_prefetch_workers = max(1, int(_cfg_get(data_cfg, "metadata_prefetch_workers", 1)))
+        self.data_file_prefetch_shards = max(0, int(_cfg_get(data_cfg, "data_file_prefetch_shards", 0)))
         self.metadata_index_cache_dir = Path(
             _cfg_get(data_cfg, "metadata_index_cache_dir", self.cache_dir / ".canonical_index_cache")
         )
@@ -410,7 +550,17 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
         self.pyav_corrupt_warning_limit = max(int(_cfg_get(data_cfg, "pyav_corrupt_warning_limit", 20)), 0)
         self.pyav_decode_retry_extra_frames = max(int(_cfg_get(data_cfg, "pyav_decode_retry_extra_frames", 900)), 0)
         self.pyav_reader_cache_size = max(int(_cfg_get(data_cfg, "pyav_reader_cache_size", self.reader_cache_size)), 0)
+        self.pyav_thread_count = _parse_pyav_thread_count(_cfg_get(data_cfg, "pyav_thread_count", 1))
         self.pyav_thread_type = str(_cfg_get(data_cfg, "pyav_thread_type", "SLICE")).upper()
+        self.video_cache_max_bytes = int(
+            float(_cfg_get(data_cfg, "video_cache_max_gb", 0) or 0) * 1024 * 1024 * 1024
+        )
+        self.video_cache_prune_interval_downloads = max(
+            1, int(_cfg_get(data_cfg, "video_cache_prune_interval_downloads", 16))
+        )
+        self.video_cache_prune_target_fraction = min(
+            1.0, max(0.1, float(_cfg_get(data_cfg, "video_cache_prune_target_fraction", 0.9)))
+        )
         self._apply_unified_adapter, self._load_adapter_config = _load_canonical_modules(
             self.dataset_canonicalization_root
         )
@@ -419,6 +569,12 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
         self._pyav_readers: OrderedDict[str, _PyAVReader] = OrderedDict()
         self._pyav_corrupt_warning_count = 0
         self._loaded_shards: OrderedDict[int, _ShardData] = OrderedDict()
+        self._known_local_relative_paths: set[tuple[str, str]] = set()
+        self._redownloaded_relative_paths: set[tuple[str, str]] = set()
+        self._video_cache_prune_download_count = 0
+        self._shard_prefetch_executor: ThreadPoolExecutor | None = None
+        self._shard_prefetch_futures: OrderedDict[int, Any] = OrderedDict()
+        self._shard_prefetch_seen: set[int] = set()
         self._metadata_index_cache_key = (
             self._build_metadata_index_cache_key() if self.metadata_index_cache else ""
         )
@@ -444,9 +600,23 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
         state["_pyav_readers"] = OrderedDict()
         state["_pyav_corrupt_warning_count"] = 0
         state["_loaded_shards"] = OrderedDict()
+        state["_known_local_relative_paths"] = set()
+        state["_redownloaded_relative_paths"] = set()
+        state["_video_cache_prune_download_count"] = 0
+        state["_shard_prefetch_executor"] = None
+        state["_shard_prefetch_futures"] = OrderedDict()
+        state["_shard_prefetch_seen"] = set()
         return state
 
     def close_video_readers(self) -> None:
+        executor = getattr(self, "_shard_prefetch_executor", None)
+        if executor is not None:
+            try:
+                executor.shutdown(wait=False, cancel_futures=True)
+            except TypeError:
+                executor.shutdown(wait=False)
+            self._shard_prefetch_executor = None
+            self._shard_prefetch_futures = OrderedDict()
         decord_readers = getattr(self, "_decord_readers", None)
         if decord_readers is not None:
             decord_readers.clear()
@@ -466,6 +636,11 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
         container = av.open(path_key, mode="r")
         try:
             stream = container.streams.video[0]
+            if self.pyav_thread_count > 0:
+                try:
+                    stream.codec_context.thread_count = self.pyav_thread_count
+                except Exception:
+                    pass
             if self.pyav_thread_type and self.pyav_thread_type != "DEFAULT":
                 try:
                     stream.thread_type = self.pyav_thread_type
@@ -573,7 +748,7 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
         if not self.allow_gcs_download:
             return
         rank, world_size = self._distributed_rank_world()
-        if world_size <= 1:
+        if world_size <= 1 and self.metadata_prefetch_workers <= 1:
             return
 
         prefetch_candidates = candidates
@@ -585,6 +760,45 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
             root = self.cache_dir / row["sid"] / row["revision"]
             if not (root / "meta/info.json").exists():
                 pending.append((index, row))
+
+        if world_size <= 1:
+            if pending:
+                print(
+                    "Canonical metadata local prefetch: "
+                    f"{len(pending)} uncached metadata roots with {self.metadata_prefetch_workers} workers.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+
+            def fetch_metadata(row: dict[str, Any]) -> bool:
+                root = self.cache_dir / row["sid"] / row["revision"]
+                gcs_prefix = _gcs_join(self.bucket_root, row["sid"], row["revision"])
+                return (
+                    _ensure_metadata_root(
+                        root=root,
+                        gcs_prefix=gcs_prefix,
+                        allow_gcs_download=self.allow_gcs_download,
+                        gcs_timeout_seconds=self.gcs_download_timeout_seconds,
+                        gcs_retries=self.gcs_download_retries,
+                        gcs_retry_backoff_seconds=self.gcs_download_retry_backoff_seconds,
+                    )
+                    is not None
+                )
+
+            local_count = 0
+            with ThreadPoolExecutor(max_workers=self.metadata_prefetch_workers) as executor:
+                futures = [executor.submit(fetch_metadata, row) for _, row in pending]
+                for future in as_completed(futures):
+                    if future.result():
+                        local_count += 1
+            if pending:
+                print(
+                    "Canonical metadata local prefetch complete; "
+                    f"fetched {local_count} metadata roots.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            return
 
         if rank == 0 and pending:
             print(
@@ -604,6 +818,9 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
                 root=root,
                 gcs_prefix=gcs_prefix,
                 allow_gcs_download=self.allow_gcs_download,
+                gcs_timeout_seconds=self.gcs_download_timeout_seconds,
+                gcs_retries=self.gcs_download_retries,
+                gcs_retry_backoff_seconds=self.gcs_download_retry_backoff_seconds,
             ):
                 local_count += 1
 
@@ -804,6 +1021,9 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
                         root=root,
                         gcs_prefix=gcs_prefix,
                         allow_gcs_download=self.allow_gcs_download,
+                        gcs_timeout_seconds=self.gcs_download_timeout_seconds,
+                        gcs_retries=self.gcs_download_retries,
+                        gcs_retry_backoff_seconds=self.gcs_download_retry_backoff_seconds,
                     )
                     is None
                 ):
@@ -842,6 +1062,9 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
                         gcs_prefix=gcs_prefix,
                         relative_path=data_relative,
                         allow_gcs_download=self.allow_gcs_download,
+                        gcs_timeout_seconds=self.gcs_download_timeout_seconds,
+                        gcs_retries=self.gcs_download_retries,
+                        gcs_retry_backoff_seconds=self.gcs_download_retry_backoff_seconds,
                     )
                     if data_path is None:
                         continue
@@ -943,6 +1166,9 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
                         gcs_prefix=gcs_prefix,
                         relative_path=video_relative,
                         allow_gcs_download=self.allow_gcs_download,
+                        gcs_timeout_seconds=self.gcs_download_timeout_seconds,
+                        gcs_retries=self.gcs_download_retries,
+                        gcs_retry_backoff_seconds=self.gcs_download_retry_backoff_seconds,
                     )
                     if video_path is None:
                         missing_video = True
@@ -1013,6 +1239,9 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
                 gcs_prefix=shard.gcs_prefix,
                 relative_path=shard.data_relative_path,
                 allow_gcs_download=self.allow_gcs_download,
+                gcs_timeout_seconds=self.gcs_download_timeout_seconds,
+                gcs_retries=self.gcs_download_retries,
+                gcs_retry_backoff_seconds=self.gcs_download_retry_backoff_seconds,
             )
             if data_path is None:
                 raise RuntimeError(
@@ -1156,6 +1385,17 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
         )
 
     def _get_shard_data(self, shard_index: int) -> _ShardData:
+        future = self._shard_prefetch_futures.pop(shard_index, None)
+        if future is not None:
+            try:
+                future.result()
+            except Exception as exc:
+                print(
+                    "Canonical shard data prefetch failed; falling back to synchronous fetch "
+                    f"shard_index={shard_index} error={type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
         if shard_index not in self._loaded_shards:
             self._ensure_sidecar(self.shards[shard_index])
             self._loaded_shards[shard_index] = _ShardData(self.shards[shard_index].sidecar_path)
@@ -1165,36 +1405,245 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
                 self._loaded_shards.popitem(last=False)
         return self._loaded_shards[shard_index]
 
+    def _cleanup_shard_prefetch_futures(self) -> None:
+        futures = getattr(self, "_shard_prefetch_futures", None)
+        if not futures:
+            return
+        for shard_index, future in list(futures.items()):
+            if not future.done():
+                continue
+            futures.pop(shard_index, None)
+            try:
+                future.result()
+            except Exception as exc:
+                print(
+                    "Canonical shard data prefetch failed "
+                    f"shard_index={shard_index} error={type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+
+    def _get_shard_prefetch_executor(self) -> ThreadPoolExecutor:
+        executor = getattr(self, "_shard_prefetch_executor", None)
+        if executor is None:
+            executor = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="canonical-shard-prefetch",
+            )
+            self._shard_prefetch_executor = executor
+        return executor
+
+    def _prefetch_shard_data_file(self, shard_index: int) -> bool:
+        shard = self.shards[shard_index]
+        if shard.sidecar_path.exists() or shard.data_path.exists():
+            return True
+        local_path = _ensure_relative_path(
+            root=shard.root,
+            gcs_prefix=shard.gcs_prefix,
+            relative_path=shard.data_relative_path,
+            allow_gcs_download=self.allow_gcs_download,
+            gcs_timeout_seconds=self.gcs_download_timeout_seconds,
+            gcs_retries=self.gcs_download_retries,
+            gcs_retry_backoff_seconds=self.gcs_download_retry_backoff_seconds,
+        )
+        return local_path is not None
+
+    def _schedule_shard_data_prefetch(self, shard_index: int) -> None:
+        if self.data_file_prefetch_shards <= 0 or not self.allow_gcs_download:
+            return
+        if not self.shards:
+            return
+        self._cleanup_shard_prefetch_futures()
+        for offset in range(1, self.data_file_prefetch_shards + 1):
+            target_index = shard_index + offset
+            if target_index >= len(self.shards):
+                break
+            if target_index in self._shard_prefetch_seen:
+                continue
+            shard = self.shards[target_index]
+            if shard.sidecar_path.exists() or shard.data_path.exists():
+                self._shard_prefetch_seen.add(target_index)
+                continue
+            executor = self._get_shard_prefetch_executor()
+            self._shard_prefetch_futures[target_index] = executor.submit(
+                self._prefetch_shard_data_file,
+                target_index,
+            )
+            self._shard_prefetch_seen.add(target_index)
+
     def _ensure_episode_video(self, shard: ShardSpec, video_path: Path) -> Path:
         try:
             relative_path = video_path.relative_to(shard.root).as_posix()
         except ValueError as exc:
             raise RuntimeError(f"Canonical video path is outside shard root: {video_path}") from exc
+        cache_key = (shard.root.as_posix(), relative_path)
+        if cache_key in self._known_local_relative_paths:
+            return video_path
+        was_missing = not video_path.exists()
         local_path = _ensure_relative_path(
             root=shard.root,
             gcs_prefix=shard.gcs_prefix,
             relative_path=relative_path,
             allow_gcs_download=self.allow_gcs_download,
+            gcs_timeout_seconds=self.gcs_download_timeout_seconds,
+            gcs_retries=self.gcs_download_retries,
+            gcs_retry_backoff_seconds=self.gcs_download_retry_backoff_seconds,
         )
         if local_path is None:
             raise RuntimeError(
                 f"Canonical video file is missing and downloads are disabled: {relative_path}"
             )
+        self._known_local_relative_paths.add(cache_key)
+        if was_missing:
+            self._maybe_prune_video_cache({local_path})
         return local_path
 
+    def _redownload_episode_video(
+        self,
+        shard: ShardSpec,
+        video_path: Path,
+        *,
+        allow_repeat: bool = False,
+    ) -> Path | None:
+        if not self.allow_gcs_download:
+            return None
+        try:
+            relative_path = video_path.relative_to(shard.root).as_posix()
+        except ValueError:
+            return None
+        cache_key = (shard.root.as_posix(), relative_path)
+        if cache_key in self._redownloaded_relative_paths and not allow_repeat:
+            return None
+        self._redownloaded_relative_paths.add(cache_key)
+        self._known_local_relative_paths.discard(cache_key)
+        self._drop_pyav_reader(video_path.as_posix())
+        local_path = _ensure_relative_path(
+            root=shard.root,
+            gcs_prefix=shard.gcs_prefix,
+            relative_path=relative_path,
+            allow_gcs_download=True,
+            force_download=True,
+            gcs_timeout_seconds=self.gcs_download_timeout_seconds,
+            gcs_retries=self.gcs_download_retries,
+            gcs_retry_backoff_seconds=self.gcs_download_retry_backoff_seconds,
+        )
+        if local_path is not None:
+            self._known_local_relative_paths.add(cache_key)
+            self._maybe_prune_video_cache({local_path})
+        return local_path
+
+    def _episode_video_lock_path(self, shard: ShardSpec, video_path: Path) -> Path:
+        try:
+            relative_path = video_path.relative_to(shard.root).as_posix()
+        except ValueError:
+            relative_path = video_path.as_posix()
+        return _relative_copy_lock_path(shard.root, relative_path)
+
+    def _decode_episode_video(
+        self,
+        shard: ShardSpec,
+        video_path: Path,
+        frame_indices: np.ndarray,
+        lock_path: Path,
+    ) -> np.ndarray:
+        try:
+            with _shared_file_lock(lock_path):
+                return self._decode_video(video_path, frame_indices)
+        except Exception:
+            redownloaded_path = self._redownload_episode_video(
+                shard,
+                video_path,
+                allow_repeat=not video_path.exists(),
+            )
+            if redownloaded_path is None:
+                raise
+            try:
+                with _shared_file_lock(lock_path):
+                    return self._decode_video(redownloaded_path, frame_indices)
+            except Exception as retry_exc:
+                raise RuntimeError(
+                    "Canonical video decode failed after forced GCS redownload: "
+                    f"{video_path}"
+                ) from retry_exc
+
+    def _maybe_prune_video_cache(self, protect_paths: set[Path]) -> None:
+        if self.video_cache_max_bytes <= 0:
+            return
+        self._video_cache_prune_download_count += 1
+        if self._video_cache_prune_download_count % self.video_cache_prune_interval_downloads != 0:
+            return
+        self._prune_video_cache(protect_paths)
+
+    def _prune_video_cache(self, protect_paths: set[Path]) -> None:
+        prune_lock_path = self.cache_dir / ".locks/video-cache-prune.lock"
+        with _try_exclusive_file_lock(prune_lock_path) as acquired:
+            if not acquired:
+                return
+            protected = {path.resolve() for path in protect_paths}
+            video_files: list[tuple[float, int, Path]] = []
+            total_bytes = 0
+            for path in self.cache_dir.rglob("*.mp4"):
+                if not path.is_file() or path.name.startswith("."):
+                    continue
+                try:
+                    resolved = path.resolve()
+                    stat = path.stat()
+                except FileNotFoundError:
+                    continue
+                total_bytes += int(stat.st_size)
+                if resolved in protected:
+                    continue
+                video_files.append((float(stat.st_mtime), int(stat.st_size), path))
+
+            if total_bytes <= self.video_cache_max_bytes:
+                return
+
+            target_bytes = int(self.video_cache_max_bytes * self.video_cache_prune_target_fraction)
+            deleted_count = 0
+            deleted_bytes = 0
+            for _, size, path in sorted(video_files):
+                if total_bytes <= target_bytes:
+                    break
+                lock_path = _cache_file_copy_lock_path(self.cache_dir, path)
+                if lock_path is None:
+                    continue
+                with _try_exclusive_file_lock(lock_path) as acquired_file:
+                    if not acquired_file:
+                        continue
+                    try:
+                        current_size = path.stat().st_size
+                        path.unlink()
+                    except FileNotFoundError:
+                        continue
+                    total_bytes -= int(current_size)
+                    deleted_count += 1
+                    deleted_bytes += int(current_size)
+            if deleted_count:
+                print(
+                    "Canonical video cache pruned: "
+                    f"deleted_files={deleted_count} deleted_gib={deleted_bytes / 1024**3:.2f} "
+                    f"remaining_gib={total_bytes / 1024**3:.2f} cap_gib={self.video_cache_max_bytes / 1024**3:.2f}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+
     def _compact_offsets(self) -> np.ndarray:
+        if self._compact_offsets_cache is not None:
+            return self._compact_offsets_cache
         if self.video_target_shift_steps <= 0:
-            return np.arange(self.video_horizon, dtype=np.int64) * self.video_frame_stride
+            self._compact_offsets_cache = np.arange(self.video_horizon, dtype=np.int64) * self.video_frame_stride
+            return self._compact_offsets_cache
         if self.video_horizon <= self.video_target_shift_steps:
             raise ValueError(
                 f"video_horizon ({self.video_horizon}) must be greater than video_target_shift_steps "
                 f"({self.video_target_shift_steps})"
             )
         context_horizon = self.video_horizon - self.video_target_shift_steps
-        return (
+        self._compact_offsets_cache = (
             np.arange(-(context_horizon - 1), self.video_target_shift_steps + 1, dtype=np.int64)
             * self.video_frame_stride
         )
+        return self._compact_offsets_cache
 
     def _decode_video_decord(self, path_key: str, frame_indices: np.ndarray) -> np.ndarray:
         if decord is None:
@@ -1257,6 +1706,7 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
 
         last_error: Exception | None = None
         attempted_after_error = False
+        retry_recovered_seek_frame: int | None = None
 
         def _seek(container: Any, stream: Any, seek_frame: int) -> None:
             if time_base > 0 and fps > 0:
@@ -1283,6 +1733,7 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
             last_candidate: tuple[int, np.ndarray] | None = None
             last_decoded_index: int | None = None
             capture_candidates = attempt_idx > 0
+            found_before_attempt = len(found)
             try:
                 _seek(reader.container, reader.stream, seek_frame)
                 try:
@@ -1331,9 +1782,12 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
                 if attempt_idx == 0 and base_reader_is_cached:
                     self._drop_pyav_reader(path_key)
                 continue
+            if attempt_idx > 0 and len(found) > found_before_attempt:
+                retry_recovered_seek_frame = seek_frame
             if found:
                 break
             if fill_candidates and attempt_idx > 0:
+                retry_recovered_seek_frame = seek_frame
                 break
 
         if len(found) != len(unique_targets):
@@ -1349,9 +1803,45 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
                 raise RuntimeError(
                     f"PyAV decoded no usable frames from {path_key}; requested={unique_targets[:8]}"
                 )
+        elif attempted_after_error and retry_recovered_seek_frame is not None:
+            self._warn_pyav_retry_recovery(path_key, unique_targets, retry_recovered_seek_frame, last_error)
 
         frames = np.stack([found[int(index)] for index in indices], axis=0)
         return self._resize_video(frames)
+
+    def _format_pyav_error(self, error: Exception | None) -> str:
+        if error is None:
+            return "none"
+        error_summary = f"{type(error).__name__}: {error}"
+        if len(error_summary) > 220:
+            error_summary = error_summary[:217] + "..."
+        return error_summary
+
+    def _claim_pyav_warning_slot(self) -> tuple[bool, bool]:
+        warning_count = int(getattr(self, "_pyav_corrupt_warning_count", 0))
+        self._pyav_corrupt_warning_count = warning_count + 1
+        if warning_count >= self.pyav_corrupt_warning_limit:
+            return False, False
+        return True, warning_count + 1 == self.pyav_corrupt_warning_limit
+
+    def _warn_pyav_retry_recovery(
+        self,
+        path_key: str,
+        requested: list[int],
+        retry_seek_frame: int,
+        error: Exception | None,
+    ) -> None:
+        should_warn, suppress_after = self._claim_pyav_warning_slot()
+        if not should_warn:
+            return
+        suffix = " Further PyAV recovery warnings are suppressed in this worker." if suppress_after else ""
+        print(
+            "Canonical PyAV recovered decode error by lookahead retry: "
+            f"path={path_key} requested={requested[:8]} retry_seek_frame={retry_seek_frame} "
+            f"last_error={self._format_pyav_error(error)}.{suffix}",
+            file=sys.stderr,
+            flush=True,
+        )
 
     def _warn_pyav_recovery(
         self,
@@ -1362,22 +1852,17 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
         error: Exception | None,
         retried: bool,
     ) -> None:
-        warning_count = int(getattr(self, "_pyav_corrupt_warning_count", 0))
-        self._pyav_corrupt_warning_count = warning_count + 1
-        if warning_count >= self.pyav_corrupt_warning_limit:
+        should_warn, suppress_after = self._claim_pyav_warning_slot()
+        if not should_warn:
             return
-        error_summary = "none"
-        if error is not None:
-            error_summary = f"{type(error).__name__}: {error}"
-            if len(error_summary) > 220:
-                error_summary = error_summary[:217] + "..."
         suffix = ""
-        if warning_count + 1 == self.pyav_corrupt_warning_limit:
+        if suppress_after:
             suffix = " Further PyAV recovery warnings are suppressed in this worker."
         print(
             "Canonical PyAV recovered corrupt video frames by nearest-frame fill: "
             f"path={path_key} requested={requested[:8]} missing={missing[:8]} total_missing={len(missing)} "
-            f"available={available[:8]} retried_after_error={retried} last_error={error_summary}.{suffix}",
+            f"available={available[:8]} retried_after_error={retried} "
+            f"last_error={self._format_pyav_error(error)}.{suffix}",
             file=sys.stderr,
             flush=True,
         )
@@ -1408,6 +1893,17 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
             return self._decode_video_pyav(path_key, frame_indices)
         return self._decode_video_imageio(path_key, frame_indices)
 
+    def _decode_video_frame_map(
+        self,
+        shard: ShardSpec,
+        video_path: Path,
+        frame_indices: np.ndarray,
+        lock_path: Path,
+    ) -> dict[int, np.ndarray]:
+        unique_indices = np.asarray(sorted({int(index) for index in frame_indices.tolist()}), dtype=np.int64)
+        decoded = self._decode_episode_video(shard, video_path, unique_indices, lock_path)
+        return {int(index): decoded[offset] for offset, index in enumerate(unique_indices.tolist())}
+
     def _resize_video(self, video: np.ndarray) -> np.ndarray:
         if video.shape[1] == self.video_resolution_size and video.shape[2] == self.video_resolution_size:
             return video
@@ -1423,6 +1919,69 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
             )
         return resized
 
+    def _sample_context(self, index: int) -> dict[str, Any]:
+        window = self._window_from_index(index) if self.index_windows_lazily else self.windows[index]
+        shard = self.shards[window.shard_index]
+        self._schedule_shard_data_prefetch(window.shard_index)
+        shard_data = self._get_shard_data(window.shard_index)
+        episode = shard.episodes[window.episode_index]
+        row_base = episode.local_start + window.base_index
+        action_rows = episode.local_start + np.clip(
+            window.base_index + self._action_offsets,
+            0,
+            episode.length - 1,
+        )
+        compact_offsets = self._compact_offsets()
+        video_frames: dict[str, tuple[Path, np.ndarray, Path]] = {}
+        for slot in self.camera_slots:
+            frame_indices = episode.video_base_frames[slot] + np.clip(
+                window.base_index + compact_offsets,
+                0,
+                episode.length - 1,
+            )
+            video_path = self._ensure_episode_video(shard, episode.video_paths[slot])
+            lock_path = self._episode_video_lock_path(shard, video_path)
+            video_frames[slot] = (video_path, frame_indices.astype(np.int64, copy=False), lock_path)
+        return {
+            "window": window,
+            "shard": shard,
+            "shard_data": shard_data,
+            "episode": episode,
+            "row_base": row_base,
+            "action_rows": action_rows,
+            "video_frames": video_frames,
+        }
+
+    def _sample_from_context(
+        self,
+        context: dict[str, Any],
+        decoded_frames: dict[tuple[str, str], dict[int, np.ndarray]] | None = None,
+    ) -> dict[str, Any]:
+        shard_data = context["shard_data"]
+        shard = context["shard"]
+        episode = context["episode"]
+        row_base = context["row_base"]
+        action_rows = context["action_rows"]
+        videos = []
+        for slot in self.camera_slots:
+            video_path, frame_indices, lock_path = context["video_frames"][slot]
+            if decoded_frames is None:
+                videos.append(self._decode_episode_video(shard, video_path, frame_indices, lock_path))
+                continue
+            frame_map = decoded_frames[(slot, video_path.as_posix())]
+            videos.append(np.stack([frame_map[int(index)] for index in frame_indices], axis=0))
+        return {
+            "video_compact": np.stack(videos, axis=0),
+            "state": shard_data.state[row_base : row_base + 1].astype(np.float32),
+            "action": shard_data.action[action_rows].astype(np.float32),
+            "action_mask": shard_data.action_mask[action_rows].astype(bool),
+            "lang": episode.task,
+            "dataset_id": shard.dataset_id,
+            "episode_index": int(shard_data.episode_index[row_base]),
+            "frame_index": int(shard_data.frame_index[row_base]),
+            "task_index": int(shard_data.task_index[row_base]),
+        }
+
     def __getitem__(self, index: int) -> dict[str, Any]:
         start_time = time.monotonic()
         window: WindowSpec | None = None
@@ -1430,49 +1989,17 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
         episode: EpisodeSpec | None = None
         touched_videos: list[str] = []
         try:
-            window = self._window_from_index(index) if self.index_windows_lazily else self.windows[index]
-            shard = self.shards[window.shard_index]
-            shard_data = self._get_shard_data(window.shard_index)
-            episode = shard.episodes[window.episode_index]
-
-            row_base = episode.local_start + window.base_index
-            action_offsets = np.arange(self.action_horizon, dtype=np.int64)
-            action_rows = episode.local_start + np.clip(
-                window.base_index + action_offsets,
-                0,
-                episode.length - 1,
-            )
-            state = shard_data.state[row_base : row_base + 1].astype(np.float32)
-            action = shard_data.action[action_rows].astype(np.float32)
-            action_mask = shard_data.action_mask[action_rows].astype(bool)
-
-            compact_offsets = self._compact_offsets()
-            videos = []
+            context = self._sample_context(int(index))
+            window = context["window"]
+            shard = context["shard"]
+            episode = context["episode"]
             for slot in self.camera_slots:
-                video_frame_indices = episode.video_base_frames[slot] + np.clip(
-                    window.base_index + compact_offsets,
-                    0,
-                    episode.length - 1,
-                )
-                video_path = self._ensure_episode_video(shard, episode.video_paths[slot])
+                video_path, _, _ = context["video_frames"][slot]
                 try:
                     touched_videos.append(f"{slot}:{video_path.relative_to(shard.root).as_posix()}")
                 except ValueError:
                     touched_videos.append(f"{slot}:{video_path.as_posix()}")
-                videos.append(self._decode_video(video_path, video_frame_indices))
-            video_compact = np.stack(videos, axis=0)
-
-            return {
-                "video_compact": video_compact,
-                "state": state,
-                "action": action,
-                "action_mask": action_mask,
-                "lang": episode.task,
-                "dataset_id": shard.dataset_id,
-                "episode_index": int(shard_data.episode_index[row_base]),
-                "frame_index": int(shard_data.frame_index[row_base]),
-                "task_index": int(shard_data.task_index[row_base]),
-            }
+            return self._sample_from_context(context)
         finally:
             if self.slow_sample_log_seconds > 0:
                 elapsed = time.monotonic() - start_time
@@ -1498,6 +2025,28 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
                         file=sys.stderr,
                         flush=True,
                     )
+
+    def __getitems__(self, indices: list[int]) -> list[dict[str, Any]]:
+        contexts = [self._sample_context(int(index)) for index in indices]
+        frame_requests: dict[tuple[str, str], tuple[ShardSpec, Path, Path, list[np.ndarray]]] = {}
+        for context in contexts:
+            for slot in self.camera_slots:
+                video_path, frame_indices, lock_path = context["video_frames"][slot]
+                key = (slot, video_path.as_posix())
+                if key not in frame_requests:
+                    frame_requests[key] = (context["shard"], video_path, lock_path, [])
+                frame_requests[key][3].append(frame_indices)
+
+        decoded_frames: dict[tuple[str, str], dict[int, np.ndarray]] = {}
+        for key, (shard, video_path, lock_path, request_chunks) in frame_requests.items():
+            decoded_frames[key] = self._decode_video_frame_map(
+                shard,
+                video_path,
+                np.concatenate(request_chunks),
+                lock_path,
+            )
+
+        return [self._sample_from_context(context, decoded_frames) for context in contexts]
 
     def save_dataset_statistics(self, save_path: str | Path) -> None:
         save_path = Path(save_path)

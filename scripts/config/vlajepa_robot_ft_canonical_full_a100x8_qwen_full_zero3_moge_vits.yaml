@@ -139,6 +139,10 @@ datasets:
     camera_slots: [left, right, main]
     preferred_fps: []  # Empty means allow all manifest FPS values.
     allow_gcs_download: true
+    gcs_download_timeout_seconds: 900
+    gcs_download_retries: 3
+    gcs_download_retry_backoff_seconds: 5
+    data_file_prefetch_shards: 1
     max_shards: 0
     max_shards_per_dataset: 0
     max_windows: 0
@@ -147,10 +151,14 @@ datasets:
     sidecar_normalization: shard_q01_q99
     sidecar_dtype: float16
     video_decode_backend: pyav
-    pyav_reader_cache_size: 64
+    pyav_reader_cache_size: 8
+    pyav_thread_count: 1
     pyav_thread_type: SLICE
     pyav_decode_retry_extra_frames: 900
     pyav_corrupt_warning_limit: 20
+    video_cache_max_gb: 500
+    video_cache_prune_interval_downloads: 8
+    video_cache_prune_target_fraction: 0.9
     lazy_cache_shards: true
     index_windows_lazily: true
     prefetch_metadata_across_ranks: true
@@ -166,9 +174,12 @@ datasets:
     cpu_video_decode_drop_worker_images: true
     runtime_timing_logging: true
     per_device_batch_size: 26
-    num_workers: 2
-    prefetch_factor: 2
-    dataloader_timeout_seconds: 120
+    num_workers: 4
+    prefetch_factor: 1
+    dataloader_timeout_seconds: 0
+    enforce_worker_memory_budget: true
+    estimated_worker_memory_gb: 5.0
+    worker_memory_budget_fraction: 0.65
     reader_cache_size: 32
     sidecar_cache_size: 32
     slow_sample_log_seconds: 30

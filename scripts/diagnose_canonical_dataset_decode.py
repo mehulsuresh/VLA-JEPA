@@ -45,20 +45,38 @@ def _configure_cfg(args: argparse.Namespace) -> Any:
     data_cfg.shuffle_shards = args.shuffle_shards
     data_cfg.shuffle = False
     data_cfg.shuffle_seed = args.shuffle_seed
-    data_cfg.prefetch_metadata_across_ranks = False
-    data_cfg.metadata_index_cache = False
+    data_cfg.prefetch_metadata_across_ranks = args.metadata_prefetch_workers > 1
+    data_cfg.metadata_prefetch_workers = args.metadata_prefetch_workers
+    if args.metadata_index_cache is not None:
+        data_cfg.metadata_index_cache = args.metadata_index_cache
     data_cfg.lazy_cache_shards = True
     data_cfg.index_windows_lazily = True
     data_cfg.video_decode_backend = args.video_decode_backend
+    if args.pyav_thread_count is not None:
+        data_cfg.pyav_thread_count = args.pyav_thread_count
     data_cfg.reader_cache_size = args.reader_cache_size
     data_cfg.sidecar_cache_size = args.sidecar_cache_size
     data_cfg.slow_sample_log_seconds = args.slow_sample_log_seconds
+    if args.dataset_canonicalization_root:
+        data_cfg.dataset_canonicalization_root = args.dataset_canonicalization_root
+    if args.manifest_path:
+        data_cfg.manifest_path = args.manifest_path
+    if args.adapter_dir:
+        data_cfg.adapter_dir = args.adapter_dir
+    if args.cache_dir:
+        data_cfg.cache_dir = args.cache_dir
+    if args.metadata_index_cache_dir:
+        data_cfg.metadata_index_cache_dir = args.metadata_index_cache_dir
+    if args.bucket_root:
+        data_cfg.bucket_root = args.bucket_root
     data_cfg.manifest_path = _maybe_repo_relative(str(data_cfg.manifest_path), repo_root)
     data_cfg.adapter_dir = _maybe_repo_relative(str(data_cfg.adapter_dir), repo_root)
     data_cfg.dataset_canonicalization_root = _maybe_repo_relative(
         str(data_cfg.dataset_canonicalization_root), repo_root
     )
     data_cfg.cache_dir = _maybe_repo_relative(str(data_cfg.cache_dir), repo_root)
+    if hasattr(data_cfg, "metadata_index_cache_dir"):
+        data_cfg.metadata_index_cache_dir = _maybe_repo_relative(str(data_cfg.metadata_index_cache_dir), repo_root)
     return cfg
 
 
@@ -126,6 +144,20 @@ def _sample_indices(dataset_len: int, args: argparse.Namespace) -> list[int]:
     return [(args.start_index + idx * args.sample_stride) % dataset_len for idx in range(count)]
 
 
+def _process_thread_count(pid: int) -> int | None:
+    try:
+        return len(os.listdir(f"/proc/{pid}/task"))
+    except Exception:
+        return None
+
+
+def _iterator_worker_pids(iterator: Any) -> list[int]:
+    workers = getattr(iterator, "_workers", None)
+    if not workers:
+        return []
+    return [int(worker.pid) for worker in workers if getattr(worker, "pid", None) is not None]
+
+
 def _run_single_process_probe(dataset: Any, indices: list[int]) -> None:
     print(f"single_process_probe samples={len(indices)}", flush=True)
     for probe_index, dataset_index in enumerate(indices):
@@ -151,19 +183,24 @@ def _run_single_process_probe(dataset: Any, indices: list[int]) -> None:
 
 
 def _run_dataloader_probe(dataset: Any, args: argparse.Namespace) -> None:
-    if args.loader_batches <= 0:
+    if args.loader_batches == 0:
         return
+    full_sweep = args.loader_batches < 0
+    if full_sweep and (args.loader_start_index > 0 or args.loader_sample_stride != 1):
+        raise ValueError("--loader-batches -1 requires loader_start_index=0 and loader_sample_stride=1")
     loader_dataset = dataset
-    if args.loader_start_index > 0 or args.loader_sample_stride != 1:
+    if not full_sweep and (args.loader_start_index > 0 or args.loader_sample_stride != 1):
         subset_len = args.loader_batches * args.batch_size
         subset_indices = [
             (args.loader_start_index + idx * args.loader_sample_stride) % len(dataset)
             for idx in range(subset_len)
         ]
         loader_dataset = torch.utils.data.Subset(dataset, subset_indices)
+    expected_batches = len(loader_dataset) // args.batch_size
     print(
         "dataloader_probe "
-        f"batches={args.loader_batches} batch_size={args.batch_size} workers={args.num_workers} "
+        f"batches={'all' if full_sweep else args.loader_batches} expected_batches={expected_batches} "
+        f"batch_size={args.batch_size} workers={args.num_workers} "
         f"prefetch_factor={args.prefetch_factor} timeout={args.timeout_seconds} "
         f"pin_memory={args.pin_memory} persistent_workers={args.persistent_workers} "
         f"multiprocessing_context={args.multiprocessing_context} "
@@ -196,26 +233,59 @@ def _run_dataloader_probe(dataset: Any, args: argparse.Namespace) -> None:
         )
     loader = torch.utils.data.DataLoader(**loader_kwargs)
     iterator = iter(loader)
-    for batch_index in range(args.loader_batches):
+    batch_index = 0
+    start_total = time.monotonic()
+    while full_sweep or batch_index < args.loader_batches:
         start = time.monotonic()
-        batch = next(iterator)
+        try:
+            batch = next(iterator)
+        except StopIteration:
+            break
         batch_size = len(batch)
         elapsed = time.monotonic() - start
-        dataset_ids = sorted({str(sample.get("dataset_id")) for sample in batch})
-        frame_indices = [int(sample.get("frame_index", -1)) for sample in batch[: min(4, len(batch))]]
-        print(
-            json.dumps(
-                {
-                    "batch_index": batch_index,
-                    "batch_size": batch_size,
-                    "elapsed_fetch_sec": round(elapsed, 4),
-                    "dataset_ids": dataset_ids,
-                    "first_frame_indices": frame_indices,
-                },
-                sort_keys=True,
-            ),
-            flush=True,
+        should_log = (
+            batch_index < 5
+            or not full_sweep
+            or (args.progress_interval_batches > 0 and (batch_index + 1) % args.progress_interval_batches == 0)
+            or (full_sweep and batch_index + 1 == expected_batches)
         )
+        if should_log:
+            dataset_ids = sorted({str(sample.get("dataset_id")) for sample in batch})
+            frame_indices = [int(sample.get("frame_index", -1)) for sample in batch[: min(4, len(batch))]]
+            worker_pids = _iterator_worker_pids(iterator)
+            worker_thread_counts = {
+                str(pid): thread_count
+                for pid in worker_pids
+                if (thread_count := _process_thread_count(pid)) is not None
+            }
+            print(
+                json.dumps(
+                    {
+                        "batch_index": batch_index,
+                        "batch_size": batch_size,
+                        "dataset_ids": dataset_ids,
+                        "elapsed_fetch_sec": round(elapsed, 4),
+                        "elapsed_total_sec": round(time.monotonic() - start_total, 2),
+                        "expected_batches": expected_batches,
+                        "first_frame_indices": frame_indices,
+                        "worker_thread_counts": worker_thread_counts,
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+        batch_index += 1
+    print(
+        json.dumps(
+            {
+                "completed_batches": batch_index,
+                "elapsed_total_sec": round(time.monotonic() - start_total, 2),
+                "expected_batches": expected_batches,
+            },
+            sort_keys=True,
+        ),
+        flush=True,
+    )
 
 
 def main() -> None:
@@ -227,9 +297,18 @@ def main() -> None:
     parser.add_argument("--shuffle-shards", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--shuffle-seed", type=int, default=42)
     parser.add_argument("--video-decode-backend", default="decord", choices=["auto", "decord", "pyav", "imageio"])
+    parser.add_argument("--pyav-thread-count", default=None)
     parser.add_argument("--reader-cache-size", type=int, default=32)
     parser.add_argument("--sidecar-cache-size", type=int, default=8)
     parser.add_argument("--slow-sample-log-seconds", type=float, default=2.0)
+    parser.add_argument("--dataset-canonicalization-root", default="")
+    parser.add_argument("--manifest-path", default="")
+    parser.add_argument("--adapter-dir", default="")
+    parser.add_argument("--cache-dir", default="")
+    parser.add_argument("--metadata-index-cache", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--metadata-index-cache-dir", default="")
+    parser.add_argument("--metadata-prefetch-workers", type=int, default=1)
+    parser.add_argument("--bucket-root", default="")
     parser.add_argument("--show-shards", type=int, default=8)
     parser.add_argument("--samples", type=int, default=8)
     parser.add_argument("--start-index", type=int, default=0)
@@ -239,6 +318,7 @@ def main() -> None:
     parser.add_argument("--loader-start-index", type=int, default=0)
     parser.add_argument("--loader-sample-stride", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=26)
+    parser.add_argument("--progress-interval-batches", type=int, default=100)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--prefetch-factor", type=int, default=2)
     parser.add_argument("--timeout-seconds", type=int, default=120)
