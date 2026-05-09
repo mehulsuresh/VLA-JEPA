@@ -156,6 +156,21 @@ class VLATrainer(TrainerUtils):
         self.completed_steps = 0
         self.total_batch_size = self._calculate_total_batch_size()
 
+    @staticmethod
+    def _detach_metric_value(value):
+        if isinstance(value, torch.Tensor):
+            return value.detach()
+        return value
+
+    @staticmethod
+    def _metric_value_for_logging(value):
+        if isinstance(value, torch.Tensor):
+            detached = value.detach()
+            if detached.numel() == 1:
+                return detached.item()
+            return f"tensor(shape={tuple(detached.shape)}, dtype={detached.dtype}, device={detached.device})"
+        return value
+
     def prepare_training(self):
         rank = dist.get_rank() if dist.is_initialized() else 0
         seed = self.config.seed + rank if hasattr(self.config, "seed") else rank + 3047
@@ -257,16 +272,21 @@ class VLATrainer(TrainerUtils):
         """record training metrics"""
         if self.completed_steps % self.config.trainer.logging_frequency == 0:
             if dist.get_rank() == 0:
+                log_metrics = {
+                    key: self._metric_value_for_logging(value)
+                    for key, value in metrics.items()
+                }
+
                 # add learning rate
-                metrics["learning_rate"] = self.lr_scheduler.get_last_lr()[0]
+                log_metrics["learning_rate"] = self.lr_scheduler.get_last_lr()[0]
 
                 # add epoch info
-                metrics["epoch"] = round(self.completed_steps / len(self.vla_train_dataloader), 2)
+                log_metrics["epoch"] = round(self.completed_steps / len(self.vla_train_dataloader), 2)
 
                 # record to W&B
-                #wandb.log(metrics, step=self.completed_steps)
+                #wandb.log(log_metrics, step=self.completed_steps)
                 # debug output
-                logger.info(f"Step {self.completed_steps}, Loss: {metrics})")
+                logger.info(f"Step {self.completed_steps}, Loss: {log_metrics})")
 
     def _create_data_iterators(self):
         """create data iterators"""
@@ -423,7 +443,10 @@ class VLATrainer(TrainerUtils):
             self.optimizer.step()
             self.lr_scheduler.step()
         
-        result_dict = {k: v.item() for k, v in output_dict.items()}
+        result_dict = {
+            key: self._detach_metric_value(value)
+            for key, value in output_dict.items()
+        }
 
         return result_dict
 
