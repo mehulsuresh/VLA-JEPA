@@ -267,25 +267,18 @@ Depending on whether you are conducting pre-training or post-training, select th
 
 Ensure the following configurations are updated in the YAML file:
 - `framework.qwenvl.basevlm` and `framework.vj2_model.base_encoder` should be set to the paths of your respective checkpoints.
-- Update `datasets.vla_data.data_root_dir`, `datasets.video_data.video_dir`, and `datasets.video_data.text_file` to match the paths of your datasets.
+- Update `datasets.vla_data.data_root_dir` to match the path of your robot dataset.
 
 Once the configurations are updated, you can proceed to start the training process.
 
 <a id="optional-custom-dataset-training"></a>
 ### 3️⃣ Optional: Custom Dataset Training
-VLA-JEPA supports training on both robot datasets and human video datasets. You can run custom training by specifying robot data and/or human videos in your configuration.
+VLA-JEPA supports custom robot datasets by specifying robot data in your configuration.
 
 - **Robot Data:** We support training with datasets in the LeRobot v2.1 format. Convert your custom robot dataset to LeRobot v2.1 first.
   - Define a custom robot dataset config class in [`data_config.py`](./starVLA/dataloader/gr00t_lerobot/data_config.py) (its video-key fields should match the values predefined in `modality.json`; see [`modality.json`](./examples/Droid/modality.json)), and add a mapping from `robot_type` to the config class in `ROBOT_TYPE_CONFIG_MAP`.
   - `robot_type` is specified by `DATASET_NAMED_MIXTURES` in [`mixtures.py`](./starVLA/dataloader/gr00t_lerobot/mixtures.py): the dict key corresponds to `datasets.vla_data.data_mix` in the YAML training config, and the value is a tuple of sub-datasets. Each sub-dataset tuple contains three items: subdirectory, version, and `robot_type`. The `robot_type` selects the corresponding config for state/action normalization and other field alignment.
   - Finally, update the YAML config accordingly and launch training.
-
-- **Human Video:** You can implement your own DataLoader and update the mapping from `dataset_py` to a dataloader in `build_dataloader` within [`./starVLA/dataloader/__init__.py`](./starVLA/dataloader/__init__.py). Alternatively, use our video dataloader and configure `datasets.video_data` in the YAML file:
-  - dataset_py: use our video dataloader (no change needed)
-  - video_dir: directory that contains video files; each file is named by its `index`, and the suffix is controlled by `extensions`
-  - text_file: a headerless CSV where the first column is `index` and the second column is the video text description
-  - CoT_prompt: prompt template for latent-action training (no change needed)
-  - extensions: list of video file extensions
 
 
 
