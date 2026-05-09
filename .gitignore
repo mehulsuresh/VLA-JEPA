@@ -8,6 +8,7 @@ build/
 
 # Training artifacts
 checkpoints/
+logs/
 results/
 cache/
 .cache/
@@ -36,6 +37,7 @@ Thumbs.db
 # Environment
 .venv
 .env
+.pytest_cache/
 *.log
 # Local benchmarks
 tmp_bench/

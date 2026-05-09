@@ -193,7 +193,7 @@ def _configure_lerobot_worker(worker_id: int, *, torch_threads: int, cv2_threads
 
 
 
-def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe", model=None): # TODO now here only is get dataset, we need mv dataloader to here
+def build_dataloader(cfg, dataset_py="lerobot_datasets", model=None):
 
     if dataset_py == "lerobot_datasets":
         from starVLA.dataloader.lerobot_datasets import get_vla_dataset, collate_fn

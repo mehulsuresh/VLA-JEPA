@@ -36,7 +36,6 @@
 - [What Changed From Base VLA-JEPA](#what-changed-from-base-vla-jepa)
 - [Operational Defaults](#operational-defaults)
 - [Runbook](#runbook)
-- [🚧 TODO](#todo)
 - [⚙️ Environment Setup](#environment-setup)
 - [🔥 Training](#training)
   - [0️⃣ Pretrained Model Preparation](#pretrained-model-preparation)
@@ -207,14 +206,6 @@ checkpoints/<run_id>/checkpoints/steps_<N>/
 
 - This fork is verified primarily for the single-GPU training path used during development.
 - Multi-GPU handling has been substantially cleaned up, but should still be smoke-tested on real multi-GPU hardware before being treated as fully certified.
-
-<a id="todo"></a>
-## 🚧 TODO
-- [x] Partial training code
-- [x] LIBERO evaluation code
-- [x] LIBERO-Plus evaluation code
-- [x] SimplerEnv evaluation code
-- [x] Training codes for custom datasets
 
 <a id="environment-setup"></a>
 ## ⚙️ Environment Setup
