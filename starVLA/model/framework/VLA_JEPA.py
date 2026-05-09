@@ -776,11 +776,7 @@ class VLA_JEPA(baseframework):
                 prompt_replace_dict["{e_actions}"] = self.embodied_replace_prompt
 
         if prompt_template is None:
-            prompt_template = (
-                self.config.datasets.vla_data.get("CoT_prompt", "")
-                if has_actions
-                else self.config.datasets.video_data.get("CoT_prompt", "")
-            )
+            prompt_template = self.config.datasets.vla_data.get("CoT_prompt", "")
 
         return prompt_replace_dict, prompt_template
 

@@ -222,22 +222,6 @@ Key properties:
 
 This file is the main expression of the fork’s operational defaults.
 
-#### [`starVLA/config/training/starvla_cotrain_libero.yaml`](/home/mehul/work/vjepa/VLA-JEPA/starVLA/config/training/starvla_cotrain_libero.yaml)
-
-Cleanup only.
-
-Removes dead config field:
-
-- `trainer.max_grad_norm`
-
-#### [`starVLA/config/training/starvla_cotrain_oxe.yaml`](/home/mehul/work/vjepa/VLA-JEPA/starVLA/config/training/starvla_cotrain_oxe.yaml)
-
-Cleanup only.
-
-Removes dead config field:
-
-- `trainer.max_grad_norm`
-
 ---
 
 ### Dataloaders and Datasets

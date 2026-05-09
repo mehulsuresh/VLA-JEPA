@@ -19,8 +19,6 @@ try:
 except Exception:
     pass
 
-from starVLA.dataloader.vlm_datasets import make_vlm_dataloader
-
 logger = get_logger(__name__)
 
 
@@ -195,7 +193,7 @@ def _configure_lerobot_worker(worker_id: int, *, torch_threads: int, cv2_threads
 
 
 
-def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe", model=None): # TODO now here only is get dataset, we need mv dataloader to here
+def build_dataloader(cfg, dataset_py="lerobot_datasets", model=None):
 
     if dataset_py == "lerobot_datasets":
         from starVLA.dataloader.lerobot_datasets import get_vla_dataset, collate_fn
@@ -375,61 +373,3 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe", model=None): # TODO
                 output_dir.mkdir(parents=True, exist_ok=True)
                 vla_dataset.save_dataset_statistics(output_dir / "dataset_statistics.json")
         return vla_train_dataloader
-    elif dataset_py == "vlm_datasets":
-        vlm_data_module = make_vlm_dataloader(cfg)
-        vlm_train_dataloader = vlm_data_module["train_dataloader"]
-        
-        return vlm_train_dataloader
-    elif dataset_py == "lerobot_v3_datasets":
-        from starVLA.dataloader.lerobot_v3_datasets import get_lerobot_v3_datasets, collate_fn
-        vla_dataset_cfg = cfg.datasets.vla_data
-
-        vla_dataset = get_lerobot_v3_datasets(data_cfg=vla_dataset_cfg)
-
-        custom_collate_fn = partial(collate_fn, 
-            img_keys=cfg.datasets.vla_data.img_keys,
-            state_key=cfg.datasets.vla_data.state_key if "state_key" in cfg.datasets.vla_data else None,
-            action_key=cfg.datasets.vla_data.action_key if cfg.datasets.vla_data.action_key else None,
-            task_key=cfg.datasets.vla_data.task_key if cfg.datasets.vla_data.task_key else None,
-            resize_size=cfg.datasets.vla_data.resize_size)
-
-        vla_train_dataloader = DataLoader(
-            vla_dataset,
-            batch_size=cfg.datasets.vla_data.per_device_batch_size,
-            collate_fn=custom_collate_fn,
-            num_workers=16,
-            shuffle=True,
-        )      
-        #if dist.get_rank() == 0: 
-        #    for batch in vla_train_dataloader:
-        #        print(batch)
-        #        for k, v in batch.items():
-        #            print(f"{k}: {v.shape if isinstance(v, torch.Tensor) else v}")
-        #        break
-        return vla_train_dataloader
-    elif dataset_py == "video_datasets":
-        from starVLA.dataloader.video_datasets import VideoFolderDataset, collate_fn
-
-        video_dataset_cfg = cfg.datasets.video_data
-
-        video_dataset = VideoFolderDataset(
-            video_dir=video_dataset_cfg.video_dir,
-            text_file=video_dataset_cfg.text_file,
-            n_frames=cfg.framework.vj2_model.num_frames,
-            extensions=tuple(video_dataset_cfg.extensions),
-            crop_h_size=video_dataset_cfg.video_resolution_size,
-            crop_w_size=video_dataset_cfg.video_resolution_size,
-            max_retry=10,
-        )
-
-        video_collate_fn = partial(collate_fn, 
-            n_views=2,
-            resolution_size=video_dataset_cfg.resolution_size)
-        video_train_dataloader = DataLoader(
-            video_dataset,
-            batch_size=video_dataset_cfg.per_device_batch_size,
-            collate_fn=video_collate_fn,
-            num_workers=16,
-            shuffle=True,
-        )        
-        return video_train_dataloader
