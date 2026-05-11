@@ -114,6 +114,8 @@ class PreprocessedSubtaskCollator:
             "rabc_progress_delta",
         )
         for key in tensor_keys:
+            if not all(key in sample for sample in batch):
+                continue
             values = [sample[key] for sample in batch]
             dtype = torch.long if key in {"frame_index", "task_id", "future_task_id"} else torch.float32
             collated[key] = torch.tensor(values, dtype=dtype)
@@ -175,35 +177,60 @@ class PreprocessedSubtaskVLADataset(Dataset):
             frame_indices = metadata.get("frame_indices", [])
             if not frame_indices:
                 continue
-            required = {
-                "subtask_id",
-                "mistake_label",
-                "global_complexity_to_go",
-                "local_complexity_to_go",
-            }
-            if not required.issubset(labels):
-                continue
             if "action" not in features or "observation.state" not in features:
                 continue
 
             frame_indices = np.asarray(frame_indices, dtype=np.int32)
             actions = np.asarray(features["action"], dtype=np.float32)
             states = np.asarray(features["observation.state"], dtype=np.float32)
-            task_ids = np.asarray(labels["subtask_id"], dtype=np.int32)
-            raw_mistake_labels = np.asarray(labels["mistake_label"], dtype=np.float32)
-            mistake_labels = 1.0 - np.clip(raw_mistake_labels, 0.0, 1.0)
-            global_ctg = np.asarray(labels["global_complexity_to_go"], dtype=np.float32)
-            local_ctg = np.asarray(labels["local_complexity_to_go"], dtype=np.float32)
+            base_length = min(len(frame_indices), len(actions), len(states))
+            if base_length <= 0:
+                continue
 
-            length = min(
-                len(frame_indices),
-                len(actions),
-                len(states),
-                len(task_ids),
-                len(mistake_labels),
-                len(global_ctg),
-                len(local_ctg),
+            task_ids, has_task_labels = self._optional_label_array(
+                labels,
+                "subtask_id",
+                dtype=np.int32,
+                length=base_length,
+                default_value=0,
             )
+            raw_mistake_labels, has_mistake_labels = self._optional_label_array(
+                labels,
+                "mistake_label",
+                dtype=np.float32,
+                length=base_length,
+                default_value=0.0,
+            )
+            if has_mistake_labels:
+                mistake_labels = 1.0 - np.clip(raw_mistake_labels, 0.0, 1.0)
+            else:
+                mistake_labels = np.zeros(base_length, dtype=np.float32)
+            global_ctg, has_global_ctg = self._optional_label_array(
+                labels,
+                "global_complexity_to_go",
+                dtype=np.float32,
+                length=base_length,
+                default_value=np.nan,
+            )
+            local_ctg, has_local_ctg = self._optional_label_array(
+                labels,
+                "local_complexity_to_go",
+                dtype=np.float32,
+                length=base_length,
+                default_value=np.nan,
+            )
+
+            present_label_lengths = [
+                len(array)
+                for array, present in (
+                    (task_ids, has_task_labels),
+                    (raw_mistake_labels, has_mistake_labels),
+                    (global_ctg, has_global_ctg),
+                    (local_ctg, has_local_ctg),
+                )
+                if present
+            ]
+            length = min([base_length, *present_label_lengths])
             if length <= 0:
                 continue
 
@@ -216,6 +243,10 @@ class PreprocessedSubtaskVLADataset(Dataset):
                 "mistake_label": mistake_labels[:length],
                 "global_complexity_to_go": global_ctg[:length],
                 "local_complexity_to_go": local_ctg[:length],
+                "has_task_labels": has_task_labels,
+                "has_mistake_labels": has_mistake_labels,
+                "has_global_complexity_to_go": has_global_ctg,
+                "has_local_complexity_to_go": has_local_ctg,
             }
             self.records.extend((episode_dir.name, i) for i in range(length))
 
@@ -228,6 +259,19 @@ class PreprocessedSubtaskVLADataset(Dataset):
 
     def __len__(self) -> int:
         return len(self.records)
+
+    @staticmethod
+    def _optional_label_array(
+        labels: dict[str, Any],
+        key: str,
+        *,
+        dtype: Any,
+        length: int,
+        default_value: float | int,
+    ) -> tuple[np.ndarray, bool]:
+        if key in labels:
+            return np.asarray(labels[key], dtype=dtype), True
+        return np.full(length, default_value, dtype=dtype), False
 
     def _resolve_sampled_frame_index(self, row_idx: int, offset: int, frame_indices: np.ndarray) -> int:
         sampled_row_idx = min(max(row_idx + offset * self.video_frame_stride, 0), len(frame_indices) - 1)
@@ -278,9 +322,21 @@ class PreprocessedSubtaskVLADataset(Dataset):
     def save_dataset_statistics(self, output_path: str | Path) -> None:
         task_ids = []
         mistake_sum = 0.0
+        episodes_with_task_labels = 0
+        episodes_with_mistake_labels = 0
+        episodes_with_global_ctg = 0
+        episodes_with_local_ctg = 0
         for episode in self.episodes.values():
-            task_ids.extend(np.unique(episode["task_id"]).tolist())
-            mistake_sum += float(np.sum(episode["mistake_label"]))
+            if episode["has_task_labels"]:
+                task_ids.extend(np.unique(episode["task_id"]).tolist())
+                episodes_with_task_labels += 1
+            if episode["has_mistake_labels"]:
+                mistake_sum += float(np.sum(episode["mistake_label"]))
+                episodes_with_mistake_labels += 1
+            if episode["has_global_complexity_to_go"]:
+                episodes_with_global_ctg += 1
+            if episode["has_local_complexity_to_go"]:
+                episodes_with_local_ctg += 1
         stats = {
             "num_records": len(self.records),
             "num_episodes": len(self.episodes),
@@ -289,6 +345,10 @@ class PreprocessedSubtaskVLADataset(Dataset):
             "current_cameras": list(self.current_cameras),
             "unique_task_ids": sorted(set(int(x) for x in task_ids)),
             "mistake_positive_count": int(mistake_sum),
+            "episodes_with_task_labels": episodes_with_task_labels,
+            "episodes_with_mistake_labels": episodes_with_mistake_labels,
+            "episodes_with_global_complexity_to_go": episodes_with_global_ctg,
+            "episodes_with_local_complexity_to_go": episodes_with_local_ctg,
         }
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -353,7 +413,7 @@ class PreprocessedSubtaskVLADataset(Dataset):
         current_global_progress = 1.0 - self._safe_progress(current_global_ctg, 1.0)
         future_global_progress = 1.0 - self._safe_progress(future_global_ctg, 1.0)
 
-        return {
+        sample = {
             "action": action,
             "image": image_list,
             "lang": self.instruction_text,
@@ -368,10 +428,21 @@ class PreprocessedSubtaskVLADataset(Dataset):
             "future_global_complexity_to_go": future_global_ctg,
             "local_complexity_to_go": current_local_ctg,
             "future_local_complexity_to_go": future_local_ctg,
-            "rabc_global_progress": current_global_progress,
-            "rabc_future_global_progress": future_global_progress,
-            "rabc_global_progress_delta": future_global_progress - current_global_progress,
-            "rabc_stage_progress": current_stage_progress,
-            "rabc_future_stage_progress": future_stage_progress,
-            "rabc_progress_delta": future_stage_progress - current_stage_progress,
         }
+        if episode["has_global_complexity_to_go"]:
+            sample["rabc_global_progress"] = current_global_progress
+            sample["rabc_future_global_progress"] = future_global_progress
+            sample["rabc_global_progress_delta"] = future_global_progress - current_global_progress
+        else:
+            sample["rabc_global_progress"] = np.nan
+            sample["rabc_future_global_progress"] = np.nan
+            sample["rabc_global_progress_delta"] = np.nan
+        if episode["has_task_labels"] and episode["has_local_complexity_to_go"]:
+            sample["rabc_stage_progress"] = current_stage_progress
+            sample["rabc_future_stage_progress"] = future_stage_progress
+            sample["rabc_progress_delta"] = future_stage_progress - current_stage_progress
+        else:
+            sample["rabc_stage_progress"] = np.nan
+            sample["rabc_future_stage_progress"] = np.nan
+            sample["rabc_progress_delta"] = np.nan
+        return sample
