@@ -115,6 +115,43 @@ def _select_vjepa_camera_slots(
     return selected
 
 
+def _is_missing_value(value: Any) -> bool:
+    if value is None:
+        return True
+    try:
+        return bool(pd.isna(value))
+    except (TypeError, ValueError):
+        return False
+
+
+def _as_metadata_sequence(value: Any) -> list[Any]:
+    if _is_missing_value(value):
+        return []
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    return [value]
+
+
+def _as_optional_int(value: Any) -> int | None:
+    if _is_missing_value(value):
+        return None
+    return int(value)
+
+
+def _as_optional_float(value: Any) -> float | None:
+    if _is_missing_value(value):
+        return None
+    return float(value)
+
+
+def _clean_label_text(value: Any) -> str:
+    if _is_missing_value(value):
+        return ""
+    return str(value).strip()
+
+
 def _as_float_filter_set(value: Any) -> set[float]:
     disabled_tokens = {"", "*", "all", "any", "none", "off"}
     values = set()
@@ -427,12 +464,22 @@ def _load_canonical_modules(dataset_canonicalization_root: Path):
 
 
 @dataclass(frozen=True)
+class SubtaskSpan:
+    label: str
+    start_frame: int | None = None
+    end_frame: int | None = None
+    start_time: float | None = None
+    end_time: float | None = None
+
+
+@dataclass(frozen=True)
 class EpisodeSpec:
     local_start: int
     length: int
     task: str
     video_paths: dict[str, Path]
     video_base_frames: dict[str, int]
+    subtask_spans: tuple[SubtaskSpan, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -552,6 +599,8 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
         )
         self.qwen_camera_slots = _as_list(_cfg_get(data_cfg, "qwen_camera_slots", list(DEFAULT_QWEN_CAMERA_SLOTS)))
         self.camera_slots = self.vjepa_camera_slots
+        self.append_subtask_to_prompt = bool(_cfg_get(data_cfg, "append_subtask_to_prompt", True))
+        self.subtask_prompt_separator = str(_cfg_get(data_cfg, "subtask_prompt_separator", " | "))
         self.dataset_id_list = [str(value) for value in _as_list(_cfg_get(data_cfg, "dataset_ids", []))]
         self.dataset_ids = set(self.dataset_id_list)
         self.dataset_order = {dataset_id: idx for idx, dataset_id in enumerate(self.dataset_id_list)}
@@ -916,6 +965,8 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
             "camera_slots": self.camera_slots,
             "qwen_camera_slots": self.qwen_camera_slots,
             "vjepa_camera_slots": self.vjepa_camera_slots,
+            "append_subtask_to_prompt": self.append_subtask_to_prompt,
+            "subtask_prompt_separator": self.subtask_prompt_separator,
             "preferred_fps": sorted(self.preferred_fps),
             "allow_gcs_download": self.allow_gcs_download,
             "max_shards": self.max_shards,
@@ -1020,8 +1071,7 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
             )
             return shards
 
-    @staticmethod
-    def _episode_metadata_columns(camera_source_keys: dict[str, str]) -> list[str]:
+    def _episode_metadata_columns(self, camera_source_keys: dict[str, str]) -> list[str]:
         columns = [
             "data/chunk_index",
             "data/file_index",
@@ -1030,6 +1080,16 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
             "task_index",
             "tasks",
         ]
+        if self.append_subtask_to_prompt:
+            columns.extend(
+                [
+                    "subtask_names",
+                    "subtask_start_frames",
+                    "subtask_end_frames",
+                    "subtask_start_times",
+                    "subtask_end_times",
+                ]
+            )
         for source_key in camera_source_keys.values():
             columns.extend(
                 [
@@ -1196,6 +1256,73 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
             return max(remaining, 1) if remaining > 0 else 0
         return None
 
+    def _episode_subtask_spans(self, episode: dict[str, Any]) -> tuple[SubtaskSpan, ...]:
+        if not self.append_subtask_to_prompt:
+            return ()
+        names = _as_metadata_sequence(episode.get("subtask_names"))
+        if not names:
+            return ()
+        start_frames = _as_metadata_sequence(episode.get("subtask_start_frames"))
+        end_frames = _as_metadata_sequence(episode.get("subtask_end_frames"))
+        start_times = _as_metadata_sequence(episode.get("subtask_start_times"))
+        end_times = _as_metadata_sequence(episode.get("subtask_end_times"))
+        spans = []
+        for index, raw_label in enumerate(names):
+            label = _clean_label_text(raw_label)
+            if not label:
+                continue
+            spans.append(
+                SubtaskSpan(
+                    label=label,
+                    start_frame=_as_optional_int(start_frames[index]) if index < len(start_frames) else None,
+                    end_frame=_as_optional_int(end_frames[index]) if index < len(end_frames) else None,
+                    start_time=_as_optional_float(start_times[index]) if index < len(start_times) else None,
+                    end_time=_as_optional_float(end_times[index]) if index < len(end_times) else None,
+                )
+            )
+        return tuple(spans)
+
+    def _subtask_label_for_window(
+        self,
+        episode: EpisodeSpec,
+        base_index: int,
+        timestamp: float | None,
+    ) -> str | None:
+        if not episode.subtask_spans:
+            return None
+        frame = int(base_index)
+        fallback_label = None
+        for span in episode.subtask_spans:
+            if fallback_label is None:
+                fallback_label = span.label
+            if span.start_frame is not None and span.end_frame is not None:
+                if span.start_frame <= frame < span.end_frame:
+                    return span.label
+                continue
+            if span.start_time is not None and span.end_time is not None and timestamp is not None:
+                if span.start_time <= timestamp < span.end_time:
+                    return span.label
+                continue
+            if span.start_frame is None and span.end_frame is None and span.start_time is None and span.end_time is None:
+                return span.label
+        last_span = episode.subtask_spans[-1]
+        if last_span.end_frame is not None and frame == last_span.end_frame:
+            return last_span.label
+        if timestamp is not None and last_span.end_time is not None and timestamp == last_span.end_time:
+            return last_span.label
+        return None if len(episode.subtask_spans) > 1 else fallback_label
+
+    def _language_with_subtask(self, task: str, subtask_label: str | None) -> str:
+        task = str(task).strip()
+        label = _clean_label_text(subtask_label)
+        if not self.append_subtask_to_prompt or not label:
+            return task
+        if self.subtask_prompt_separator in task:
+            existing_label = task.rsplit(self.subtask_prompt_separator, 1)[-1].strip()
+            if existing_label == label:
+                return task
+        return f"{task}{self.subtask_prompt_separator}{label}"
+
     def _build_episode_specs(
         self,
         *,
@@ -1256,6 +1383,7 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
                     task=task,
                     video_paths=video_paths,
                     video_base_frames=video_base_frames,
+                    subtask_spans=self._episode_subtask_spans(episode),
                 )
             )
             projected_windows += max(1, (int(episode["length"]) + self.sample_stride - 1) // self.sample_stride)
@@ -2044,6 +2172,8 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
         episode = context["episode"]
         row_base = context["row_base"]
         action_rows = context["action_rows"]
+        window = context.get("window")
+        base_index = int(window.base_index) if window is not None else int(row_base - episode.local_start)
         video_cache: dict[str, np.ndarray] = {}
 
         def _video_for_slot(slot: str) -> np.ndarray:
@@ -2074,6 +2204,8 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
             [qwen_slot_to_index[slot] for slot in shard.vjepa_camera_slots],
             dtype=np.int64,
         )
+        timestamp = float(shard_data.timestamp[row_base]) if hasattr(shard_data, "timestamp") else None
+        subtask_label = self._subtask_label_for_window(episode, base_index, timestamp)
         return {
             "video_compact": np.stack(videos, axis=0),
             "qwen_frames": qwen_frames,
@@ -2084,11 +2216,12 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
             "state": shard_data.state[row_base : row_base + 1].astype(np.float32),
             "action": shard_data.action[action_rows].astype(np.float32),
             "action_mask": shard_data.action_mask[action_rows].astype(bool),
-            "lang": episode.task,
+            "lang": self._language_with_subtask(episode.task, subtask_label),
             "dataset_id": shard.dataset_id,
             "episode_index": int(shard_data.episode_index[row_base]),
             "frame_index": int(shard_data.frame_index[row_base]),
             "task_index": int(shard_data.task_index[row_base]),
+            "subtask_label": subtask_label or "",
         }
 
     def __getitem__(self, index: int) -> dict[str, Any]:

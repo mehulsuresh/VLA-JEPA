@@ -237,6 +237,8 @@ def test_canonical_sample_returns_qwen_frames_without_duplicate_qwen_views(tmp_p
     dataset = canonical.CanonicalSubsetVLADataset.__new__(canonical.CanonicalSubsetVLADataset)
     dataset.video_target_shift_steps = 1
     dataset._compact_offsets_cache = np.asarray([-1, 0, 1], dtype=np.int64)
+    dataset.append_subtask_to_prompt = True
+    dataset.subtask_prompt_separator = " | "
 
     main_path = tmp_path / "main.mp4"
     right_path = tmp_path / "right.mp4"
@@ -278,6 +280,10 @@ def test_canonical_sample_returns_qwen_frames_without_duplicate_qwen_views(tmp_p
         task="task",
         video_paths={"main": main_path, "right": right_path, "extra": extra_path},
         video_base_frames={"main": 0, "right": 0, "extra": 0},
+        subtask_spans=(
+            canonical.SubtaskSpan("approach object", start_frame=0, end_frame=1),
+            canonical.SubtaskSpan("grasp object", start_frame=1, end_frame=3),
+        ),
     )
     context = {
         "shard_data": shard_data,
@@ -317,3 +323,23 @@ def test_canonical_sample_returns_qwen_frames_without_duplicate_qwen_views(tmp_p
     assert sample["qwen_view_slots"] == ("main", "right", "extra")
     assert sample["vjepa_view_slots"] == ("right", "right", "main")
     assert sample["qwen_vjepa_view_indices"].tolist() == [1, 1, 0]
+    assert sample["lang"] == "task | grasp object"
+    assert sample["subtask_label"] == "grasp object"
+
+
+def test_canonical_subtask_spans_parse_episode_metadata():
+    dataset = canonical.CanonicalSubsetVLADataset.__new__(canonical.CanonicalSubsetVLADataset)
+    dataset.append_subtask_to_prompt = True
+
+    spans = dataset._episode_subtask_spans(
+        {
+            "subtask_names": ["open drawer", "pick item"],
+            "subtask_start_frames": [0, 15],
+            "subtask_end_frames": [15, 42],
+        }
+    )
+
+    assert spans == (
+        canonical.SubtaskSpan("open drawer", start_frame=0, end_frame=15),
+        canonical.SubtaskSpan("pick item", start_frame=15, end_frame=42),
+    )
