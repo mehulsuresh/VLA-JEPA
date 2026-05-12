@@ -18,12 +18,16 @@ import random
 from typing import Any, ClassVar
 
 import numpy as np
-import pytorch3d.transforms as pt
 import torch
 from pydantic import Field, PrivateAttr, field_validator, model_validator
 
 from ..schema import DatasetMetadata, RotationType, StateActionMetadata
 from .base import InvertibleModalityTransform, ModalityTransform
+
+try:
+    import pytorch3d.transforms as pt
+except ImportError:
+    from . import rotation_ops as pt
 
 
 class RotationTransform:
