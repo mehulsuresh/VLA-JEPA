@@ -1,86 +1,86 @@
 # VLA-JEPA Architecture
 
-This diagram reflects the current training pipeline in [`VLA_JEPA.py`](/home/mehul/work/vjepa/VLA-JEPA/starVLA/model/framework/VLA_JEPA.py) with the active single-GPU training config in [`vlajepa_robot_ft_trossen_vjepa21_small_5090_lerobot.yaml`](/home/mehul/work/vjepa/VLA-JEPA/scripts/config/vlajepa_robot_ft_trossen_vjepa21_small_5090_lerobot.yaml).
+This document tracks the active training and inference paths in [`VLA_JEPA.py`](/home/mehul/work/vjepa/VLA-JEPA/starVLA/model/framework/VLA_JEPA.py) under the canonical A100×8 production config in [`vlajepa_robot_ft_canonical_full_a100x8_qwen_full_zero3_moge_vits.yaml`](/home/mehul/work/vjepa/VLA-JEPA/scripts/config/vlajepa_robot_ft_canonical_full_a100x8_qwen_full_zero3_moge_vits.yaml). The companion SVG is [`assets/vla_jepa_architecture_research.svg`](/home/mehul/work/vjepa/VLA-JEPA/assets/vla_jepa_architecture_research.svg).
 
 ## Executive Summary
 
-- The model has two trainable heads on top of frozen perceptual backbones.
-- `Qwen 3.5 VL` converts images + language into multimodal token features.
-- `V-JEPA encoder` converts multi-view videos into latent video tokens.
-- `VJ predictor` learns a world-model objective by predicting future video latents.
-- `GR00T action head` learns a policy objective by predicting future robot actions.
-- Training jointly optimizes:
-  - `action_loss`
-  - `wm_loss`
+The model has three trainable heads on top of frozen perceptual backbones, and three losses combined into a single objective.
+
+- **Frozen perception**: Qwen 3.5 VL (frozen on small-scale configs, full-FT or LoRA on canonical), V-JEPA 2.1 encoder (always frozen), MoGe-2 teacher (frozen, optional).
+- **Trainable heads**: V-JEPA predictor (latent world model), DirectGeometryTeacherHead (MoGe feature distillation), GR00T DiT-B flow-matching action head.
+- **Joint objective**: `total_loss = action_loss + wm_scale(t) · wm_loss + 0.004 · depth_teacher_loss`, where `wm_scale(t)` linearly warms up from `wm_initial` to `wm` over `wm_warmup_steps`.
 
 ## Training Diagram
 
 ```mermaid
-flowchart LR
+flowchart TB
     classDef frozen fill:#e8f0ff,stroke:#4b6cb7,stroke-width:1.5px,color:#102040;
+    classDef teacher fill:#fff0e4,stroke:#c28556,stroke-width:1.5px,color:#4d2410;
     classDef trainable fill:#eaf8ea,stroke:#2f7d32,stroke-width:1.5px,color:#103010;
     classDef input fill:#fff6dd,stroke:#b78900,stroke-width:1.2px,color:#4d3b00;
     classDef loss fill:#fdeaea,stroke:#b23b3b,stroke-width:1.5px,color:#5a1010;
-    classDef output fill:#f4ecff,stroke:#7d4db3,stroke-width:1.2px,color:#30104d;
+    classDef total fill:#fff1f1,stroke:#d27e7e,stroke-width:2px,color:#5a1010;
 
-    subgraph Inputs["Inputs Per Sample"]
-        I1["3 camera views for Qwen<br/>RGB images + prompt text"]:::input
-        I2["3 camera views x 8 frames<br/>384x384 video clip"]:::input
-        I3["Robot state"]:::input
-        I4["Target future action chunk"]:::input
-        I5["RA-BC metadata<br/>progress / mistake labels"]:::input
+    subgraph PolicyLane["POLICY"]
+        direction TB
+        I_lang["Lang + last frame per view<br/>+ CoT prompt"]:::input
+        I_state["Robot state"]:::input
+        I_future["Future action chunk<br/>(target, horizon=50)"]:::input
+        I_rabc["RA-BC progress<br/>+ mistake labels"]:::input
+        Qwen["Qwen 3.5 VL · forward_features<br/>FROZEN · LoRA · FULL FT"]:::frozen
+        DiT["DiT-B Flow-Matching Action Head<br/>+ RTC prefix · + repeated_diffusion_steps<br/>+ RA-BC weighted per-sample loss"]:::trainable
+        L_act["action_loss"]:::loss
     end
 
-    subgraph QwenPath["Language + Image Path"]
-        Q1["Qwen 3.5 VL Interface<br/>multimodal feature extractor"]:::frozen
-        Q2["Extract action token embeddings"]:::output
-        Q3["Extract embodied action embeddings"]:::output
+    subgraph WMLane["WORLD MODEL"]
+        direction TB
+        I_video["Video clip<br/>3 views × 8 frames @ 384²"]:::input
+        VJEnc["V-JEPA 2.1 Encoder · vit-base-384<br/>FROZEN (no_grad)"]:::frozen
+        VJPred["VJ Predictor · VisionTransformerPredictorAC<br/>action-conditioned · corrected RoPE"]:::trainable
+        L_wm["wm_loss<br/>L1 in latent space<br/>warmup wm_initial → wm"]:::loss
     end
 
-    subgraph VideoPath["Video World-Model Path"]
-        V1["Frozen V-JEPA Encoder<br/>multi-view video latent tokens"]:::frozen
-        V2["Split latent tokens into:<br/>past context states + future target states"]:::output
-        V3["VJ Predictor<br/>VisionTransformerPredictorAC"]:::trainable
-        L1["wm_loss<br/>L1(predicted future states,<br/>ground-truth future states)"]:::loss
+    subgraph GeoLane["GEOMETRY DISTILLATION"]
+        direction TB
+        I_lastframe["Last frame per view<br/>(reused from video)"]:::input
+        MoGe["MoGe-2 Teacher · vit-s/l-normal<br/>FROZEN (no_grad)"]:::teacher
+        GeoHead["DirectGeometryTeacherHead<br/>MLP into MoGe feature space"]:::trainable
+        L_geo["depth_teacher_loss<br/>pooled L1 + cosine similarity<br/>scale 0.004"]:::loss
     end
 
-    subgraph ActionPath["Policy Path"]
-        A1["Repeat target chunk N times<br/>repeated_diffusion_steps = 4"]:::output
-        A2["GR00T Action Head<br/>state encoder + action encoder + DiT"]:::trainable
-        A3["Per-sample flow-matching loss"]:::output
-        A4["Optional RA-BC weighting"]:::output
-        L2["action_loss"]:::loss
-    end
+    Total["total_loss = 1.0 · action_loss<br/>+ wm_scale(t) · wm_loss<br/>+ 0.004 · depth_teacher_loss"]:::total
 
-    subgraph Final["Joint Optimization"]
-        F1["total_loss =<br/>1.0 * action_loss + 0.1 * wm_loss"]:::loss
-    end
+    %% Within-lane edges
+    I_lang --> Qwen
+    Qwen -->|"embodied-action tokens"| DiT
+    I_state --> DiT
+    I_future --> DiT
+    DiT --> L_act
+    I_rabc -->|"per-sample weighting"| L_act
 
-    I1 --> Q1
-    Q1 --> Q2
-    Q1 --> Q3
+    I_video --> VJEnc
+    VJEnc -->|"past latents"| VJPred
+    VJPred -->|"predicted future latents"| L_wm
+    VJEnc -->|"future latents (target)"| L_wm
 
-    I2 --> V1
-    V1 --> V2
-    V2 -->|"past latent states"| V3
-    Q2 -->|"action token conditioning"| V3
-    V3 -->|"predicted future latent states"| L1
-    V2 -->|"future latent states"| L1
+    I_lastframe --> MoGe
+    GeoHead -->|"projected features"| L_geo
+    MoGe -->|"teacher features (target)"| L_geo
 
-    I4 --> A1
-    A1 --> A2
-    I3 --> A2
-    Q3 -->|"policy conditioning"| A2
-    A2 --> A3
-    I5 --> A4
-    A3 --> A4
-    A4 --> L2
+    %% Cross-lane edges
+    Qwen -.->|"action tokens"| VJPred
+    Qwen -.->|"image-token hidden states"| GeoHead
+    I_video -.->|"last frame"| I_lastframe
 
-    L1 --> F1
-    L2 --> F1
+    %% Combined objective
+    L_act --> Total
+    L_wm --> Total
+    L_geo --> Total
 ```
 
 ## Inference Diagram
+
+Only Qwen 3.5 VL and the DiT action head run at inference. The V-JEPA encoder, V-JEPA predictor, MoGe teacher, and DirectGeometryHead are training-only.
 
 ```mermaid
 flowchart LR
@@ -90,30 +90,50 @@ flowchart LR
     classDef output fill:#f4ecff,stroke:#7d4db3,stroke-width:1.2px,color:#30104d;
 
     I1["Current images + instruction"]:::input --> Q1["Qwen 3.5 VL"]:::frozen
-    I2["Current robot state"]:::input --> A1["GR00T Action Head"]:::trainable
-    Q1 --> Q2["Embodied action embeddings"]:::output
-    Q2 --> A1
-    A1 --> O1["4 denoising / Euler steps<br/>from Gaussian noise to action chunk"]:::output
-    O1 --> O2["Predicted future action sequence"]:::output
+    I2["Current robot state"]:::input --> A1["DiT-B Action Head"]:::trainable
+    Q1 -->|"embodied-action tokens"| A1
+    A1 --> O1["num_inference_timesteps = 4<br/>Euler steps from Gaussian noise"]:::output
+    O1 --> O2["Future action chunk"]:::output
 ```
 
-## Current Freeze / Train Status
+## Freeze / Train Status (canonical defaults)
 
-- Frozen:
-  - `qwen_vl_interface.model`
-  - `vj_encoder`
-- Trainable:
-  - `vj_predictor`
-  - `action_model`
+| Module | Default state | Notes |
+| --- | --- | --- |
+| `qwen_vl_interface.model` (Qwen 3.5 VL) | Trainable on canonical full FT, frozen on 5090 lerobot, LoRA optional | Controlled by `trainer.freeze_modules` and `framework.qwenvl.lora.enabled` |
+| `vj_encoder` (V-JEPA 2.1) | Frozen | Wrapped in `no_grad` independent of Qwen state so the predictor still trains |
+| `vj_predictor` | Trainable | Corrected RoPE; legacy bug retained behind `framework.vj2_model.use_legacy_rope_bug` |
+| `action_model` (DiT-B + flow matching) | Trainable | Per-sample loss reduction so RA-BC weights apply |
+| `_depth_teacher` (MoGe-2) | Frozen | Loaded outside the trainable state dict |
+| `depth_teacher_aux_head` (DirectGeometryHead) | Trainable | Disabled by default; gated by `framework.depth_teacher_aux.enabled` |
 
-## Main Data Shapes
+## Loss Composition
 
-- Qwen inputs:
-  - multi-image prompt per sample
-- Video input:
-  - `B x V x T x C x H x W`
-  - current config uses `V=3`, `T=8`
-- Action head target:
-  - future action window of `7` steps
-- Inference denoising:
-  - `num_inference_timesteps = 4`
+Computed inside the trainer (not in the model body) so each scale is configurable and the world-model term can warm up:
+
+```text
+wm_scale(t) = lerp(wm_initial, wm, min(1, t / wm_warmup_steps))
+
+total_loss = trainer.loss_scale.action          * action_loss
+           + wm_scale(t)                        * wm_loss
+           + trainer.loss_scale.depth_teacher   * depth_teacher_loss
+```
+
+Canonical defaults: `action = 1.0`, `wm_initial = 0.3`, `wm = 0.1`, `wm_warmup_steps = 2000`, `depth_teacher = 0.004`.
+
+## Main Tensor Shapes
+
+- Video input: `B × V × T × C × H × W` with `V = 3`, `T = 8`, `H = W = 384`.
+- Action target: `action_horizon = 50`, `future_action_window_size = 49`.
+- Action token spans: `num_action_tokens_per_timestep = 8`.
+- Embodied-action token spans: `num_embodied_action_tokens_per_instruction = 32`.
+- Action-head inference: `num_inference_timesteps = 4` Euler steps.
+
+## Source Pointers
+
+- Framework: [`starVLA/model/framework/VLA_JEPA.py`](/home/mehul/work/vjepa/VLA-JEPA/starVLA/model/framework/VLA_JEPA.py)
+- Predictor: [`starVLA/model/modules/world_model/vj2_predictor.py`](/home/mehul/work/vjepa/VLA-JEPA/starVLA/model/modules/world_model/vj2_predictor.py)
+- Action head: [`starVLA/model/modules/action_model/GR00T_ActionHeader.py`](/home/mehul/work/vjepa/VLA-JEPA/starVLA/model/modules/action_model/GR00T_ActionHeader.py)
+- RTC training: [`starVLA/model/modules/action_model/rtc_training.py`](/home/mehul/work/vjepa/VLA-JEPA/starVLA/model/modules/action_model/rtc_training.py)
+- Geometry teacher: [`starVLA/model/modules/geometry_teacher.py`](/home/mehul/work/vjepa/VLA-JEPA/starVLA/model/modules/geometry_teacher.py)
+- Trainer (loss composition + RA-BC): [`starVLA/training/train_starvla.py`](/home/mehul/work/vjepa/VLA-JEPA/starVLA/training/train_starvla.py)

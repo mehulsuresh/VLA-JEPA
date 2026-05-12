@@ -44,6 +44,24 @@ def _freeze_backend_kwargs(video_backend_kwargs: dict | None) -> tuple[tuple[str
     return tuple(sorted(video_backend_kwargs.items()))
 
 
+def _configure_pyav_stream(container: av.container.InputContainer, video_backend_kwargs: dict | None):
+    stream = container.streams.video[0]
+    thread_count = int((video_backend_kwargs or {}).get("num_threads", 1))
+    if thread_count > 0:
+        stream.codec_context.thread_count = thread_count
+    return stream
+
+
+def _pyav_frame_time_seconds(frame: av.VideoFrame, stream, frame_index: int) -> float:
+    if frame.time is not None:
+        return float(frame.time)
+    if frame.pts is not None and stream.time_base is not None:
+        return float(frame.pts * stream.time_base)
+    if stream.average_rate:
+        return float(frame_index / float(stream.average_rate))
+    return float(frame_index)
+
+
 @lru_cache(maxsize=512)
 def _get_decord_frame_timestamps(
     video_path: str,
@@ -203,6 +221,33 @@ def get_frames_by_timestamps(
         
         frames = np.array(loaded_frames)
         return frames.transpose(0, 2, 3, 1)
+    elif video_backend == "pyav":
+        requested_ts = np.asarray(timestamps, dtype=np.float64)
+        if requested_ts.ndim == 0:
+            requested_ts = requested_ts[None]
+        if requested_ts.size == 0:
+            return np.empty((0, 0, 0, 3), dtype=np.uint8)
+
+        container = av.open(video_path)
+        try:
+            stream = _configure_pyav_stream(container, video_backend_kwargs)
+            fps = float(stream.average_rate) if stream.average_rate else 0.0
+            stop_after = float(np.max(requested_ts)) + (2.0 / fps if fps > 0 else 1.0)
+            frame_ts = []
+            frames = []
+            for frame_index, frame in enumerate(container.decode(stream)):
+                ts = _pyav_frame_time_seconds(frame, stream, frame_index)
+                frame_ts.append(ts)
+                frames.append(frame.to_ndarray(format="rgb24"))
+                if ts > stop_after:
+                    break
+        finally:
+            container.close()
+
+        if not frames:
+            raise ValueError(f"Unable to read frames from video file: {video_path}")
+        closest_indices = np.abs(np.asarray(frame_ts)[:, None] - requested_ts[None, :]).argmin(axis=0)
+        return np.stack([frames[int(index)] for index in closest_indices], axis=0)
     else:
         raise NotImplementedError
 
@@ -235,11 +280,12 @@ def get_all_frames(
         return frames.data.numpy(), frames.pts_seconds.numpy()
     elif video_backend == "pyav":
         container = av.open(video_path)
-        frames = []
-        for frame in container.decode(video=0):
-            frame = frame.to_ndarray(format="rgb24")
-            frames.append(frame)
-        frames = np.array(frames)
+        try:
+            stream = _configure_pyav_stream(container, video_backend_kwargs)
+            frames = [frame.to_ndarray(format="rgb24") for frame in container.decode(stream)]
+            frames = np.array(frames)
+        finally:
+            container.close()
     elif video_backend == "torchvision_av":
         # set backend and reader
         torchvision.set_video_backend("pyav")

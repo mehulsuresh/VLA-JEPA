@@ -20,6 +20,7 @@ def make_LeRobotSingleDataset(
     video_frame_stride: int = 1,
     data_cfg: dict | None = None,
     lerobot_version: str | None = None,
+    video_backend: str = "decord",
     video_backend_kwargs: dict | None = None,
 ) -> LeRobotSingleDataset:
     """
@@ -50,7 +51,7 @@ def make_LeRobotSingleDataset(
         modality_configs=modality_config,
         transforms=transforms,
         embodiment_tag=embodiment_tag,
-        video_backend="decord",
+        video_backend=video_backend,
         video_backend_kwargs=video_backend_kwargs,
         delete_pause_frame=delete_pause_frame,
         data_cfg=data_cfg,
@@ -75,6 +76,7 @@ def get_vla_dataset(
     data_root_dir = data_cfg.data_root_dir
     data_mix = data_cfg.data_mix
     video_backend_num_threads = max(1, int(data_cfg.get("video_backend_num_threads", 1)))
+    video_backend = str(data_cfg.get("video_backend", "decord"))
     video_backend_kwargs = {"num_threads": video_backend_num_threads}
     mixture_spec = DATASET_NAMED_MIXTURES[data_mix]
     included_datasets, filtered_mixture_spec = set(), []
@@ -100,6 +102,7 @@ def get_vla_dataset(
                                                           video_frame_stride=video_frame_stride,
                                                           data_cfg=data_cfg,
                                                           lerobot_version=d_version,
+                                                          video_backend=video_backend,
                                                           video_backend_kwargs=video_backend_kwargs), d_weight))
 
     return LeRobotMixtureDataset(

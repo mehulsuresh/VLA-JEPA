@@ -48,7 +48,9 @@ except ImportError:  # pragma: no cover
 STATE_DIM = 53
 ACTION_DIM = 49
 DEFAULT_BUCKET_ROOT = "gs://robotics-datasets-yonduai/raw"
-CANONICAL_INDEX_CACHE_VERSION = 1
+CANONICAL_INDEX_CACHE_VERSION = 2
+DEFAULT_QWEN_CAMERA_SLOTS = ("main", "left", "right", "extra")
+DEFAULT_VJEPA_CAMERA_SLOTS = ("left", "right", "main")
 
 
 def collate_fn(batch):
@@ -67,6 +69,87 @@ def _as_list(value: Any, default: list[Any] | None = None) -> list[Any]:
     if isinstance(value, str):
         return [value]
     return list(value)
+
+
+def _unique_preserve_order(values: list[str] | tuple[str, ...]) -> list[str]:
+    seen = set()
+    result = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        result.append(value)
+    return result
+
+
+def _select_qwen_camera_slots(
+    image_mapping: dict[str, str],
+    qwen_camera_slots: list[str] | tuple[str, ...] = DEFAULT_QWEN_CAMERA_SLOTS,
+) -> list[str]:
+    return [slot for slot in qwen_camera_slots if slot in image_mapping]
+
+
+def _select_vjepa_camera_slots(
+    image_mapping: dict[str, str],
+    vjepa_camera_slots: list[str] | tuple[str, ...] = DEFAULT_VJEPA_CAMERA_SLOTS,
+) -> list[str]:
+    available = [slot for slot in DEFAULT_QWEN_CAMERA_SLOTS if slot in image_mapping]
+    if not available:
+        return []
+
+    selected = []
+    for target_slot in vjepa_camera_slots:
+        if target_slot in image_mapping:
+            selected.append(target_slot)
+            continue
+        fallback_order = []
+        if target_slot == "left":
+            fallback_order = ["right", "main", "extra"]
+        elif target_slot == "right":
+            fallback_order = ["left", "main", "extra"]
+        elif target_slot == "main":
+            fallback_order = ["extra", "left", "right"]
+        else:
+            fallback_order = list(DEFAULT_QWEN_CAMERA_SLOTS)
+        selected.append(next((slot for slot in fallback_order if slot in image_mapping), available[0]))
+    return selected
+
+
+def _is_missing_value(value: Any) -> bool:
+    if value is None:
+        return True
+    try:
+        return bool(pd.isna(value))
+    except (TypeError, ValueError):
+        return False
+
+
+def _as_metadata_sequence(value: Any) -> list[Any]:
+    if _is_missing_value(value):
+        return []
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    return [value]
+
+
+def _as_optional_int(value: Any) -> int | None:
+    if _is_missing_value(value):
+        return None
+    return int(value)
+
+
+def _as_optional_float(value: Any) -> float | None:
+    if _is_missing_value(value):
+        return None
+    return float(value)
+
+
+def _clean_label_text(value: Any) -> str:
+    if _is_missing_value(value):
+        return ""
+    return str(value).strip()
 
 
 def _as_float_filter_set(value: Any) -> set[float]:
@@ -381,12 +464,22 @@ def _load_canonical_modules(dataset_canonicalization_root: Path):
 
 
 @dataclass(frozen=True)
+class SubtaskSpan:
+    label: str
+    start_frame: int | None = None
+    end_frame: int | None = None
+    start_time: float | None = None
+    end_time: float | None = None
+
+
+@dataclass(frozen=True)
 class EpisodeSpec:
     local_start: int
     length: int
     task: str
     video_paths: dict[str, Path]
     video_base_frames: dict[str, int]
+    subtask_spans: tuple[SubtaskSpan, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -417,6 +510,9 @@ class ShardSpec:
     sidecar_path: Path
     fps: float
     camera_source_keys: dict[str, str]
+    qwen_camera_slots: tuple[str, ...]
+    vjepa_camera_slots: tuple[str, ...]
+    decode_camera_slots: tuple[str, ...]
     task_map: dict[int, str]
     episodes: list[EpisodeSpec]
 
@@ -494,7 +590,17 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
         self.gcs_download_retry_backoff_seconds = max(
             0.0, float(_cfg_get(data_cfg, "gcs_download_retry_backoff_seconds", 5.0) or 0.0)
         )
-        self.camera_slots = _as_list(_cfg_get(data_cfg, "camera_slots", ["left", "right", "main"]))
+        self.vjepa_camera_slots = _as_list(
+            _cfg_get(
+                data_cfg,
+                "vjepa_camera_slots",
+                _cfg_get(data_cfg, "camera_slots", list(DEFAULT_VJEPA_CAMERA_SLOTS)),
+            )
+        )
+        self.qwen_camera_slots = _as_list(_cfg_get(data_cfg, "qwen_camera_slots", list(DEFAULT_QWEN_CAMERA_SLOTS)))
+        self.camera_slots = self.vjepa_camera_slots
+        self.append_subtask_to_prompt = bool(_cfg_get(data_cfg, "append_subtask_to_prompt", True))
+        self.subtask_prompt_separator = str(_cfg_get(data_cfg, "subtask_prompt_separator", " | "))
         self.dataset_id_list = [str(value) for value in _as_list(_cfg_get(data_cfg, "dataset_ids", []))]
         self.dataset_ids = set(self.dataset_id_list)
         self.dataset_order = {dataset_id: idx for idx, dataset_id in enumerate(self.dataset_id_list)}
@@ -721,7 +827,7 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
                 continue
             adapter_path = self.dataset_canonicalization_root / adapter_meta["path"]
             adapter = self._load_adapter_config(adapter_path)
-            if any(slot not in adapter.image_mapping for slot in self.camera_slots):
+            if not _select_qwen_camera_slots(adapter.image_mapping, self.qwen_camera_slots):
                 continue
             candidates.append((row, adapter_meta, adapter))
 
@@ -857,6 +963,10 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
             },
             "adapter_group_ids": sorted(self.adapter_group_ids),
             "camera_slots": self.camera_slots,
+            "qwen_camera_slots": self.qwen_camera_slots,
+            "vjepa_camera_slots": self.vjepa_camera_slots,
+            "append_subtask_to_prompt": self.append_subtask_to_prompt,
+            "subtask_prompt_separator": self.subtask_prompt_separator,
             "preferred_fps": sorted(self.preferred_fps),
             "allow_gcs_download": self.allow_gcs_download,
             "max_shards": self.max_shards,
@@ -961,8 +1071,7 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
             )
             return shards
 
-    @staticmethod
-    def _episode_metadata_columns(camera_source_keys: dict[str, str]) -> list[str]:
+    def _episode_metadata_columns(self, camera_source_keys: dict[str, str]) -> list[str]:
         columns = [
             "data/chunk_index",
             "data/file_index",
@@ -971,6 +1080,16 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
             "task_index",
             "tasks",
         ]
+        if self.append_subtask_to_prompt:
+            columns.extend(
+                [
+                    "subtask_names",
+                    "subtask_start_frames",
+                    "subtask_end_frames",
+                    "subtask_start_times",
+                    "subtask_end_times",
+                ]
+            )
         for source_key in camera_source_keys.values():
             columns.extend(
                 [
@@ -1035,7 +1154,12 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
                 continue
             default_task = _derive_default_task(str(row.get("dataset_id") or sid))
             task_map = _load_task_map(tasks_path, default_task)
-            camera_source_keys = {slot: adapter.image_mapping[slot] for slot in self.camera_slots}
+            qwen_camera_slots = tuple(_select_qwen_camera_slots(adapter.image_mapping, self.qwen_camera_slots))
+            vjepa_camera_slots = tuple(_select_vjepa_camera_slots(adapter.image_mapping, self.vjepa_camera_slots))
+            if not qwen_camera_slots or not vjepa_camera_slots:
+                continue
+            decode_camera_slots = tuple(_unique_preserve_order([*qwen_camera_slots, *vjepa_camera_slots]))
+            camera_source_keys = {slot: adapter.image_mapping[slot] for slot in decode_camera_slots}
             episodes = _read_parquet_selected(
                 episodes_path,
                 self._episode_metadata_columns(camera_source_keys),
@@ -1102,6 +1226,9 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
                     sidecar_path=sidecar_path,
                     fps=float(row.get("fps") or 30.0),
                     camera_source_keys=camera_source_keys,
+                    qwen_camera_slots=qwen_camera_slots,
+                    vjepa_camera_slots=vjepa_camera_slots,
+                    decode_camera_slots=decode_camera_slots,
                     task_map=task_map,
                     episodes=shard_episodes,
                 )
@@ -1128,6 +1255,73 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
             remaining = self.max_windows - used
             return max(remaining, 1) if remaining > 0 else 0
         return None
+
+    def _episode_subtask_spans(self, episode: dict[str, Any]) -> tuple[SubtaskSpan, ...]:
+        if not self.append_subtask_to_prompt:
+            return ()
+        names = _as_metadata_sequence(episode.get("subtask_names"))
+        if not names:
+            return ()
+        start_frames = _as_metadata_sequence(episode.get("subtask_start_frames"))
+        end_frames = _as_metadata_sequence(episode.get("subtask_end_frames"))
+        start_times = _as_metadata_sequence(episode.get("subtask_start_times"))
+        end_times = _as_metadata_sequence(episode.get("subtask_end_times"))
+        spans = []
+        for index, raw_label in enumerate(names):
+            label = _clean_label_text(raw_label)
+            if not label:
+                continue
+            spans.append(
+                SubtaskSpan(
+                    label=label,
+                    start_frame=_as_optional_int(start_frames[index]) if index < len(start_frames) else None,
+                    end_frame=_as_optional_int(end_frames[index]) if index < len(end_frames) else None,
+                    start_time=_as_optional_float(start_times[index]) if index < len(start_times) else None,
+                    end_time=_as_optional_float(end_times[index]) if index < len(end_times) else None,
+                )
+            )
+        return tuple(spans)
+
+    def _subtask_label_for_window(
+        self,
+        episode: EpisodeSpec,
+        base_index: int,
+        timestamp: float | None,
+    ) -> str | None:
+        if not episode.subtask_spans:
+            return None
+        frame = int(base_index)
+        fallback_label = None
+        for span in episode.subtask_spans:
+            if fallback_label is None:
+                fallback_label = span.label
+            if span.start_frame is not None and span.end_frame is not None:
+                if span.start_frame <= frame < span.end_frame:
+                    return span.label
+                continue
+            if span.start_time is not None and span.end_time is not None and timestamp is not None:
+                if span.start_time <= timestamp < span.end_time:
+                    return span.label
+                continue
+            if span.start_frame is None and span.end_frame is None and span.start_time is None and span.end_time is None:
+                return span.label
+        last_span = episode.subtask_spans[-1]
+        if last_span.end_frame is not None and frame == last_span.end_frame:
+            return last_span.label
+        if timestamp is not None and last_span.end_time is not None and timestamp == last_span.end_time:
+            return last_span.label
+        return None if len(episode.subtask_spans) > 1 else fallback_label
+
+    def _language_with_subtask(self, task: str, subtask_label: str | None) -> str:
+        task = str(task).strip()
+        label = _clean_label_text(subtask_label)
+        if not self.append_subtask_to_prompt or not label:
+            return task
+        if self.subtask_prompt_separator in task:
+            existing_label = task.rsplit(self.subtask_prompt_separator, 1)[-1].strip()
+            if existing_label == label:
+                return task
+        return f"{task}{self.subtask_prompt_separator}{label}"
 
     def _build_episode_specs(
         self,
@@ -1189,6 +1383,7 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
                     task=task,
                     video_paths=video_paths,
                     video_base_frames=video_base_frames,
+                    subtask_spans=self._episode_subtask_spans(episode),
                 )
             )
             projected_windows += max(1, (int(episode["length"]) + self.sample_stride - 1) // self.sample_stride)
@@ -1645,6 +1840,10 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
         )
         return self._compact_offsets_cache
 
+    def _qwen_frame_offset(self) -> int:
+        context_horizon = len(self._compact_offsets()) - self.video_target_shift_steps
+        return max(context_horizon - 1, 0)
+
     def _decode_video_decord(self, path_key: str, frame_indices: np.ndarray) -> np.ndarray:
         if decord is None:
             raise RuntimeError("decord is required for canonical Decord video decoding.")
@@ -1932,16 +2131,26 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
             episode.length - 1,
         )
         compact_offsets = self._compact_offsets()
+        qwen_frame_offset = self._qwen_frame_offset()
+        qwen_compact_offset = compact_offsets[qwen_frame_offset]
+        vjepa_decode_slots = set(shard.vjepa_camera_slots)
         video_frames: dict[str, tuple[Path, np.ndarray, Path]] = {}
-        for slot in self.camera_slots:
+        qwen_frame_positions: dict[str, int] = {}
+        for slot in shard.decode_camera_slots:
+            offsets = (
+                compact_offsets
+                if slot in vjepa_decode_slots
+                else np.asarray([qwen_compact_offset], dtype=np.int64)
+            )
             frame_indices = episode.video_base_frames[slot] + np.clip(
-                window.base_index + compact_offsets,
+                window.base_index + offsets,
                 0,
                 episode.length - 1,
             )
             video_path = self._ensure_episode_video(shard, episode.video_paths[slot])
             lock_path = self._episode_video_lock_path(shard, video_path)
             video_frames[slot] = (video_path, frame_indices.astype(np.int64, copy=False), lock_path)
+            qwen_frame_positions[slot] = qwen_frame_offset if slot in vjepa_decode_slots else 0
         return {
             "window": window,
             "shard": shard,
@@ -1950,6 +2159,7 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
             "row_base": row_base,
             "action_rows": action_rows,
             "video_frames": video_frames,
+            "qwen_frame_positions": qwen_frame_positions,
         }
 
     def _sample_from_context(
@@ -1962,24 +2172,56 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
         episode = context["episode"]
         row_base = context["row_base"]
         action_rows = context["action_rows"]
-        videos = []
-        for slot in self.camera_slots:
+        window = context.get("window")
+        base_index = int(window.base_index) if window is not None else int(row_base - episode.local_start)
+        video_cache: dict[str, np.ndarray] = {}
+
+        def _video_for_slot(slot: str) -> np.ndarray:
+            cached = video_cache.get(slot)
+            if cached is not None:
+                return cached
             video_path, frame_indices, lock_path = context["video_frames"][slot]
             if decoded_frames is None:
-                videos.append(self._decode_episode_video(shard, video_path, frame_indices, lock_path))
-                continue
-            frame_map = decoded_frames[(slot, video_path.as_posix())]
-            videos.append(np.stack([frame_map[int(index)] for index in frame_indices], axis=0))
+                video = self._decode_episode_video(shard, video_path, frame_indices, lock_path)
+            else:
+                frame_map = decoded_frames[(slot, video_path.as_posix())]
+                video = np.stack([frame_map[int(index)] for index in frame_indices], axis=0)
+            video_cache[slot] = video
+            return video
+
+        videos = [_video_for_slot(slot) for slot in shard.vjepa_camera_slots]
+        qwen_frame_positions = context.get("qwen_frame_positions", {})
+        default_qwen_frame_position = self._qwen_frame_offset()
+        qwen_frames = np.stack(
+            [
+                _video_for_slot(slot)[int(qwen_frame_positions.get(slot, default_qwen_frame_position))]
+                for slot in shard.qwen_camera_slots
+            ],
+            axis=0,
+        )
+        qwen_slot_to_index = {slot: index for index, slot in enumerate(shard.qwen_camera_slots)}
+        qwen_vjepa_view_indices = np.asarray(
+            [qwen_slot_to_index[slot] for slot in shard.vjepa_camera_slots],
+            dtype=np.int64,
+        )
+        timestamp = float(shard_data.timestamp[row_base]) if hasattr(shard_data, "timestamp") else None
+        subtask_label = self._subtask_label_for_window(episode, base_index, timestamp)
         return {
             "video_compact": np.stack(videos, axis=0),
+            "qwen_frames": qwen_frames,
+            "qwen_view_slots": tuple(shard.qwen_camera_slots),
+            "qwen_view_count": len(shard.qwen_camera_slots),
+            "vjepa_view_slots": tuple(shard.vjepa_camera_slots),
+            "qwen_vjepa_view_indices": qwen_vjepa_view_indices,
             "state": shard_data.state[row_base : row_base + 1].astype(np.float32),
             "action": shard_data.action[action_rows].astype(np.float32),
             "action_mask": shard_data.action_mask[action_rows].astype(bool),
-            "lang": episode.task,
+            "lang": self._language_with_subtask(episode.task, subtask_label),
             "dataset_id": shard.dataset_id,
             "episode_index": int(shard_data.episode_index[row_base]),
             "frame_index": int(shard_data.frame_index[row_base]),
             "task_index": int(shard_data.task_index[row_base]),
+            "subtask_label": subtask_label or "",
         }
 
     def __getitem__(self, index: int) -> dict[str, Any]:
@@ -1993,7 +2235,7 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
             window = context["window"]
             shard = context["shard"]
             episode = context["episode"]
-            for slot in self.camera_slots:
+            for slot in context["video_frames"]:
                 video_path, _, _ = context["video_frames"][slot]
                 try:
                     touched_videos.append(f"{slot}:{video_path.relative_to(shard.root).as_posix()}")
@@ -2030,7 +2272,7 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
         contexts = [self._sample_context(int(index)) for index in indices]
         frame_requests: dict[tuple[str, str], tuple[ShardSpec, Path, Path, list[np.ndarray]]] = {}
         for context in contexts:
-            for slot in self.camera_slots:
+            for slot in context["video_frames"]:
                 video_path, frame_indices, lock_path = context["video_frames"][slot]
                 key = (slot, video_path.as_posix())
                 if key not in frame_requests:
@@ -2066,7 +2308,7 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
                 window_counts[dataset_id] = window_counts.get(dataset_id, 0) + 1
         for shard in self.shards:
             video_files: dict[str, list[str]] = {}
-            for slot in self.camera_slots:
+            for slot in shard.decode_camera_slots:
                 video_files[slot] = sorted(
                     {
                         episode.video_paths[slot].as_posix()
@@ -2085,6 +2327,9 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
                     "local_data_file": shard.data_path.as_posix(),
                     "sidecar_file": shard.sidecar_path.as_posix(),
                     "video_files": video_files,
+                    "qwen_camera_slots": list(shard.qwen_camera_slots),
+                    "vjepa_camera_slots": list(shard.vjepa_camera_slots),
+                    "decode_camera_slots": list(shard.decode_camera_slots),
                     "fps": shard.fps,
                     "episodes": len(shard.episodes),
                 }
@@ -2098,6 +2343,8 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
                 "state_dim": STATE_DIM,
                 "action_dim": ACTION_DIM,
                 "normalization": self.sidecar_normalization,
+                "qwen_camera_slots": self.qwen_camera_slots,
+                "vjepa_camera_slots": self.vjepa_camera_slots,
                 "exclude_dataset_ids": self.exclude_dataset_id_list,
                 "exclude_sids": self.exclude_sid_list,
                 "windows_per_dataset": window_counts,
@@ -2108,6 +2355,8 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
                         "revision": shard.revision,
                         "adapter_group_id": shard.adapter_group_id,
                         "data_file": shard.data_relative_path,
+                        "qwen_camera_slots": list(shard.qwen_camera_slots),
+                        "vjepa_camera_slots": list(shard.vjepa_camera_slots),
                         "episodes": len(shard.episodes),
                     }
                     for shard in self.shards
@@ -2130,6 +2379,8 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
                     "state_dim": STATE_DIM,
                     "action_dim": ACTION_DIM,
                     "normalization": self.sidecar_normalization,
+                    "qwen_camera_slots": self.qwen_camera_slots,
+                    "vjepa_camera_slots": self.vjepa_camera_slots,
                     "exclude_dataset_ids": self.exclude_dataset_id_list,
                     "exclude_sids": self.exclude_sid_list,
                     "windows_per_dataset": window_counts,
