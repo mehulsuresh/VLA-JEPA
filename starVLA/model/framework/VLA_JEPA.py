@@ -14,7 +14,7 @@ import math
 from collections import OrderedDict
 from pathlib import Path
 import time
-from typing import List, Optional, Tuple
+from typing import List, Optional, Sequence, Tuple
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -651,6 +651,8 @@ class VLA_JEPA(baseframework):
         qwen_inputs: dict[str, torch.Tensor],
         batch_size: int,
         num_views: int,
+        qwen_view_counts: Optional[Sequence[int]] = None,
+        qwen_selected_view_indices: Optional[Sequence[Sequence[int]]] = None,
     ) -> tuple[torch.Tensor, tuple[int, int]]:
         input_ids = qwen_inputs["input_ids"]
         image_mask = input_ids == int(self._qwen_image_token_id)
@@ -663,11 +665,15 @@ class VLA_JEPA(baseframework):
             )
 
         image_grid_thw = image_grid_thw.detach().to(device="cpu", dtype=torch.long)
-        if image_grid_thw.shape[0] != batch_size * num_views:
+        expected_grid_rows = (
+            sum(int(count) for count in qwen_view_counts)
+            if qwen_view_counts is not None
+            else batch_size * num_views
+        )
+        if image_grid_thw.shape[0] != expected_grid_rows:
             raise RuntimeError(
-                "depth_teacher_aux is wired to the current Qwen builder, which passes exactly the "
-                f"last frame of each view ({batch_size * num_views} images). Found "
-                f"{image_grid_thw.shape[0]} Qwen image grids instead."
+                "depth_teacher_aux Qwen image-grid count did not match view metadata: "
+                f"expected {expected_grid_rows}, found {image_grid_thw.shape[0]}"
             )
         image_shapes = []
         token_counts = []
@@ -689,6 +695,62 @@ class VLA_JEPA(baseframework):
             )
         token_grid_hw = image_shapes[0]
         per_view_tokens = int(token_counts[0])
+        if qwen_view_counts is not None or qwen_selected_view_indices is not None:
+            if qwen_view_counts is None or qwen_selected_view_indices is None:
+                raise RuntimeError("depth_teacher_aux variable-view alignment requires both view counts and selected indices")
+            if len(qwen_view_counts) != batch_size or len(qwen_selected_view_indices) != batch_size:
+                raise RuntimeError(
+                    "depth_teacher_aux variable-view metadata batch size mismatch: "
+                    f"batch_size={batch_size}, view_counts={len(qwen_view_counts)}, "
+                    f"selected={len(qwen_selected_view_indices)}"
+                )
+            if sum(int(count) for count in qwen_view_counts) != len(token_counts):
+                raise RuntimeError(
+                    "depth_teacher_aux qwen_view_counts did not match image_grid_thw rows: "
+                    f"sum={sum(int(count) for count in qwen_view_counts)}, grids={len(token_counts)}"
+                )
+
+            image_positions = [torch.nonzero(image_mask[row], as_tuple=False).flatten() for row in range(batch_size)]
+            selected_positions = []
+            grid_offset = 0
+            sample_counts = image_mask.sum(dim=1).detach().cpu().tolist()
+            for row, raw_count in enumerate(qwen_view_counts):
+                view_count = int(raw_count)
+                selected_indices = [int(index) for index in qwen_selected_view_indices[row]]
+                if len(selected_indices) != num_views:
+                    raise RuntimeError(
+                        "depth_teacher_aux selected-view metadata must match V-JEPA view count: "
+                        f"expected={num_views}, got={len(selected_indices)}"
+                    )
+                per_sample_token_counts = token_counts[grid_offset : grid_offset + view_count]
+                expected_tokens = sum(per_sample_token_counts)
+                if int(sample_counts[row]) != expected_tokens:
+                    raise RuntimeError(
+                        "depth_teacher_aux image token counts did not match variable-view metadata: "
+                        f"sample={row}, expected={expected_tokens}, got={int(sample_counts[row])}"
+                    )
+                offsets = np.cumsum([0, *per_sample_token_counts]).tolist()
+                row_positions = []
+                for selected_index in selected_indices:
+                    if selected_index < 0 or selected_index >= view_count:
+                        raise RuntimeError(
+                            "depth_teacher_aux selected Qwen view index is out of range: "
+                            f"sample={row}, selected={selected_index}, view_count={view_count}"
+                        )
+                    start = int(offsets[selected_index])
+                    end = int(offsets[selected_index + 1])
+                    row_positions.append(image_positions[row][start:end])
+                selected_positions.append(torch.cat(row_positions, dim=0))
+                grid_offset += view_count
+
+            image_positions = torch.stack(selected_positions, dim=0)
+            gathered = torch.gather(
+                last_hidden,
+                dim=1,
+                index=image_positions.unsqueeze(-1).expand(-1, -1, last_hidden.shape[-1]),
+            )
+            return gathered.reshape(batch_size * num_views, per_view_tokens, last_hidden.shape[-1]), token_grid_hw
+
         expected_per_sample = per_view_tokens * num_views
         sample_counts = image_mask.sum(dim=1)
         if not torch.all(sample_counts == expected_per_sample):
@@ -712,8 +774,9 @@ class VLA_JEPA(baseframework):
         *,
         device: torch.device,
     ) -> torch.Tensor:
-        # `_build_qwen_inputs_from_video_tensor` also uses only `batch_videos[:, :, -1]`,
-        # so the direct feature targets stay one-to-one with Qwen image tokens.
+        # The teacher follows the fixed V-JEPA view tensor. When Qwen sees a
+        # different set of real views, qwen_selected_view_indices maps its image
+        # tokens back onto these V-JEPA views before the auxiliary loss.
         if isinstance(batch_videos, np.ndarray):
             frames = torch.from_numpy(np.ascontiguousarray(batch_videos[:, :, -1]))
         else:
@@ -731,6 +794,8 @@ class VLA_JEPA(baseframework):
         batch_size: int,
         num_views: int,
         train_step: Optional[int] = None,
+        qwen_view_counts: Optional[Sequence[int]] = None,
+        qwen_selected_view_indices: Optional[Sequence[Sequence[int]]] = None,
     ) -> dict[str, torch.Tensor]:
         if not self.depth_teacher_aux_enabled:
             return {}
@@ -739,6 +804,8 @@ class VLA_JEPA(baseframework):
             qwen_inputs=qwen_inputs,
             batch_size=batch_size,
             num_views=num_views,
+            qwen_view_counts=qwen_view_counts,
+            qwen_selected_view_indices=qwen_selected_view_indices,
         )
         detach_steps = self.resolve_depth_teacher_detach_steps()
         step = 0 if train_step is None else int(train_step)
@@ -835,6 +902,77 @@ class VLA_JEPA(baseframework):
             has_actions=has_actions,
             stage="_build_qwen_inputs_from_examples",
         )
+        return qwen_inputs
+
+    def _qwen_frame_batch_to_chw_tensor(self, frames: np.ndarray | torch.Tensor) -> torch.Tensor:
+        if isinstance(frames, torch.Tensor):
+            tensor = frames
+        else:
+            tensor = torch.from_numpy(np.ascontiguousarray(frames))
+        if tensor.ndim != 4:
+            raise ValueError(f"Expected qwen_frames with shape [V,H,W,C] or [V,C,H,W], got {tuple(tensor.shape)}")
+        if tensor.shape[-1] in {1, 3}:
+            tensor = tensor.permute(0, 3, 1, 2).contiguous()
+        elif tensor.shape[1] not in {1, 3}:
+            raise ValueError(f"Unable to infer qwen_frames channel dimension from shape {tuple(tensor.shape)}")
+        return tensor
+
+    def _build_qwen_inputs_from_qwen_frames(
+        self,
+        qwen_frame_batches: Sequence[np.ndarray | torch.Tensor],
+        instructions: List[str],
+        has_actions: bool,
+        prompt_replace_dict: Optional[dict[str, str]] = None,
+        prompt_template: Optional[str] = None,
+        *,
+        return_timing: bool = False,
+    ) -> dict[str, torch.Tensor] | tuple[dict[str, torch.Tensor], dict[str, float]]:
+        build_start = time.perf_counter()
+        frame_tensors = [self._qwen_frame_batch_to_chw_tensor(frames) for frames in qwen_frame_batches]
+        view_counts = [int(tensor.shape[0]) for tensor in frame_tensors]
+
+        if len(set(view_counts)) == 1:
+            batch_frames = torch.stack(frame_tensors, dim=0)
+            return self._build_qwen_inputs_from_video_tensor(
+                batch_videos=batch_frames.unsqueeze(2),
+                instructions=instructions,
+                has_actions=has_actions,
+                prompt_replace_dict=prompt_replace_dict,
+                prompt_template=prompt_template,
+                return_timing=return_timing,
+            )
+
+        prompt_replace_dict, prompt_template = self._resolve_qwen_prompt_args(
+            has_actions=has_actions,
+            prompt_replace_dict=prompt_replace_dict,
+            prompt_template=prompt_template,
+        )
+        image_batches = []
+        for tensor in frame_tensors:
+            if tensor.dtype != torch.uint8:
+                tensor = tensor.clamp(0, 255).round().to(torch.uint8)
+            tensor = tensor.detach().cpu()
+            image_batches.append([
+                frame.permute(1, 2, 0).contiguous().numpy()
+                for frame in tensor
+            ])
+
+        qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(
+            images=image_batches,
+            instructions=instructions,
+            prompt_replace_dict=prompt_replace_dict,
+            prompt_template=prompt_template,
+        )
+        self._validate_qwen_action_prompt_tokens(
+            qwen_inputs,
+            has_actions=has_actions,
+            stage="_build_qwen_inputs_from_qwen_frames[variable_views]",
+        )
+        if return_timing:
+            return qwen_inputs, {
+                "video_tensor_to_cuda_time": 0.0,
+                "qwen_input_build_time": time.perf_counter() - build_start,
+            }
         return qwen_inputs
 
     def _build_qwen_inputs_from_video_tensor(
@@ -1597,6 +1735,8 @@ class VLA_JEPA(baseframework):
             "predictor_action_head_time": 0.0,
         }
         batch_videos, batch_target_videos = self._extract_training_videos(examples)
+        qwen_view_counts = None
+        qwen_selected_view_indices = None
         if isinstance(examples, dict):
             actions = examples.get("action")
             action_mask = examples.get("action_mask")
@@ -1618,8 +1758,27 @@ class VLA_JEPA(baseframework):
             actions = [example["action"] for example in examples] if "action" in examples[0] else None
             action_mask = [example["action_mask"] for example in examples] if "action_mask" in examples[0] else None
             state = [example["state"] for example in examples] if "state" in examples[0] else None
+            if "qwen_vjepa_view_indices" in examples[0]:
+                qwen_view_counts = [
+                    int(example.get("qwen_view_count", len(example.get("qwen_view_slots", []))))
+                    for example in examples
+                ]
+                qwen_selected_view_indices = [
+                    [int(index) for index in example["qwen_vjepa_view_indices"]]
+                    for example in examples
+                ]
             if "qwen_inputs" in examples[0]:
                 qwen_inputs = self._move_qwen_inputs(examples[0]["qwen_inputs"])
+            elif "qwen_frames" in examples[0]:
+                instructions = [example["lang"] for example in examples]
+                qwen_inputs, qwen_timing = self._build_qwen_inputs_from_qwen_frames(
+                    qwen_frame_batches=[example["qwen_frames"] for example in examples],
+                    instructions=instructions,
+                    has_actions=actions is not None,
+                    return_timing=True,
+                )
+                timing_stats["video_tensor_to_cuda_time"] += qwen_timing["video_tensor_to_cuda_time"]
+                timing_stats["qwen_input_build_time"] += qwen_timing["qwen_input_build_time"]
             else:
                 instructions = [example["lang"] for example in examples]
                 qwen_inputs, qwen_timing = self._build_qwen_inputs_from_video_tensor(
@@ -1659,6 +1818,8 @@ class VLA_JEPA(baseframework):
                     batch_size=batch_videos.shape[0],
                     num_views=batch_videos.shape[1],
                     train_step=train_step,
+                    qwen_view_counts=qwen_view_counts,
+                    qwen_selected_view_indices=qwen_selected_view_indices,
                 )
             timing_stats["depth_teacher_time"] += time.perf_counter() - depth_teacher_start
 
@@ -1807,6 +1968,18 @@ class VLA_JEPA(baseframework):
                     state = [example["state"] for example in batch]
                 if "qwen_inputs" in batch[0]:
                     qwen_inputs = self._move_qwen_inputs(batch[0]["qwen_inputs"])
+                elif "qwen_frames" in batch[0]:
+                    instructions = [example["lang"] for example in batch]
+                    qwen_inputs = self._build_qwen_inputs_from_qwen_frames(
+                        qwen_frame_batches=[example["qwen_frames"] for example in batch],
+                        instructions=instructions,
+                        has_actions=False,
+                        prompt_replace_dict={
+                            "{actions}": self.replace_prompt,
+                            "{e_actions}": self.embodied_replace_prompt,
+                        },
+                        prompt_template=self.config.datasets.vla_data.get("CoT_prompt", ""),
+                    )
                 else:
                     instructions = [example["lang"] for example in batch]
                     if (

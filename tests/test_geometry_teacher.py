@@ -119,6 +119,51 @@ def test_image_token_gather_alignment():
     assert tokens.squeeze(-1).tolist() == [[1.0, 2.0], [5.0, 6.0], [8.0, 11.0], [12.0, 15.0]]
 
 
+def test_image_token_gather_alignment_with_variable_qwen_views():
+    class DummyVLA:
+        _qwen_image_token_id = 99
+
+        def _qwen_image_merge_size(self):
+            return 1
+
+    dummy = DummyVLA()
+    input_ids = torch.tensor(
+        [
+            [99, 99, 1, 99, 99, 2, 99, 99],
+            [3, 99, 99, 4, 5, 6, 7, 8],
+        ]
+    )
+    last_hidden = torch.arange(input_ids.numel(), dtype=torch.float32).view(2, 8, 1)
+    image_grid_thw = torch.tensor(
+        [
+            [1, 1, 2],
+            [1, 1, 2],
+            [1, 1, 2],
+            [1, 1, 2],
+        ]
+    )
+
+    tokens, token_grid_hw = VLA_JEPA._extract_qwen_image_hidden(
+        dummy,
+        last_hidden=last_hidden,
+        qwen_inputs={"input_ids": input_ids, "image_grid_thw": image_grid_thw},
+        batch_size=2,
+        num_views=3,
+        qwen_view_counts=[3, 1],
+        qwen_selected_view_indices=[[1, 1, 0], [0, 0, 0]],
+    )
+
+    assert token_grid_hw == (1, 2)
+    assert tokens.squeeze(-1).tolist() == [
+        [3.0, 4.0],
+        [3.0, 4.0],
+        [0.0, 1.0],
+        [9.0, 10.0],
+        [9.0, 10.0],
+        [9.0, 10.0],
+    ]
+
+
 def test_module_out_channels_prefers_residual_output_dim():
     block = SimpleNamespace(
         neck=SimpleNamespace(

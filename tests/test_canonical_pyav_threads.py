@@ -1,6 +1,7 @@
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 import starVLA.dataloader as dataloader_pkg
@@ -215,3 +216,104 @@ def test_shard_data_prefetch_downloads_next_shard(monkeypatch, tmp_path):
 
     assert calls == ["data/chunk-000/file-001.parquet"]
     dataset.close_video_readers()
+
+
+def test_canonical_view_selection_uses_real_qwen_views_and_pads_vjepa():
+    image_mapping = {
+        "main": "observation.images.exterior_1_left",
+        "right": "observation.images.wrist_left",
+        "extra": "observation.images.exterior_2_left",
+    }
+
+    assert canonical._select_qwen_camera_slots(image_mapping) == ["main", "right", "extra"]
+    assert canonical._select_vjepa_camera_slots(image_mapping) == ["right", "right", "main"]
+
+    image_mapping = {"main": "observation.images.camera_top"}
+    assert canonical._select_qwen_camera_slots(image_mapping) == ["main"]
+    assert canonical._select_vjepa_camera_slots(image_mapping) == ["main", "main", "main"]
+
+
+def test_canonical_sample_returns_qwen_frames_without_duplicate_qwen_views(tmp_path):
+    dataset = canonical.CanonicalSubsetVLADataset.__new__(canonical.CanonicalSubsetVLADataset)
+    dataset.video_target_shift_steps = 1
+    dataset._compact_offsets_cache = np.asarray([-1, 0, 1], dtype=np.int64)
+
+    main_path = tmp_path / "main.mp4"
+    right_path = tmp_path / "right.mp4"
+    extra_path = tmp_path / "extra.mp4"
+    shard_data = SimpleNamespace(
+        state=np.zeros((4, canonical.STATE_DIM), dtype=np.float32),
+        action=np.zeros((4, canonical.ACTION_DIM), dtype=np.float32),
+        action_mask=np.ones((4, canonical.ACTION_DIM), dtype=bool),
+        episode_index=np.zeros(4, dtype=np.int64),
+        frame_index=np.arange(4, dtype=np.int64),
+        task_index=np.zeros(4, dtype=np.int64),
+    )
+    shard = canonical.ShardSpec(
+        dataset_id="dataset",
+        sid="sid",
+        revision="main",
+        adapter_group_id="adapter",
+        adapter_path=tmp_path / "adapter.json",
+        root=tmp_path,
+        gcs_prefix="gs://bucket/sid/main",
+        data_relative_path="data/chunk-000/file-000.parquet",
+        data_path=tmp_path / "data.parquet",
+        sidecar_path=tmp_path / "sidecar.npz",
+        fps=30.0,
+        camera_source_keys={
+            "main": "observation.images.exterior_1_left",
+            "right": "observation.images.wrist_left",
+            "extra": "observation.images.exterior_2_left",
+        },
+        qwen_camera_slots=("main", "right", "extra"),
+        vjepa_camera_slots=("right", "right", "main"),
+        decode_camera_slots=("main", "right", "extra"),
+        task_map={0: "task"},
+        episodes=[],
+    )
+    episode = canonical.EpisodeSpec(
+        local_start=0,
+        length=4,
+        task="task",
+        video_paths={"main": main_path, "right": right_path, "extra": extra_path},
+        video_base_frames={"main": 0, "right": 0, "extra": 0},
+    )
+    context = {
+        "shard_data": shard_data,
+        "shard": shard,
+        "episode": episode,
+        "row_base": 1,
+        "action_rows": np.asarray([1, 2], dtype=np.int64),
+        "video_frames": {
+            "main": (main_path, np.asarray([0, 1, 2], dtype=np.int64), tmp_path / "main.lock"),
+            "right": (right_path, np.asarray([0, 1, 2], dtype=np.int64), tmp_path / "right.lock"),
+            "extra": (extra_path, np.asarray([1], dtype=np.int64), tmp_path / "extra.lock"),
+        },
+        "qwen_frame_positions": {"main": 1, "right": 1, "extra": 0},
+    }
+
+    decoded_frames = {}
+    for slot, path, base_value in (
+        ("main", main_path, 10),
+        ("right", right_path, 20),
+        ("extra", extra_path, 30),
+    ):
+        frame_indices = (1,) if slot == "extra" else (0, 1, 2)
+        decoded_frames[(slot, path.as_posix())] = {
+            frame_index: np.full((2, 2, 3), base_value + frame_index, dtype=np.uint8)
+            for frame_index in frame_indices
+        }
+
+    sample = dataset._sample_from_context(context, decoded_frames)
+
+    assert sample["video_compact"].shape == (3, 3, 2, 2, 3)
+    assert np.all(sample["video_compact"][0] == sample["video_compact"][1])
+    assert np.all(sample["video_compact"][2, 1] == 11)
+    assert sample["qwen_frames"].shape == (3, 2, 2, 3)
+    assert np.all(sample["qwen_frames"][0] == 11)
+    assert np.all(sample["qwen_frames"][1] == 21)
+    assert np.all(sample["qwen_frames"][2] == 31)
+    assert sample["qwen_view_slots"] == ("main", "right", "extra")
+    assert sample["vjepa_view_slots"] == ("right", "right", "main")
+    assert sample["qwen_vjepa_view_indices"].tolist() == [1, 1, 0]
