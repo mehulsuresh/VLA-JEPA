@@ -59,10 +59,18 @@ framework:
     num_frames: 8
   depth_teacher_aux:
     enabled: false
-    mode: direct
+    mode: query
     teacher_model: Ruicheng/moge-2-vitl-normal
     input_size: 224
     num_tokens: 256
+    num_task_tokens: 8
+    num_output_tokens: 256
+    geometry_token_template: <|geometry_{}|>
+    query_num_layers: 1
+    query_num_heads: 4
+    query_dim_head: 32
+    query_ff_mult: 1.0
+    query_smooth_l1_beta: 1.0
     teacher_feature_source: neck
     teacher_feature_level: 0
     teacher_feature_dim: auto
@@ -70,12 +78,6 @@ framework:
     loss_weight: 0.004
     detach_vlm_steps: null
     detach_vlm_fraction: 0.01
-    head_hidden_multiplier: 2.0
-    head_layer_norm: false
-    head_final_init_std: 0.0
-    feature_l1_weight: 1.0
-    feature_similarity_weight: 1.0
-    similarity_max_tokens: 4096
   reduce_in_full_precision: true
 
 
@@ -85,7 +87,7 @@ datasets:
     data_root_dir: /home/dataset-local/datasets/LeRobot/LEROBOT_LIBERO_DATA
     data_mix: libero_all
     action_type: delta_qpos
-    CoT_prompt: "Your task is {instruction}. Infer the temporal dynamics from frames {actions} and produce the corresponding policy actions {e_actions}."
+    CoT_prompt: "Your task is {instruction}. Infer the temporal dynamics from frames {actions} {geometry} and produce the corresponding policy actions {e_actions}."
     #CoT_answer: bbox
     resolution_size: 224   # image input of VLA will be resized and video will not, video will be precessed by world model videoprocessor
     per_device_batch_size: 32

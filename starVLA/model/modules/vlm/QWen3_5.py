@@ -2,14 +2,20 @@
 # Licensed under the MIT License, Version 1.0 (the "License");
 
 import os
+import importlib.util
 import torch
 import torch.nn.functional as F
 from typing import Optional
 from transformers.modeling_outputs import CausalLMOutputWithPast
-from transformers import Qwen3_5ForConditionalGeneration, AutoProcessor
+from transformers import Qwen3_5ForConditionalGeneration, AutoConfig, AutoProcessor
 from transformers.models.qwen3_5 import modeling_qwen3_5
 from transformers.models.qwen2_vl.image_processing_qwen2_vl import smart_resize
 from transformers.utils import is_flash_attn_2_available
+try:
+    from transformers.utils import is_flash_attn_4_available
+except ImportError:
+    def is_flash_attn_4_available() -> bool:
+        return False
 
 from accelerate.logging import get_logger
 
@@ -53,29 +59,118 @@ class _QWen3_5_Interface(nn.Module):
             print(message)
 
     @staticmethod
-    def _resolve_attn_implementation(requested: Optional[str], *, strict: bool = False) -> str:
+    def _flash_attn_4_gpu_supported(max_head_dim: Optional[int] = None) -> bool:
+        if not torch.cuda.is_available():
+            return False
+        major, _minor = torch.cuda.get_device_capability()
+        if major in {9, 10, 11}:
+            return True
+        if major == 12 and max_head_dim is not None and max_head_dim > 128:
+            return False
+        return major == 12 and _QWen3_5_Interface._flash_attn_4_sm120_available()
+
+    @staticmethod
+    def _flash_attn_4_sm120_available() -> bool:
+        if not torch.cuda.is_available():
+            return False
+        major, _minor = torch.cuda.get_device_capability()
+        return major == 12 and importlib.util.find_spec("flash_attn_4_sm120_sncbl") is not None
+
+    @staticmethod
+    def _prepare_flash_attn_4(max_head_dim: Optional[int] = None) -> bool:
+        if not torch.cuda.is_available() or not is_flash_attn_4_available():
+            return False
+        major, _minor = torch.cuda.get_device_capability()
+        if major in {9, 10, 11}:
+            return True
+        if major != 12:
+            return False
+        if max_head_dim is not None and max_head_dim > 128:
+            return False
+        if not _QWen3_5_Interface._flash_attn_4_sm120_available():
+            return False
+        try:
+            import flash_attn.cute as upstream_cute
+            import flash_attn.cute.interface as upstream_interface
+            import flash_attn_4_sm120_sncbl as sm120
+        except Exception as exc:
+            _QWen3_5_Interface._safe_log(
+                "warning", f"SM120 FlashAttention 4 package is installed but could not be imported: {exc}"
+            )
+            return False
+
+        if getattr(upstream_cute, "_starvla_sm120_patch", False):
+            return True
+        upstream_cute.flash_attn_func = sm120.flash_attn_func
+        upstream_cute.flash_attn_varlen_func = sm120.flash_attn_varlen_func
+        upstream_interface.flash_attn_func = sm120.flash_attn_func
+        upstream_interface.flash_attn_varlen_func = sm120.flash_attn_varlen_func
+        upstream_cute._starvla_sm120_patch = True
+        upstream_interface._starvla_sm120_patch = True
+        _QWen3_5_Interface._safe_log(
+            "info", "Using SecondNatureComputing SM120 FlashAttention 4 kernel for Qwen3.5"
+        )
+        return True
+
+    @staticmethod
+    def _resolve_attention_head_dim(model_id: str) -> Optional[int]:
+        try:
+            model_config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+        except Exception as exc:
+            _QWen3_5_Interface._safe_log(
+                "warning", f"Could not inspect `{model_id}` attention head dimension before loading: {exc}"
+            )
+            return None
+
+        text_config = getattr(model_config, "text_config", model_config)
+        head_dim = getattr(text_config, "head_dim", None)
+        if head_dim is not None:
+            return int(head_dim)
+        hidden_size = getattr(text_config, "hidden_size", None)
+        num_heads = getattr(text_config, "num_attention_heads", None)
+        if hidden_size is None or num_heads in {None, 0}:
+            return None
+        return int(hidden_size) // int(num_heads)
+
+    @staticmethod
+    def _resolve_attn_implementation(
+        requested: Optional[str],
+        *,
+        strict: bool = False,
+        max_head_dim: Optional[int] = None,
+    ) -> str:
         normalized = (requested or "flash_attention_2").strip().lower()
         alias_map = {
             "flash": "flash_attention_2",
             "flash2": "flash_attention_2",
+            "flash4": "flash_attention_4",
             "flash_attn": "flash_attention_2",
             "flash_attn_2": "flash_attention_2",
+            "flash_attn_4": "flash_attention_4",
             "flash-attn": "flash_attention_2",
             "flash-attn-2": "flash_attention_2",
+            "flash-attn-4": "flash_attention_4",
         }
         normalized = alias_map.get(normalized, normalized)
 
         if normalized == "auto":
-            normalized = "flash_attention_2"
+            normalized = "flash_attention_4" if (
+                torch.cuda.is_available()
+                and is_flash_attn_4_available()
+                and _QWen3_5_Interface._prepare_flash_attn_4(max_head_dim=max_head_dim)
+            ) else "flash_attention_2"
 
-        flash_available = torch.cuda.is_available() and is_flash_attn_2_available()
+        flash2_available = torch.cuda.is_available() and is_flash_attn_2_available()
+        flash4_installed = torch.cuda.is_available() and is_flash_attn_4_available()
+        flash4_available = flash4_installed and _QWen3_5_Interface._prepare_flash_attn_4(max_head_dim=max_head_dim)
         prefer_flash = os.getenv("STARVLA_DISABLE_FLASH_ATTN_PROMOTION", "0") != "1"
 
-        if normalized == "sdpa" and flash_available and prefer_flash:
+        if normalized == "sdpa" and prefer_flash and (flash4_available or flash2_available):
+            promoted_backend = "flash_attention_4" if flash4_available else "flash_attention_2"
             _QWen3_5_Interface._safe_log(
-                "info", "Promoting requested `sdpa` attention to `flash_attention_2` for Qwen3.5"
+                "info", f"Promoting requested `sdpa` attention to `{promoted_backend}` for Qwen3.5"
             )
-            normalized = "flash_attention_2"
+            normalized = promoted_backend
 
         if normalized == "flash_attention_2":
             if not torch.cuda.is_available():
@@ -89,6 +184,12 @@ class _QWen3_5_Interface(nn.Module):
                 )
                 return "sdpa"
             if not is_flash_attn_2_available():
+                if flash4_available and not strict:
+                    _QWen3_5_Interface._safe_log(
+                        "warning",
+                        "FlashAttention 2 requested but unavailable; using `flash_attention_4` instead",
+                    )
+                    return "flash_attention_4"
                 if strict:
                     raise RuntimeError(
                         "Qwen FlashAttention was requested with strict attention enabled, "
@@ -99,6 +200,63 @@ class _QWen3_5_Interface(nn.Module):
                 )
                 return "sdpa"
             return "flash_attention_2"
+
+        if normalized == "flash_attention_4":
+            if not torch.cuda.is_available():
+                if strict:
+                    raise RuntimeError(
+                        "Qwen FlashAttention 4 was requested with strict attention enabled, "
+                        "but CUDA is unavailable."
+                    )
+                _QWen3_5_Interface._safe_log(
+                    "warning", "FlashAttention 4 requested but CUDA is unavailable; falling back to sdpa"
+                )
+                return "sdpa"
+            if is_flash_attn_4_available() and not _QWen3_5_Interface._flash_attn_4_gpu_supported(max_head_dim=max_head_dim):
+                major, minor = torch.cuda.get_device_capability()
+                if strict:
+                    head_dim_note = f" with head_dim {max_head_dim}" if max_head_dim is not None else ""
+                    raise RuntimeError(
+                        "Qwen FlashAttention 4 was requested with strict attention enabled, "
+                        f"but the installed FA4 kernel does not support compute capability {major}.{minor}{head_dim_note}."
+                    )
+                head_dim_note = f" and head_dim {max_head_dim}" if max_head_dim is not None else ""
+                _QWen3_5_Interface._safe_log(
+                    "warning",
+                    "FlashAttention 4 is installed but does not support this GPU "
+                    f"(compute capability {major}.{minor}{head_dim_note}); falling back to sdpa",
+                )
+                return "sdpa"
+            if is_flash_attn_4_available() and not _QWen3_5_Interface._prepare_flash_attn_4(max_head_dim=max_head_dim):
+                major, minor = torch.cuda.get_device_capability()
+                if strict:
+                    raise RuntimeError(
+                        "Qwen FlashAttention 4 was requested with strict attention enabled, "
+                        f"but no supported FA4 kernel is available for compute capability {major}.{minor}."
+                    )
+                _QWen3_5_Interface._safe_log(
+                    "warning",
+                    "FlashAttention 4 is installed but no supported kernel is available for this GPU "
+                    f"(compute capability {major}.{minor}); falling back to sdpa",
+                )
+                return "sdpa"
+            if not is_flash_attn_4_available():
+                if is_flash_attn_2_available() and not strict:
+                    _QWen3_5_Interface._safe_log(
+                        "warning",
+                        "FlashAttention 4 requested but unavailable; using `flash_attention_2` instead",
+                    )
+                    return "flash_attention_2"
+                if strict:
+                    raise RuntimeError(
+                        "Qwen FlashAttention 4 was requested with strict attention enabled, "
+                        "but `flash-attn-4` is unavailable."
+                    )
+                _QWen3_5_Interface._safe_log(
+                    "warning", "FlashAttention 4 requested but `flash-attn-4` is unavailable; falling back to sdpa"
+                )
+                return "sdpa"
+            return "flash_attention_4"
 
         return normalized
 
@@ -236,9 +394,15 @@ class _QWen3_5_Interface(nn.Module):
         model_id = qwenvl_config.get("base_vlm", "Qwen/Qwen3.5-2B")
         requested_attn_implementation = qwenvl_config.get("attn_implementation", "flash_attention_2")
         strict_attn_implementation = bool(qwenvl_config.get("strict_attn_implementation", False))
+        max_attention_head_dim = qwenvl_config.get("max_attention_head_dim", None)
+        if max_attention_head_dim is None:
+            max_attention_head_dim = self._resolve_attention_head_dim(model_id)
+        else:
+            max_attention_head_dim = int(max_attention_head_dim)
         attn_implementation = self._resolve_attn_implementation(
             requested_attn_implementation,
             strict=strict_attn_implementation,
+            max_head_dim=max_attention_head_dim,
         )
         compile_qwen_model = bool(config.get("trainer", {}).get("compile_qwen_model", False))
         device_map = qwenvl_config.get("device_map", None if compile_qwen_model else "cuda")

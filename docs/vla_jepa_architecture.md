@@ -7,7 +7,7 @@ This document tracks the active training and inference paths in [`VLA_JEPA.py`](
 The model has three trainable heads on top of frozen perceptual backbones, and three losses combined into a single objective.
 
 - **Frozen perception**: Qwen 3.5 VL (frozen on small-scale configs, full-FT or LoRA on canonical), V-JEPA 2.1 encoder (always frozen), MoGe-2 teacher (frozen, optional).
-- **Trainable heads**: V-JEPA predictor (latent world model), DirectGeometryTeacherHead (MoGe feature distillation), GR00T DiT-B flow-matching action head.
+- **Trainable heads**: V-JEPA predictor (latent world model), QueryGeometryTeacherHead (MoGe feature distillation), GR00T DiT-B flow-matching action head.
 - **Joint objective**: `total_loss = action_loss + wm_scale(t) · wm_loss + 0.004 · depth_teacher_loss`, where `wm_scale(t)` linearly warms up from `wm_initial` to `wm` over `wm_warmup_steps`.
 
 ## Training Diagram
@@ -44,8 +44,8 @@ flowchart TB
         direction TB
         I_lastframe["Last frame per view<br/>(reused from video)"]:::input
         MoGe["MoGe-2 Teacher · vit-s/l-normal<br/>FROZEN (no_grad)"]:::teacher
-        GeoHead["DirectGeometryTeacherHead<br/>MLP into MoGe feature space"]:::trainable
-        L_geo["depth_teacher_loss<br/>pooled L1 + cosine similarity<br/>scale 0.004"]:::loss
+        GeoHead["QueryGeometryTeacherHead<br/>geometry tokens → MoGe feature tokens"]:::trainable
+        L_geo["depth_teacher_loss<br/>SmoothL1 over 256 teacher tokens<br/>scale 0.004"]:::loss
     end
 
     Total["total_loss = 1.0 · action_loss<br/>+ wm_scale(t) · wm_loss<br/>+ 0.004 · depth_teacher_loss"]:::total
@@ -69,7 +69,7 @@ flowchart TB
 
     %% Cross-lane edges
     Qwen -.->|"action tokens"| VJPred
-    Qwen -.->|"image-token hidden states"| GeoHead
+    Qwen -.->|"image tokens + geometry tokens"| GeoHead
     I_video -.->|"last frame"| I_lastframe
 
     %% Combined objective
@@ -80,7 +80,7 @@ flowchart TB
 
 ## Inference Diagram
 
-Only Qwen 3.5 VL and the DiT action head run at inference. The V-JEPA encoder, V-JEPA predictor, MoGe teacher, and DirectGeometryHead are training-only.
+Only Qwen 3.5 VL and the DiT action head run at inference. The V-JEPA encoder, V-JEPA predictor, MoGe teacher, and QueryGeometryTeacherHead are training-only.
 
 ```mermaid
 flowchart LR

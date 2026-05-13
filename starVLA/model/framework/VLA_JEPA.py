@@ -29,9 +29,9 @@ from starVLA.model.framework.base_framework import baseframework
 from starVLA.model.modules.vlm import get_vlm_model
 from starVLA.model.modules.action_model.GR00T_ActionHeader import get_action_model, FlowmatchingActionHead
 from starVLA.model.modules.geometry_teacher import (
-    DirectGeometryTeacherHead,
     MoGeGeometryTeacher,
-    direct_feature_distillation_loss,
+    QueryGeometryTeacherHead,
+    query_feature_distillation_loss,
 )
 from starVLA.model.modules.world_model.vj2_predictor import VisionTransformerPredictorAC
 from starVLA.training.trainer_utils.trainer_tools import resize_images
@@ -144,11 +144,12 @@ class VLA_JEPA(baseframework):
         self.qwen_vl_interface = get_vlm_model(config=self.config)
         self.depth_teacher_aux_cfg = self.config.framework.get("depth_teacher_aux", {})
         self.depth_teacher_aux_enabled = bool(self.depth_teacher_aux_cfg.get("enabled", False))
-        self.depth_teacher_aux_mode = str(self.depth_teacher_aux_cfg.get("mode", "direct")).lower()
         if self.depth_teacher_aux_enabled:
-            if self.depth_teacher_aux_mode != "direct":
+            depth_teacher_aux_mode = str(self.depth_teacher_aux_cfg.get("mode", "query")).lower()
+            if depth_teacher_aux_mode != "query":
                 raise ValueError(
-                    "VLA_JEPA depth_teacher_aux currently supports only LingBot-style `direct` mode"
+                    "VLA_JEPA depth_teacher_aux is query-only. Set `framework.depth_teacher_aux.mode: query` "
+                    "or disable the auxiliary path."
                 )
             self._depth_teacher = MoGeGeometryTeacher(self.depth_teacher_aux_cfg, logger=logger)
             self._depth_teacher.initialize(self._get_qwen_device())
@@ -170,31 +171,51 @@ class VLA_JEPA(baseframework):
                         f"configured {configured_feature_dim}, inferred {teacher_feature_dim}. "
                         "Set teacher_feature_dim: auto or update it to the inferred value."
                     )
-            self.depth_teacher_aux_head = DirectGeometryTeacherHead(
+            self.depth_teacher_aux_num_task_tokens = int(
+                self.depth_teacher_aux_cfg.get(
+                    "num_task_tokens",
+                    self.depth_teacher_aux_cfg.get("geometry_tokens_per_view", 8),
+                )
+            )
+            self.depth_teacher_aux_num_output_tokens = int(
+                self.depth_teacher_aux_cfg.get(
+                    "num_output_tokens",
+                    self.depth_teacher_aux_cfg.get(
+                        "num_backbone_tokens",
+                        self.depth_teacher_aux_cfg.get("num_tokens", 256),
+                    ),
+                )
+            )
+            self.depth_teacher_aux_head = QueryGeometryTeacherHead(
                 hidden_size=self.qwen_vl_interface.model.config.hidden_size,
                 output_size=teacher_feature_dim,
-                head_hidden_multiplier=float(
-                    self.depth_teacher_aux_cfg.get(
-                        "head_hidden_multiplier",
-                        self.depth_teacher_aux_cfg.get("hidden_multiplier", 2.0),
-                    )
-                ),
+                num_output_tokens=self.depth_teacher_aux_num_output_tokens,
+                num_layers=int(self.depth_teacher_aux_cfg.get("query_num_layers", 1)),
+                num_heads=int(self.depth_teacher_aux_cfg.get("query_num_heads", 4)),
+                dim_head=int(self.depth_teacher_aux_cfg.get("query_dim_head", 32)),
+                ff_mult=float(self.depth_teacher_aux_cfg.get("query_ff_mult", 1.0)),
                 dropout=float(self.depth_teacher_aux_cfg.get("dropout", 0.0)),
-                use_layer_norm=bool(self.depth_teacher_aux_cfg.get("head_layer_norm", False)),
-                final_init_std=float(self.depth_teacher_aux_cfg.get("head_final_init_std", 0.0)),
+                final_init_std=self.depth_teacher_aux_cfg.get("query_final_init_std", None),
             )
             self._qwen_image_token_id = self._resolve_qwen_image_token_id()
         else:
+            self.depth_teacher_aux_num_task_tokens = 0
+            self.depth_teacher_aux_num_output_tokens = 0
             self.depth_teacher_aux_head = None
             self._depth_teacher = None
             self._qwen_image_token_id = None
 
         embodied_action_token = self.config.framework.vj2_model.get("embodied_action_token", "<|embodied_action|>")
-        action_tokens, self.action_token_ids, self.embodied_action_token_id = self.expand_tokenizer(
+        self.geometry_token_template = str(
+            self.depth_teacher_aux_cfg.get("geometry_token_template", "<|geometry_{}|>")
+        )
+        action_tokens, self.action_token_ids, self.embodied_action_token_id, self.geometry_tokens, self.geometry_token_ids = self.expand_tokenizer(
             tokenizer=self.qwen_vl_interface.processor.tokenizer,
             special_action_token=self.config.framework.vj2_model.special_action_token,
             max_action_tokens=self.config.framework.action_model.action_horizon * 4,
-            embodied_action_token=embodied_action_token
+            embodied_action_token=embodied_action_token,
+            geometry_token_template=self.geometry_token_template,
+            num_geometry_tokens=self.depth_teacher_aux_num_task_tokens if self.depth_teacher_aux_enabled else 0,
         )
 
         self.config.framework.action_model.diffusion_model_cfg.cross_attention_dim = self.qwen_vl_interface.model.config.hidden_size
@@ -213,6 +234,9 @@ class VLA_JEPA(baseframework):
         if bool(self.config.get("trainer", {}).get("channels_last", False)) and self.config.framework.vj2_model.get("source", "hf") == "torchhub":
             self.vj_encoder = self.vj_encoder.to(memory_format=torch.channels_last_3d)
         self.vj_num_video_views = self.config.framework.vj2_model.get("num_video_views", 2)
+        self.geometry_num_prompt_views = int(
+            self.depth_teacher_aux_cfg.get("num_geometry_views", self.vj_num_video_views)
+        )
 
         tubelet_size = self._get_vjepa_attr("tubelet_size")
         image_size = self._get_vjepa_attr("image_size")
@@ -240,6 +264,11 @@ class VLA_JEPA(baseframework):
         )
 
         self.embodied_replace_prompt = "".join([embodied_action_token * self.config.framework.vj2_model.num_embodied_action_tokens_per_instruction])
+        if self.depth_teacher_aux_enabled:
+            per_view_geometry_prompt = "".join(self.geometry_tokens)
+            self.geometry_replace_prompt = per_view_geometry_prompt * self.geometry_num_prompt_views
+        else:
+            self.geometry_replace_prompt = ""
 
         # Pre-cache token ID tensors (avoids torch.tensor + torch.isin every forward)
         self.register_buffer(
@@ -250,6 +279,11 @@ class VLA_JEPA(baseframework):
         self.register_buffer(
             "_embodied_token_id_t",
             torch.tensor([self.embodied_action_token_id], dtype=torch.long),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_geometry_token_ids_t",
+            torch.tensor(self.geometry_token_ids, dtype=torch.long),
             persistent=False,
         )
         self.register_buffer(
@@ -581,6 +615,8 @@ class VLA_JEPA(baseframework):
             actual_attn = str(getattr(self.qwen_vl_interface, "attn_implementation", "")).lower()
             if requested_attn in {"flash", "flash2", "flash_attn", "flash_attn_2", "flash-attn", "flash-attn-2"}:
                 requested_attn = "flash_attention_2"
+            if requested_attn in {"flash4", "flash_attn_4", "flash-attn-4"}:
+                requested_attn = "flash_attention_4"
             if requested_attn != actual_attn:
                 raise RuntimeError(
                     f"Qwen attention backend mismatch under strict mode: requested `{requested_attn}`, "
@@ -660,7 +696,7 @@ class VLA_JEPA(baseframework):
         image_grid_thw = qwen_inputs.get("image_grid_thw", None)
         if image_grid_thw is None:
             raise RuntimeError(
-                "depth_teacher_aux requires Qwen `image_grid_thw` metadata to align direct "
+                "depth_teacher_aux requires Qwen `image_grid_thw` metadata to align "
                 "feature targets with image tokens. Refusing to infer per-view grids from token counts."
             )
 
@@ -790,6 +826,7 @@ class VLA_JEPA(baseframework):
         *,
         last_hidden: torch.Tensor,
         qwen_inputs: dict[str, torch.Tensor],
+        geometry_tokens: Optional[torch.Tensor],
         batch_videos: np.ndarray | torch.Tensor,
         batch_size: int,
         num_views: int,
@@ -799,7 +836,7 @@ class VLA_JEPA(baseframework):
     ) -> dict[str, torch.Tensor]:
         if not self.depth_teacher_aux_enabled:
             return {}
-        image_tokens, token_grid_hw = self._extract_qwen_image_hidden(
+        image_tokens, _token_grid_hw = self._extract_qwen_image_hidden(
             last_hidden=last_hidden,
             qwen_inputs=qwen_inputs,
             batch_size=batch_size,
@@ -810,17 +847,31 @@ class VLA_JEPA(baseframework):
         detach_steps = self.resolve_depth_teacher_detach_steps()
         step = 0 if train_step is None else int(train_step)
         detach_vlm = step < detach_steps
+        if geometry_tokens is None:
+            raise RuntimeError("depth_teacher_aux requires dedicated geometry prompt tokens")
+        expected_geometry_tokens = int(num_views) * self.depth_teacher_aux_num_task_tokens
+        if geometry_tokens.shape[1] != expected_geometry_tokens:
+            raise RuntimeError(
+                "depth_teacher_aux geometry token count did not match V-JEPA views: "
+                f"expected {expected_geometry_tokens} per sample, got {geometry_tokens.shape[1]}"
+            )
+        geometry_tokens = geometry_tokens.reshape(
+            batch_size * num_views,
+            self.depth_teacher_aux_num_task_tokens,
+            geometry_tokens.shape[-1],
+        )
         if detach_vlm:
             image_tokens = image_tokens.detach()
-        predictions = self.depth_teacher_aux_head(image_tokens)
+            geometry_tokens = geometry_tokens.detach()
+        prediction_context = torch.cat([image_tokens, geometry_tokens], dim=1)
+        predictions = self.depth_teacher_aux_head(prediction_context)
+
         teacher_frames = self._last_frames_for_depth_teacher(batch_videos, device=predictions.device)
         teacher_output = self._depth_teacher.infer_features(teacher_frames)
-        loss, metrics = direct_feature_distillation_loss(
+        loss, metrics = query_feature_distillation_loss(
             predictions,
             teacher_output,
-            token_grid_hw,
             self.depth_teacher_aux_cfg,
-            train_step=train_step,
         )
         metrics["depth_teacher_loss"] = loss
         metrics["depth_teacher_vlm_detached"] = torch.tensor(
@@ -841,9 +892,16 @@ class VLA_JEPA(baseframework):
             prompt_replace_dict = {"{actions}": self.replace_prompt}
             if has_actions:
                 prompt_replace_dict["{e_actions}"] = self.embodied_replace_prompt
+        else:
+            prompt_replace_dict = dict(prompt_replace_dict)
+
+        if self.depth_teacher_aux_enabled:
+            prompt_replace_dict["{geometry}"] = self.geometry_replace_prompt
 
         if prompt_template is None:
             prompt_template = self.config.datasets.vla_data.get("CoT_prompt", "")
+        if self.depth_teacher_aux_enabled and "{geometry}" not in str(prompt_template):
+            prompt_template = f"{prompt_template} {{geometry}}"
 
         return prompt_replace_dict, prompt_template
 
@@ -884,6 +942,21 @@ class VLA_JEPA(baseframework):
                     f"tokens in Qwen inputs ({expected_embodied_count_per_example} per sample "
                     f"across batch_size={batch_size}), found {embodied_count}. This usually means "
                     "prompt placeholders were not expanded before building Qwen inputs."
+                )
+
+        if self.depth_teacher_aux_enabled:
+            geometry_token_ids = self._geometry_token_ids_t.to(input_ids.device)
+            expected_geometry_count_per_example = (
+                self.geometry_num_prompt_views * self.depth_teacher_aux_num_task_tokens
+            )
+            expected_geometry_count = expected_geometry_count_per_example * batch_size
+            geometry_count = int(torch.isin(input_ids, geometry_token_ids).sum().item())
+            if geometry_count != expected_geometry_count:
+                raise RuntimeError(
+                    f"{stage}: expected {expected_geometry_count} total geometry prompt "
+                    f"tokens in Qwen inputs ({expected_geometry_count_per_example} per sample "
+                    f"across batch_size={batch_size}), found {geometry_count}. This usually means "
+                    "the {geometry} placeholder was not added before building Qwen inputs."
                 )
 
     def _build_qwen_inputs_from_examples(self, examples: List[dict]) -> dict[str, torch.Tensor]:
@@ -1688,7 +1761,9 @@ class VLA_JEPA(baseframework):
                          tokenizer: AutoTokenizer,
                          special_action_token: str = "<|action_{}|>",
                          max_action_tokens: int = 32,
-                         embodied_action_token: str = "<|embodied_action|>"):
+                         embodied_action_token: str = "<|embodied_action|>",
+                         geometry_token_template: str = "<|geometry_{}|>",
+                         num_geometry_tokens: int = 0):
         action_tokens, action_token_ids = [], []
         for i in range(0, max_action_tokens):
             action_token_i = special_action_token.format(i)
@@ -1706,12 +1781,22 @@ class VLA_JEPA(baseframework):
                 logger.warning(f"Warning: 0 tokens added (they may already exist) embodied_action_token: {embodied_action_token}.")
         embodied_action_token_id = tokenizer.convert_tokens_to_ids(embodied_action_token)
 
+        geometry_tokens, geometry_token_ids = [], []
+        for i in range(max(int(num_geometry_tokens), 0)):
+            geometry_token_i = geometry_token_template.format(i)
+            geometry_tokens.append(geometry_token_i)
+            if geometry_token_i not in tokenizer.get_vocab():
+                added = tokenizer.add_tokens([geometry_token_i], special_tokens=True)
+                if added == 0:
+                    logger.warning(f"Warning: 0 tokens added (they may already exist) geometry_token_i: {geometry_token_i}.")
+            geometry_token_ids.append(tokenizer.convert_tokens_to_ids(geometry_token_i))
+
         vla_embedding_size = self._input_embedding_vocab_size()
         if vla_embedding_size < len(tokenizer):
             self.qwen_vl_interface.model.resize_token_embeddings(len(tokenizer))
             vla_embedding_size = self._input_embedding_vocab_size()
         logger.info(f"Model embedding size: {vla_embedding_size} ;tokenizer.vocab_size: {len(tokenizer)}")
-        return action_tokens, action_token_ids, embodied_action_token_id
+        return action_tokens, action_token_ids, embodied_action_token_id, geometry_tokens, geometry_token_ids
 
     def _training_action_chunk_size(self) -> int:
         return int(self.future_action_window_size) + 1
@@ -1796,6 +1881,10 @@ class VLA_JEPA(baseframework):
         embodied_token_id = self._embodied_token_id_t.to(input_ids.device)
         action_indices = torch.isin(input_ids, action_token_ids).nonzero(as_tuple=True)
         embodied_action_indices = torch.isin(input_ids, embodied_token_id).nonzero(as_tuple=True)
+        geometry_indices = None
+        if self.depth_teacher_aux_enabled:
+            geometry_token_ids = self._geometry_token_ids_t.to(input_ids.device)
+            geometry_indices = torch.isin(input_ids, geometry_token_ids).nonzero(as_tuple=True)
         
         qwen_context = nullcontext() if self._qwen_requires_grad() else torch.no_grad()
         qwen_forward_start = time.perf_counter()
@@ -1806,6 +1895,11 @@ class VLA_JEPA(baseframework):
             B, _, H = last_hidden.shape
             action_tokens = last_hidden[action_indices[0], action_indices[1], :].view(B, -1, H)
             embodied_action_tokens = last_hidden[embodied_action_indices[0], embodied_action_indices[1], :].view(B, -1, H)
+            geometry_tokens = (
+                last_hidden[geometry_indices[0], geometry_indices[1], :].view(B, -1, H)
+                if geometry_indices is not None
+                else None
+            )
         timing_stats["qwen_forward_time"] += time.perf_counter() - qwen_forward_start
         depth_teacher_metrics = {}
         if self.depth_teacher_aux_enabled:
@@ -1814,6 +1908,7 @@ class VLA_JEPA(baseframework):
                 depth_teacher_metrics = self._compute_depth_teacher_aux_loss(
                     last_hidden=last_hidden,
                     qwen_inputs=qwen_inputs,
+                    geometry_tokens=geometry_tokens,
                     batch_videos=batch_videos,
                     batch_size=batch_videos.shape[0],
                     num_views=batch_videos.shape[1],
@@ -1970,15 +2065,13 @@ class VLA_JEPA(baseframework):
                     qwen_inputs = self._move_qwen_inputs(batch[0]["qwen_inputs"])
                 elif "qwen_frames" in batch[0]:
                     instructions = [example["lang"] for example in batch]
+                    prompt_replace_dict, prompt_template = self._resolve_qwen_prompt_args(has_actions=True)
                     qwen_inputs = self._build_qwen_inputs_from_qwen_frames(
                         qwen_frame_batches=[example["qwen_frames"] for example in batch],
                         instructions=instructions,
                         has_actions=False,
-                        prompt_replace_dict={
-                            "{actions}": self.replace_prompt,
-                            "{e_actions}": self.embodied_replace_prompt,
-                        },
-                        prompt_template=self.config.datasets.vla_data.get("CoT_prompt", ""),
+                        prompt_replace_dict=prompt_replace_dict,
+                        prompt_template=prompt_template,
                     )
                 else:
                     instructions = [example["lang"] for example in batch]
@@ -1989,25 +2082,22 @@ class VLA_JEPA(baseframework):
                         or "video_compact" in batch[0]
                     ):
                         batch_videos, _ = self._extract_training_videos(batch)
+                        prompt_replace_dict, prompt_template = self._resolve_qwen_prompt_args(has_actions=True)
                         qwen_inputs = self._build_qwen_inputs_from_video_tensor(
                             batch_videos=batch_videos,
                             instructions=instructions,
                             has_actions=False,
-                            prompt_replace_dict={
-                                "{actions}": self.replace_prompt,
-                                "{e_actions}": self.embodied_replace_prompt,
-                            },
-                            prompt_template=self.config.datasets.vla_data.get("CoT_prompt", ""),
+                            prompt_replace_dict=prompt_replace_dict,
+                            prompt_template=prompt_template,
                         )
                     else:
                         batch_images = [example["image"] for example in batch]
+                        prompt_replace_dict, prompt_template = self._resolve_qwen_prompt_args(has_actions=True)
                         qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(
                             images=batch_images,
                             instructions=instructions,
-                            prompt_replace_dict={
-                                "{actions}": self.replace_prompt,
-                                "{e_actions}": self.embodied_replace_prompt,
-                            },
+                            prompt_replace_dict=prompt_replace_dict,
+                            prompt_template=prompt_template,
                         )
         else:
             train_obs_image_size = getattr(self.config.datasets.vla_data, "image_size", None)

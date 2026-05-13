@@ -1,339 +1,136 @@
-# Geometry Teacher Auxiliary Loss: Technical Design
+# Geometry Teacher Auxiliary Loss
 
-This document describes only the technical implementation of the geometry teacher auxiliary path in VLA-JEPA. It is intended for implementation review.
+This document describes the query-only geometry teacher path in VLA-JEPA.
 
 ## Goal
 
-The auxiliary path was inspired by LingBot-VLA's direct geometry alignment path, but adapted for VLA-JEPA and Qwen-VL. The important point is that this is feature-embedding distillation, not raw depth or normal regression.
+The auxiliary branch distills frozen MoGe geometry features into Qwen using dedicated geometry query tokens. It does not regress raw depth pixels or normals.
 
-Instead of asking the VLA model to directly regress metric depth or surface normals, the path projects Qwen image-token hidden states into the frozen teacher feature space and applies:
+The training signal is:
 
-- pooled teacher-feature L1 loss
-- teacher/prediction feature-similarity loss
+```text
+Qwen image tokens + contextualized geometry tokens
+  -> QueryGeometryTeacherHead
+  -> predicted MoGe feature tokens
 
-The teacher is `Ruicheng/moge-2-vitl-normal`, which is useful because MoGe-2 provides metric-scale geometry and surface-normal supervision internally. We use its learned feature maps as the distillation target.
+same RGB frames
+  -> frozen MoGe teacher
+  -> target MoGe feature tokens
 
-## Implementation
+loss = SmoothL1(predicted tokens, target tokens)
+```
 
-The implementation lives in:
+## Components
 
-- `starVLA/model/modules/geometry_teacher.py`
-- `starVLA/model/framework/VLA_JEPA.py`
-- `starVLA/training/train_starvla.py`
-- `starVLA/training/trainer_utils/trainer_tools.py`
+- `MoGeGeometryTeacher`: frozen MoGe wrapper kept outside the trainable model state dict.
+- `QueryGeometryTeacherHead`: LingBot-style cross-attention resampler.
+- `query_feature_distillation_loss`: SmoothL1 over teacher feature tokens.
 
-The main pieces are:
-
-- `MoGeGeometryTeacher`: frozen MoGe teacher kept outside the trainable model state dict.
-- `DirectGeometryTeacherHead`: trainable MLP that projects Qwen image-token hidden states into MoGe feature space.
-- `direct_feature_distillation_loss`: LingBot-style direct feature loss.
-
-The auxiliary branch is disabled by default and is gated by:
+The branch is disabled by default:
 
 ```yaml
 framework:
   depth_teacher_aux:
     enabled: false
+    mode: query
 ```
 
-When disabled, no teacher is loaded, no auxiliary head is constructed, and no auxiliary loss is added.
+If enabled, only `mode: query` is supported.
 
-## Direct-Mode Alignment
+## Qwen Tokens
 
-Qwen image-token hidden states are extracted from the same image tokens Qwen saw. The branch requires Qwen `image_grid_thw` metadata so target grids are explicit. It does not use the unsafe fallback that inferred grids from token counts.
-
-The current Qwen input builder passes only the last temporal frame from each view into Qwen. The geometry teacher path mirrors that behavior by taking `batch_videos[:, :, -1]`, keeping teacher targets one-to-one with Qwen image tokens.
-
-All images in a batch are expected to share the same Qwen image-token grid. If this assumption breaks, the branch raises instead of silently misaligning teacher targets.
-
-## Teacher
-
-Teacher model:
+When the branch is enabled, VLA-JEPA adds dedicated geometry tokens to the Qwen prompt:
 
 ```text
-Ruicheng/moge-2-vitl-normal
+<|geometry_0|> ... <|geometry_7|>
 ```
 
-Implementation:
+By default this is repeated once per V-JEPA view:
 
 ```text
-starVLA/model/modules/geometry_teacher.py
+3 views x 8 geometry tokens = 24 geometry tokens per sample
 ```
 
-The teacher wrapper is `MoGeGeometryTeacher`. It is intentionally not an `nn.Module` child of `VLA_JEPA`; the inner MoGe model is kept outside the trainable model state dict and optimizer parameter set.
+These tokens go through Qwen with the real image tokens and become image-conditioned. They are separate from:
 
-The teacher is:
+- `<|action_i|>` tokens used by the V-JEPA predictor
+- `<|embodied_action|>` tokens used by the flow-matching action head
 
-- loaded through `moge.model.v2.MoGeModel.from_pretrained`
-- set to `requires_grad_(False)`
-- set to `eval()`
-- moved to the active inference device and dtype on use
+## Head Shape
 
-Local MoGe source import is controlled by:
+For each view, the geometry head receives:
 
-```bash
-STARVLA_MOGE_REPO_PATH=/path/to/moge
+```text
+Qwen image tokens + 8 contextualized geometry tokens
 ```
 
-or:
+The head uses learned output queries and Perceiver-style cross-attention to produce:
+
+```text
+[num_images, 256, teacher_feature_dim]
+```
+
+The default config matches LingBot's token counts:
 
 ```yaml
-framework:
-  depth_teacher_aux:
-    moge_repo_path: /path/to/moge
+num_task_tokens: 8
+num_output_tokens: 256
+query_num_layers: 1
+query_num_heads: 4
+query_dim_head: 32
+query_ff_mult: 1.0
 ```
 
-## Teacher Feature Source
+## Teacher Target
 
-The default target is the MoGe neck feature at level 0:
-
-```yaml
-teacher_feature_source: neck
-teacher_feature_level: 0
-teacher_feature_dim: auto
-```
-
-For `Ruicheng/moge-2-vitl-normal`, the known neck dimensions are:
-
-| Level | Feature Dim |
-| --- | --- |
-| 0 | 1024 |
-| 1 | 256 |
-| 2 | 128 |
-| 3 | 64 |
-| 4 | 32 |
-
-The implementation can derive these dimensions without loading the full teacher if the model is `Ruicheng/moge-2-vitl-normal` or a local path ending in `moge-2-vitl-normal`.
-
-If the teacher is already loaded, the feature dimension is inferred from the loaded MoGe modules and checked against the configured or known value.
-
-## Student Projection Head
-
-Implementation:
-
-```text
-DirectGeometryTeacherHead
-```
-
-Input:
-
-```text
-[num_images, qwen_image_tokens, qwen_hidden_dim]
-```
-
-Output:
-
-```text
-[num_images, qwen_image_tokens, teacher_feature_dim]
-```
-
-Architecture:
-
-```text
-Linear(qwen_hidden_dim, teacher_feature_dim * head_hidden_multiplier)
-GELU
-Dropout
-Linear(teacher_feature_dim * head_hidden_multiplier, teacher_feature_dim)
-```
-
-Defaults:
-
-```yaml
-head_hidden_multiplier: 2.0
-head_layer_norm: false
-head_final_init_std: 0.0
-```
-
-The final linear layer is zero-initialized by default. This makes the auxiliary head start from a non-random teacher-space output and reduces the chance of sending large initial gradients into the VLM.
-
-A LayerNorm can be enabled with `head_layer_norm: true`, but the default avoids it to stay closer to LingBot direct mode.
-
-## Qwen Image Token Extraction
-
-Implementation:
-
-```text
-VLA_JEPA._extract_qwen_image_hidden
-```
-
-The branch extracts hidden states only at Qwen image-token positions.
-
-The image token id is resolved from the Qwen processor or tokenizer using:
-
-1. `processor.image_token_id`
-2. `processor.image_token`
-3. `<|image_pad|>`
-4. `<image>`
-
-The implementation requires Qwen `image_grid_thw`. If it is absent, the auxiliary path raises. This is deliberate: inferring image grids from token counts is unsafe when image sizes or view resolutions differ.
-
-As noted above, the current Qwen input builder passes the last temporal frame from each view. The geometry teacher branch mirrors this by using:
+The teacher runs on the same last frame per view that Qwen sees:
 
 ```text
 batch_videos[:, :, -1]
 ```
 
-This keeps Qwen image-token embeddings and MoGe teacher targets one-to-one.
-
-Current alignment assumptions:
-
-- `image_grid_thw.shape[0] == batch_size * num_views`
-- every `grid_t == 1`
-- all images in the batch share the same token grid
-- each sample has exactly `num_views * tokens_per_view` image-token positions
-
-If any of these assumptions fail, the branch raises.
-
-The final gather is vectorized with `torch.gather` instead of per-view indexing loops.
-
-## Frame Preprocessing
-
-Implementation:
+MoGe returns feature maps:
 
 ```text
-MoGeGeometryTeacher._prepare_images
+[num_images, teacher_feature_dim, H_teacher, W_teacher]
 ```
 
-MoGe expects images in `[0, 1]`.
-
-Supported input ranges:
-
-```yaml
-frame_value_range: uint8   # aliases: 0_255, 0-255
-frame_value_range: 0_1
-frame_value_range: auto
-```
-
-For explicit ranges, the implementation validates min/max once and caches the resolved range. This avoids a CUDA-to-host min/max sync every step.
-
-For `auto`, the implementation checks every batch. This is slower, but avoids incorrectly caching a first all-black uint8 batch as `[0, 1]`.
-
-The default robot config uses:
-
-```yaml
-frame_value_range: uint8
-```
-
-Frames are resized to `input_size` before teacher inference if needed.
-
-## Teacher Forward
-
-Default config:
-
-```yaml
-input_size: 224
-num_tokens: 256
-teacher_feature_source: neck
-teacher_feature_level: 0
-```
-
-For a 224x224 input and `num_tokens: 256`, MoGe encoder features are requested on a 16x16 token grid.
-
-For `teacher_feature_source: neck`, the implementation constructs the normalized view-plane UV inputs expected by MoGe's neck and returns the selected neck feature level.
-
-Teacher features are detached before loss computation:
-
-```text
-teacher_features: [num_images, teacher_feature_dim, H_teacher, W_teacher]
-```
+Those maps are average-pooled to the query output token grid, usually `16x16 = 256`.
 
 ## Loss
 
-Implementation:
+The loss is:
 
 ```text
-direct_feature_distillation_loss
+depth_teacher_loss = SmoothL1(predicted_256_tokens, teacher_256_tokens)
 ```
 
-Inputs:
+The trainer adds it with:
 
 ```text
-predictions:     [num_images, qwen_image_tokens, teacher_feature_dim]
-teacher_output:  {"features": [num_images, teacher_feature_dim, H_teacher, W_teacher]}
-token_grid_hw:   (H_qwen, W_qwen)
+total_loss += depth_teacher_loss * trainer.loss_scale.depth_teacher
 ```
 
-The teacher feature map is average-pooled to the Qwen image-token grid:
-
-```text
-target = adaptive_avg_pool2d(teacher_features, (H_qwen, W_qwen))
-target = flatten_hw_to_tokens(target)
-```
-
-The loss has two terms.
-
-Feature L1:
-
-```text
-l1_loss = mean(abs(predictions - target))
-```
-
-Similarity L1:
-
-```text
-pred_norm = normalize(flatten(predictions), dim=-1)
-target_norm = normalize(flatten(target), dim=-1)
-pred_sim = pred_norm @ pred_norm.T
-target_sim = target_norm @ target_norm.T
-sim_loss = mean(abs(pred_sim - target_sim))
-```
-
-Total auxiliary loss:
-
-```text
-depth_teacher_loss =
-    feature_l1_weight * l1_loss
-  + feature_similarity_weight * sim_loss
-```
-
-Trainer total loss contribution:
-
-```text
-total_loss += depth_teacher_loss * depth_teacher_loss_scale
-```
-
-The default scale is read from:
+The default scale comes from:
 
 ```yaml
 framework.depth_teacher_aux.loss_weight: 0.004
 ```
 
-or can be overridden with:
+or:
 
 ```yaml
-trainer.loss_scale.depth_teacher
+trainer.loss_scale.depth_teacher: 0.004
 ```
-
-## Similarity Subsampling
-
-The similarity matrix is quadratic in token count.
-
-Default:
-
-```yaml
-similarity_max_tokens: 4096
-```
-
-If the flattened token count exceeds the cap, tokens are sampled with `torch.randperm`.
-
-If `train_step` or `similarity_sample_seed` is supplied, the subsampling generator is seeded as:
-
-```text
-seed = similarity_sample_seed + train_step
-```
-
-This keeps the estimator unbiased while making loss curves reproducible across diagnostic runs.
-
-Set `similarity_max_tokens: 0` to disable subsampling.
 
 ## Gradient Behavior
 
-The auxiliary head is trainable. The MoGe teacher is frozen.
+MoGe is always frozen. The query head is trainable.
 
-By default, Qwen image-token hidden states are detached for an initial warmup:
+Qwen hidden states can be detached during an initial warmup:
 
 ```yaml
-detach_vlm_steps: null
+detach_vlm_steps: 5
 detach_vlm_fraction: 0.01
 ```
 
@@ -343,92 +140,52 @@ Resolved detach steps:
 max(detach_vlm_steps or 0, ceil(detach_vlm_fraction * trainer.max_train_steps))
 ```
 
-During detach warmup:
+During warmup, the geometry head learns the teacher feature space before the auxiliary loss updates Qwen or Qwen LoRA parameters.
 
-```text
-Qwen hidden states -> detach -> auxiliary head -> loss
-```
+## Checkpoints
 
-After detach warmup:
-
-```text
-Qwen hidden states -> auxiliary head -> loss
-```
-
-This lets the projection head learn a reasonable teacher-space mapping before the auxiliary loss can update Qwen or Qwen LoRA parameters.
-
-If Qwen is fully frozen and no LoRA is active, the aux path can still train the projection head. For that dry-run mode, the config must explicitly set:
-
-```yaml
-framework:
-  depth_teacher_aux:
-    allow_frozen_qwen: true
-```
-
-Otherwise the trainer raises, because an enabled aux path with no trainable Qwen path is usually a configuration error.
-
-## Checkpoint Semantics
-
-The auxiliary head is part of the VLA-JEPA model state dict:
+The trainable query head is saved under:
 
 ```text
 depth_teacher_aux_head.*
 ```
 
-The MoGe teacher is not part of the state dict.
+The MoGe teacher is not saved in VLA-JEPA checkpoints.
 
-Checkpoint loading filters only this known compatibility boundary:
+Checkpoint loading allows only this known compatibility boundary:
 
-- missing `depth_teacher_aux_head.*` is allowed when loading an old checkpoint into an aux-enabled model
-- unexpected `depth_teacher_aux_head.*` is allowed when loading an aux checkpoint into an aux-disabled model
-- all other missing or unexpected keys still fail normally
+- missing `depth_teacher_aux_head.*` when loading an old checkpoint into an aux-enabled model
+- unexpected `depth_teacher_aux_head.*` when loading an aux checkpoint into an aux-disabled model
 
 ## Config Surface
-
-Relevant config block:
 
 ```yaml
 framework:
   depth_teacher_aux:
-    enabled: false
-    mode: direct
-    teacher_model: Ruicheng/moge-2-vitl-normal
+    enabled: true
+    mode: query
+    teacher_model: Ruicheng/moge-2-vits-normal
+    moge_repo_path: /path/to/MoGe
     input_size: 224
     num_tokens: 256
+    num_task_tokens: 8
+    num_output_tokens: 256
+    geometry_token_template: <|geometry_{}|>
+    query_num_layers: 1
+    query_num_heads: 4
+    query_dim_head: 32
+    query_ff_mult: 1.0
+    query_smooth_l1_beta: 1.0
     teacher_feature_source: neck
     teacher_feature_level: 0
     teacher_feature_dim: auto
     frame_value_range: uint8
     loss_weight: 0.004
-    detach_vlm_steps: null
+    detach_vlm_steps: 5
     detach_vlm_fraction: 0.01
-    head_hidden_multiplier: 2.0
-    head_layer_norm: false
-    head_final_init_std: 0.0
-    feature_l1_weight: 1.0
-    feature_similarity_weight: 1.0
-    similarity_max_tokens: 4096
+    use_fp16: true
+    allow_frozen_qwen: false
+    allow_zero_loss_scale: false
 ```
 
-Optional operational knobs:
-
-```yaml
-moge_repo_path: /path/to/moge
-eager_load_on_cpu: false
-use_fp16: true
-similarity_sample_seed: 0
-allow_frozen_qwen: false
-allow_zero_loss_scale: false
-```
-
-## Known Technical Constraints
-
-The implementation currently assumes Qwen receives one image per view, corresponding to the last temporal frame. If Qwen is changed to consume multiple temporal frames per view, the teacher target path must be updated to pass the same frames through MoGe.
-
-The direct loss assumes all images in a batch share the same Qwen token grid. Mixed-resolution image-token grids are rejected.
-
-The teacher feature target uses average pooling from MoGe grid to Qwen grid. This matches the direct feature-distillation shape requirement, but it is still an approximation when the two grids differ.
-
-For multi-node training, the teacher weights should be pre-staged to avoid every rank downloading the same model from Hugging Face Hub.
-
-`compile_qwen_model: true` with `find_unused_parameters: true` is warned about because `torch.compile` and DDP unused-parameter traversal can interact poorly. This needs a real multi-GPU smoke test before long runs.
+The Qwen prompt must include `{geometry}` when the branch is enabled. If it is missing, VLA-JEPA appends the geometry tokens to the prompt automatically.
