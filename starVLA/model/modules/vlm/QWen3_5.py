@@ -515,7 +515,12 @@ class _QWen3_5_Interface(nn.Module):
         with torch.autocast("cuda", dtype=torch.bfloat16):
             return self.model(**kwargs)
 
-    def forward_features(self, **kwargs) -> torch.Tensor:
+    def forward_features(
+        self,
+        token_replacement_embeds: Optional[torch.Tensor] = None,
+        token_replacement_mask: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> torch.Tensor:
         """
         Feature-extraction path: runs only the base transformer (no LM head, no
         intermediate hidden states stored).  Returns last_hidden_state directly.
@@ -526,8 +531,105 @@ class _QWen3_5_Interface(nn.Module):
         kwargs["output_hidden_states"] = False
         kwargs["output_attentions"] = False
         kwargs["return_dict"] = True
+        if token_replacement_embeds is not None or token_replacement_mask is not None:
+            return self._forward_features_with_token_replacements(
+                token_replacement_embeds=token_replacement_embeds,
+                token_replacement_mask=token_replacement_mask,
+                **kwargs,
+            )
         with torch.autocast("cuda", dtype=torch.bfloat16):
             base_outputs = self.model.model(**kwargs)
+        return base_outputs.last_hidden_state
+
+    def _forward_features_with_token_replacements(
+        self,
+        *,
+        token_replacement_embeds: torch.Tensor,
+        token_replacement_mask: torch.Tensor,
+        **kwargs,
+    ) -> torch.Tensor:
+        if token_replacement_embeds is None or token_replacement_mask is None:
+            raise ValueError("Both token_replacement_embeds and token_replacement_mask are required.")
+        input_ids = kwargs.pop("input_ids")
+        attention_mask = kwargs.pop("attention_mask", None)
+        position_ids = kwargs.pop("position_ids", None)
+        past_key_values = kwargs.pop("past_key_values", None)
+        pixel_values = kwargs.pop("pixel_values", None)
+        pixel_values_videos = kwargs.pop("pixel_values_videos", None)
+        image_grid_thw = kwargs.pop("image_grid_thw", None)
+        video_grid_thw = kwargs.pop("video_grid_thw", None)
+        mm_token_type_ids = kwargs.pop("mm_token_type_ids", None)
+        kwargs.pop("inputs_embeds", None)
+
+        qwen_model = self.model.model
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            inputs_embeds = self.model.get_input_embeddings()(input_ids)
+
+            if pixel_values is not None:
+                image_outputs = qwen_model.get_image_features(
+                    pixel_values,
+                    image_grid_thw,
+                    return_dict=True,
+                )
+                image_embeds = image_outputs.pooler_output
+                image_embeds = torch.cat(image_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+                image_mask, _ = qwen_model.get_placeholder_mask(
+                    input_ids,
+                    inputs_embeds=inputs_embeds,
+                    image_features=image_embeds,
+                )
+                inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+
+            if pixel_values_videos is not None:
+                video_outputs = qwen_model.get_video_features(
+                    pixel_values_videos,
+                    video_grid_thw,
+                    return_dict=True,
+                )
+                video_embeds = video_outputs.pooler_output
+                video_embeds = torch.cat(video_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+                _, video_mask = qwen_model.get_placeholder_mask(
+                    input_ids,
+                    inputs_embeds=inputs_embeds,
+                    video_features=video_embeds,
+                )
+                inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
+
+            replacement_mask = token_replacement_mask.to(device=inputs_embeds.device, dtype=torch.bool)
+            replacement_embeds = token_replacement_embeds.to(device=inputs_embeds.device, dtype=inputs_embeds.dtype)
+            if replacement_mask.shape != input_ids.shape:
+                raise ValueError(
+                    f"token_replacement_mask shape {tuple(replacement_mask.shape)} does not match "
+                    f"input_ids shape {tuple(input_ids.shape)}"
+                )
+            expected_values = int(replacement_mask.sum().item()) * inputs_embeds.shape[-1]
+            if replacement_embeds.numel() != expected_values:
+                raise ValueError(
+                    "token_replacement_embeds did not match replacement mask: "
+                    f"expected {expected_values} values, got {replacement_embeds.numel()}"
+                )
+            expanded_mask = replacement_mask.unsqueeze(-1).expand_as(inputs_embeds)
+            inputs_embeds = inputs_embeds.masked_scatter(expanded_mask, replacement_embeds.reshape(-1))
+
+            if position_ids is None:
+                position_ids = qwen_model.compute_3d_position_ids(
+                    input_ids=input_ids,
+                    image_grid_thw=image_grid_thw,
+                    video_grid_thw=video_grid_thw,
+                    inputs_embeds=inputs_embeds,
+                    attention_mask=attention_mask,
+                    past_key_values=past_key_values,
+                    mm_token_type_ids=mm_token_type_ids,
+                )
+
+            base_outputs = qwen_model.language_model(
+                input_ids=None,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                **kwargs,
+            )
         return base_outputs.last_hidden_state
 
     def generate(self, **kwargs):
@@ -578,6 +680,77 @@ class _QWen3_5_Interface(nn.Module):
         )
         self._chat_wrapper_cache[cache_key] = wrapper
         return wrapper
+
+    def _get_interleaved_chat_wrapper(
+        self,
+        num_images: int,
+        *,
+        add_generation_prompt: bool,
+    ) -> tuple[str, str, str]:
+        cache_key = ("interleaved", int(num_images), bool(add_generation_prompt))
+        cached = self._chat_wrapper_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        prefix_sentinel = "__STARVLA_PREFIX_SENTINEL__"
+        suffix_sentinel = "__STARVLA_SUFFIX_SENTINEL__"
+        content = [{"type": "text", "text": prefix_sentinel}]
+        content.extend({"type": "image", "image": f"dummy_{i}"} for i in range(num_images))
+        content.append({"type": "text", "text": suffix_sentinel})
+        rendered = self.processor.apply_chat_template(
+            [[{"role": "user", "content": content}]],
+            tokenize=False,
+            add_generation_prompt=add_generation_prompt,
+        )[0]
+        prefix_index = rendered.find(prefix_sentinel)
+        suffix_index = rendered.find(suffix_sentinel)
+        if prefix_index < 0 or suffix_index < 0 or suffix_index < prefix_index:
+            raise ValueError("Failed to derive interleaved Qwen chat wrapper")
+        wrapper = (
+            rendered[:prefix_index],
+            rendered[prefix_index + len(prefix_sentinel):suffix_index],
+            rendered[suffix_index + len(suffix_sentinel):],
+        )
+        self._chat_wrapper_cache[cache_key] = wrapper
+        return wrapper
+
+    @staticmethod
+    def _leading_special_token(text: str) -> Optional[str]:
+        if not text.startswith("<|"):
+            return None
+        end = text.find("|>")
+        if end < 0:
+            return None
+        return text[: end + 2]
+
+    def _split_prompt_for_interleaved_images(
+        self,
+        prompt: str,
+        prompt_replace_dict=None,
+    ) -> tuple[str, str, bool]:
+        if not prompt_replace_dict:
+            return prompt, "", False
+
+        split_markers = []
+        for placeholder in ("{state}", "{e_actions}", "{actions}", "{geometry}"):
+            value = prompt_replace_dict.get(placeholder)
+            if not value:
+                continue
+            split_markers.append(value)
+            leading = self._leading_special_token(value)
+            if leading is not None:
+                split_markers.append(leading)
+
+        marker_positions = [
+            position
+            for marker in split_markers
+            if (position := prompt.find(marker)) >= 0
+        ]
+        if not marker_positions:
+            return prompt, "", False
+
+        split_position = min(marker_positions)
+        return prompt[:split_position], prompt[split_position:], True
 
     def build_qwenvl_inputs_from_frames_tensor(
         self,
@@ -667,11 +840,23 @@ class _QWen3_5_Interface(nn.Module):
             )
             for instruction in instructions
         ]
-        prefix, suffix = self._get_chat_wrapper(V, add_generation_prompt=True)
-        rendered_text = [
-            f"{prefix}{prompt}{suffix}".replace(self.processor.image_token, self.processor.image_token * num_image_tokens)
-            for prompt in prompts
-        ]
+        image_token_run = self.processor.image_token * num_image_tokens
+        rendered_text = []
+        for prompt in prompts:
+            prompt_prefix, prompt_suffix, use_interleaved = self._split_prompt_for_interleaved_images(
+                prompt,
+                prompt_replace_dict=prompt_replace_dict,
+            )
+            if use_interleaved:
+                prefix, image_middle, suffix = self._get_interleaved_chat_wrapper(
+                    V,
+                    add_generation_prompt=True,
+                )
+                rendered = f"{prefix}{prompt_prefix}{image_middle}{prompt_suffix}{suffix}"
+            else:
+                prefix, suffix = self._get_chat_wrapper(V, add_generation_prompt=True)
+                rendered = f"{prefix}{prompt}{suffix}"
+            rendered_text.append(rendered.replace(self.processor.image_token, image_token_run))
 
         tokenizer_kwargs = {
             "padding": True,
@@ -718,11 +903,22 @@ class _QWen3_5_Interface(nn.Module):
             ]
             rendered_text = []
             for imgs, prompt in zip(images, prompts):
-                prefix, suffix = self._get_chat_wrapper(
-                    len(imgs),
-                    add_generation_prompt=True,
+                prompt_prefix, prompt_suffix, use_interleaved = self._split_prompt_for_interleaved_images(
+                    prompt,
+                    prompt_replace_dict=prompt_replace_dict,
                 )
-                rendered_text.append(f"{prefix}{prompt}{suffix}")
+                if use_interleaved:
+                    prefix, image_middle, suffix = self._get_interleaved_chat_wrapper(
+                        len(imgs),
+                        add_generation_prompt=True,
+                    )
+                    rendered_text.append(f"{prefix}{prompt_prefix}{image_middle}{prompt_suffix}{suffix}")
+                else:
+                    prefix, suffix = self._get_chat_wrapper(
+                        len(imgs),
+                        add_generation_prompt=True,
+                    )
+                    rendered_text.append(f"{prefix}{prompt}{suffix}")
 
             batch_inputs = self.processor(
                 text=rendered_text,
@@ -750,8 +946,6 @@ class _QWen3_5_Interface(nn.Module):
         messages = []
         assert len(images) == len(instructions), "Images and instructions must have the same length"
         for imgs, instruction in zip(images, instructions):
-            content = [{"type": "image", "image": img} for img in imgs]
-
             if prompt_template is None:
                 if "CoT_prompt" in self.config.datasets.vla_data:
                     prompt = self.config.datasets.vla_data.get("CoT_prompt", "").replace("{instruction}", instruction)
@@ -766,7 +960,20 @@ class _QWen3_5_Interface(nn.Module):
                     for k, v in prompt_replace_dict.items():
                         prompt = prompt.replace(k, v)
 
-            content.append({"type": "text", "text": prompt})
+            prompt_prefix, prompt_suffix, use_interleaved = self._split_prompt_for_interleaved_images(
+                prompt,
+                prompt_replace_dict=prompt_replace_dict,
+            )
+            if use_interleaved:
+                content = []
+                if prompt_prefix:
+                    content.append({"type": "text", "text": prompt_prefix})
+                content.extend({"type": "image", "image": img} for img in imgs)
+                if prompt_suffix:
+                    content.append({"type": "text", "text": prompt_suffix})
+            else:
+                content = [{"type": "image", "image": img} for img in imgs]
+                content.append({"type": "text", "text": prompt})
             msg = [{"role": "user", "content": content}]
 
             if solutions is not None:

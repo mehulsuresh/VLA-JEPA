@@ -87,6 +87,83 @@ def test_dit_accepts_per_token_timesteps():
     assert per_token.shape == (2, 7, 8)
 
 
+def test_dit_applies_encoder_attention_mask_to_cross_attention():
+    torch.manual_seed(0)
+    model = DiT(
+        num_attention_heads=2,
+        attention_head_dim=4,
+        output_dim=8,
+        num_layers=1,
+        dropout=0.0,
+        final_dropout=False,
+        positional_embeddings=None,
+        cross_attention_dim=6,
+    )
+    model.eval()
+    hidden = torch.randn(2, 7, 8)
+    context = torch.randn(2, 4, 6)
+    changed_context = context.clone()
+    changed_context[:, -1] += 1000.0
+    encoder_attention_mask = torch.zeros(2, 1, 4)
+    encoder_attention_mask[:, :, -1] = -10000.0
+    timestep = torch.ones(2, dtype=torch.long)
+
+    masked_reference = model(
+        hidden,
+        context,
+        timestep=timestep,
+        encoder_attention_mask=encoder_attention_mask,
+    )
+    masked_changed = model(
+        hidden,
+        changed_context,
+        timestep=timestep,
+        encoder_attention_mask=encoder_attention_mask,
+    )
+    unmasked_changed = model(hidden, changed_context, timestep=timestep)
+
+    assert torch.allclose(masked_reference, masked_changed, atol=1e-5)
+    assert not torch.allclose(masked_reference, unmasked_changed, atol=1e-3)
+
+
+def test_dit_accepts_query_specific_encoder_attention_mask():
+    torch.manual_seed(0)
+    model = DiT(
+        num_attention_heads=2,
+        attention_head_dim=4,
+        output_dim=8,
+        num_layers=1,
+        dropout=0.0,
+        final_dropout=False,
+        positional_embeddings=None,
+        cross_attention_dim=6,
+    )
+    model.eval()
+    hidden = torch.randn(1, 7, 8)
+    context = torch.randn(1, 4, 6)
+    changed_context = context.clone()
+    changed_context[:, -1] += 1000.0
+    encoder_attention_mask = torch.zeros(1, hidden.shape[1], context.shape[1])
+    encoder_attention_mask[:, :3, -1] = -10000.0
+    timestep = torch.ones(1, dtype=torch.long)
+
+    masked_reference = model(
+        hidden,
+        context,
+        timestep=timestep,
+        encoder_attention_mask=encoder_attention_mask,
+    )
+    masked_changed = model(
+        hidden,
+        changed_context,
+        timestep=timestep,
+        encoder_attention_mask=encoder_attention_mask,
+    )
+
+    assert torch.allclose(masked_reference[:, :3], masked_changed[:, :3], atol=1e-5)
+    assert not torch.allclose(masked_reference[:, 3:], masked_changed[:, 3:], atol=1e-3)
+
+
 def _make_gr00t_full_cfg(rtc_training=None):
     full_cfg = SimpleNamespace(
         framework=SimpleNamespace(
@@ -253,6 +330,26 @@ class _ZeroModel(nn.Module):
         return torch.zeros_like(hidden_states)
 
 
+class _CaptureModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.attention_mask = None
+        self.encoder_attention_mask = None
+
+    def forward(
+        self,
+        hidden_states,
+        encoder_hidden_states,
+        timestep,
+        attention_mask=None,
+        encoder_attention_mask=None,
+        return_all_hidden_states=False,
+    ):
+        self.attention_mask = attention_mask
+        self.encoder_attention_mask = encoder_attention_mask
+        return torch.zeros_like(hidden_states)
+
+
 class _ZeroActionDecoder(nn.Module):
     def __init__(self, action_dim):
         super().__init__()
@@ -265,6 +362,94 @@ class _ZeroActionDecoder(nn.Module):
             device=hidden_states.device,
             dtype=hidden_states.dtype,
         )
+
+
+def test_gr00t_head_passes_encoder_attention_mask_to_dit():
+    head = FlowmatchingActionHead(_make_gr00t_full_cfg(None))
+    capture_model = _CaptureModel()
+    head.model = capture_model
+    head.action_decoder = _ZeroActionDecoder(action_dim=3)
+
+    vl_embs = torch.randn(2, 4, 16)
+    actions = torch.randn(2, 5, 3)
+    state = torch.randn(2, 1, 3)
+    encoder_attention_mask = torch.zeros(2, 1, 4)
+    encoder_attention_mask[:, :, -1] = -10000.0
+
+    loss = head(
+        vl_embs,
+        actions,
+        state,
+        encoder_attention_mask=encoder_attention_mask,
+    )
+
+    assert loss.ndim == 0
+    assert capture_model.encoder_attention_mask is encoder_attention_mask
+
+
+def test_gr00t_head_passes_self_attention_mask_to_dit():
+    head = FlowmatchingActionHead(_make_gr00t_full_cfg(None))
+    capture_model = _CaptureModel()
+    head.model = capture_model
+    head.action_decoder = _ZeroActionDecoder(action_dim=3)
+
+    vl_embs = torch.randn(2, 4, 16)
+    actions = torch.randn(2, 5, 3)
+    state = torch.randn(2, 1, 3)
+    attention_mask = torch.zeros(2, 8, 8)
+    attention_mask[:, :3, 3:] = -10000.0
+
+    loss = head(
+        vl_embs,
+        actions,
+        state,
+        attention_mask=attention_mask,
+    )
+
+    assert loss.ndim == 0
+    assert capture_model.attention_mask is attention_mask
+
+
+def test_gr00t_predict_action_passes_encoder_attention_mask_to_dit():
+    head = FlowmatchingActionHead(_make_gr00t_full_cfg(None))
+    capture_model = _CaptureModel()
+    head.model = capture_model
+    head.action_decoder = _ZeroActionDecoder(action_dim=3)
+
+    vl_embs = torch.randn(2, 4, 16)
+    state = torch.randn(2, 1, 3)
+    encoder_attention_mask = torch.zeros(2, 1, 4)
+    encoder_attention_mask[:, :, -1] = -10000.0
+
+    pred = head.predict_action(
+        vl_embs,
+        state,
+        encoder_attention_mask=encoder_attention_mask,
+    )
+
+    assert pred.shape == (2, 5, 3)
+    assert capture_model.encoder_attention_mask is encoder_attention_mask
+
+
+def test_gr00t_predict_action_passes_self_attention_mask_to_dit():
+    head = FlowmatchingActionHead(_make_gr00t_full_cfg(None))
+    capture_model = _CaptureModel()
+    head.model = capture_model
+    head.action_decoder = _ZeroActionDecoder(action_dim=3)
+
+    vl_embs = torch.randn(2, 4, 16)
+    state = torch.randn(2, 1, 3)
+    attention_mask = torch.zeros(2, 8, 8)
+    attention_mask[:, :3, 3:] = -10000.0
+
+    pred = head.predict_action(
+        vl_embs,
+        state,
+        attention_mask=attention_mask,
+    )
+
+    assert pred.shape == (2, 5, 3)
+    assert capture_model.attention_mask is attention_mask
 
 
 def test_gr00t_head_rtc_fixed_delay_loss_matches_manual_mask(monkeypatch):
