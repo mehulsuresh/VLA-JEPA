@@ -1,4 +1,6 @@
 import torch
+import yaml
+from pathlib import Path
 
 from starVLA.model.framework.VLA_JEPA import VLA_JEPA
 from starVLA.model.modules.vlm.QWen3_5 import _QWen3_5_Interface
@@ -175,3 +177,25 @@ def test_qwen_prompt_split_places_images_before_state_and_action_slots():
     assert use_interleaved
     assert prefix == "Your task is stack the cup. "
     assert suffix.startswith("<|state_0|>")
+
+
+def test_vla_jepa_configs_declare_state_tokens_and_ordered_prompts():
+    for path in sorted(Path("scripts/config").glob("vlajepa_robot_ft*.yaml")):
+        with path.open("r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f)
+
+        framework_cfg = cfg["framework"]
+        assert framework_cfg["name"] == "VLA_JEPA", path
+        assert framework_cfg["qwen_state"] == {
+            "num_tokens": 8,
+            "token_template": "<|state_{}|>",
+        }, path
+
+        prompt = cfg["datasets"]["vla_data"]["CoT_prompt"]
+        assert "temporal dynamics from frames" not in prompt, path
+        assert prompt.index("{state}") < prompt.index("{e_actions}") < prompt.index("{actions}"), path
+        if framework_cfg.get("depth_teacher_aux", {}).get("enabled", False):
+            assert "{geometry}" in prompt, path
+            assert prompt.index("{actions}") < prompt.index("{geometry}"), path
+        else:
+            assert "{geometry}" not in prompt, path

@@ -925,10 +925,16 @@ class VLA_JEPA(baseframework):
             prompt_replace_dict["{actions}"] = self.replace_prompt
         if has_actions and "{e_actions}" not in prompt_replace_dict:
             prompt_replace_dict["{e_actions}"] = self.embodied_replace_prompt
+        elif not has_actions:
+            prompt_replace_dict.setdefault("{e_actions}", "")
         if self.depth_teacher_aux_enabled:
             prompt_replace_dict["{geometry}"] = self.geometry_replace_prompt
+        else:
+            prompt_replace_dict.setdefault("{geometry}", "")
         if has_state and self.qwen_state_projector is not None:
             prompt_replace_dict["{state}"] = self.qwen_state_replace_prompt
+        else:
+            prompt_replace_dict.setdefault("{state}", "")
 
         if prompt_template is None:
             prompt_template = self.config.datasets.vla_data.get("CoT_prompt", "")

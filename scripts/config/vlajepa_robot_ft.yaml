@@ -10,6 +10,9 @@ framework:
     base_vlm: /home/dataset-local/models/Qwen3-VL-2B-Instruct
     attn_implementation: flash_attention_2
     vl_hidden_dim: 2048
+  qwen_state:
+    num_tokens: 8
+    token_template: <|state_{}|>
   action_model:
     action_model_type: DiT-B
     action_hidden_dim: 1024
@@ -87,7 +90,7 @@ datasets:
     data_root_dir: /home/dataset-local/datasets/LeRobot/LEROBOT_LIBERO_DATA
     data_mix: libero_all
     action_type: delta_qpos
-    CoT_prompt: "Your task is {instruction}. Infer the temporal dynamics from frames {actions} {geometry} and produce the corresponding policy actions {e_actions}."
+    CoT_prompt: "Your task is {instruction}. Use the robot observations and state to produce the corresponding policy actions. {state}{e_actions}{actions}"
     #CoT_answer: bbox
     resolution_size: 224   # image input of VLA will be resized and video will not, video will be precessed by world model videoprocessor
     per_device_batch_size: 32

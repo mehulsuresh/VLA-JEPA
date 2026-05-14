@@ -12,6 +12,9 @@ framework:
     attn_implementation: flash_attention_2
     enable_fast_linear_attention: true
     vl_hidden_dim: 1024
+  qwen_state:
+    num_tokens: 8
+    token_template: <|state_{}|>
   action_model:
     action_model_type: DiT-B
     action_hidden_dim: 1024
@@ -90,7 +93,7 @@ datasets:
     sidecar_normalization: shard_q01_q99
     sidecar_dtype: float16
     video_decode_backend: auto
-    CoT_prompt: "Your task is {instruction}. Infer the temporal dynamics from frames {actions} and produce the corresponding policy actions {e_actions}."
+    CoT_prompt: "Your task is {instruction}. Use the robot observations and state to produce the corresponding policy actions. {state}{e_actions}{actions}"
     resolution_size: 224
     video_resolution_size: 384
     video_frame_stride: 10

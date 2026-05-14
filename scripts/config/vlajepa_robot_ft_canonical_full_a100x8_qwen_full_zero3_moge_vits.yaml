@@ -39,6 +39,9 @@ framework:
     strict_attn_implementation: true
     strict_tensor_input_fast_path: true
     strict_full_trainable: true
+  qwen_state:
+    num_tokens: 8
+    token_template: <|state_{}|>
   action_model:
     action_model_type: DiT-B
     action_hidden_dim: 1024
@@ -166,7 +169,7 @@ datasets:
     shuffle_shards: true
     shuffle_seed: 42
     shuffle: false
-    CoT_prompt: "Your task is {instruction}. Infer the temporal dynamics from frames {actions} {geometry} and produce the corresponding policy actions {e_actions}."
+    CoT_prompt: "Your task is {instruction}. Use the robot observations and state to produce the corresponding policy actions. {state}{e_actions}{actions}{geometry}"
     resolution_size: 224
     video_resolution_size: 384
     video_frame_stride: 10
