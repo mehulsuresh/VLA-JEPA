@@ -1073,12 +1073,12 @@ class VLA_JEPA(baseframework):
         """
         Build the VLM context visible to the flow-matching action head.
 
-        The action head should condition on Qwen's observation/instruction
-        prefix and the embodied-action query slots. V-JEPA action prompt tokens
-        and geometry-teacher query tokens are auxiliary branch inputs, so they
-        are masked out here. Non-embodied tokens after the first auxiliary token
-        are also masked because Qwen causal attention has already let those
-        positions see the auxiliary branch tokens.
+        The action head conditions on ordered text/image/state context and the
+        embodied-action query slots. V-JEPA action prompt tokens and geometry
+        query tokens are auxiliary branch inputs, so they are masked out here.
+        Non-embodied tokens after the first auxiliary token are also masked
+        because their Qwen hidden states may already include auxiliary-branch
+        information.
         """
         input_ids = qwen_inputs["input_ids"]
         if input_ids.ndim != 2:
@@ -1117,7 +1117,6 @@ class VLA_JEPA(baseframework):
 
         positions = torch.arange(input_ids.shape[1], device=input_ids.device).unsqueeze(0)
         last_embodied_position = embodied_mask.to(dtype=positions.dtype).mul(positions).amax(dim=1)
-        causal_prefix_mask = positions <= last_embodied_position.unsqueeze(1)
         auxiliary_positions = torch.where(
             auxiliary_mask,
             positions.expand_as(input_ids),
@@ -1125,8 +1124,9 @@ class VLA_JEPA(baseframework):
         )
         first_auxiliary_position = auxiliary_positions.amin(dim=1)
         pre_auxiliary_mask = positions < first_auxiliary_position.unsqueeze(1)
+        before_last_embodied_mask = positions <= last_embodied_position.unsqueeze(1)
         keep_mask = valid_mask & ~auxiliary_mask & (
-            (causal_prefix_mask & pre_auxiliary_mask) | state_mask | embodied_mask
+            (before_last_embodied_mask & pre_auxiliary_mask) | state_mask | embodied_mask
         )
 
         context = last_hidden.masked_fill(~keep_mask.unsqueeze(-1), 0)
