@@ -155,14 +155,14 @@
   <rect x="1660" y="338" width="86" height="24" rx="12" fill="#FAD8C0"/>
   <text x="1703" y="354" class="chip" text-anchor="middle" fill="#7A3F0E">FROZEN</text>
 
-  <!-- Trainable head: DirectGeoHead -->
+  <!-- Trainable head: QueryGeoHead -->
   <rect x="1234" y="478" width="512" height="226" rx="18" fill="#EDF8EF" stroke="#69A875" stroke-width="2" filter="url(#shadow)"/>
-  <text x="1252" y="506" class="label">DirectGeometryTeacherHead</text>
-  <text x="1252" y="530" class="body">MLP : Qwen image-token hiddens → MoGe feature space</text>
-  <text x="1252" y="556" class="small">• Pooled feature L1 + cosine similarity</text>
-  <text x="1252" y="578" class="small">• similarity_max_tokens = 4096 (memory bound)</text>
+  <text x="1252" y="506" class="label">QueryGeometryTeacherHead</text>
+  <text x="1252" y="530" class="body">Qwen image hiddens + geometry tokens → MoGe tokens</text>
+  <text x="1252" y="556" class="small">• SmoothL1 over 256 teacher feature tokens</text>
+  <text x="1252" y="578" class="small">• 8 dedicated geometry prompt tokens per view</text>
   <text x="1252" y="600" class="small">• Optional Qwen-detach during early steps</text>
-  <text x="1252" y="622" class="small">• Mode: direct · feature distillation, not depth regression</text>
+  <text x="1252" y="622" class="small">• Query-only feature distillation, not depth regression</text>
   <text x="1252" y="650" class="small">Disabled by default; gated by depth_teacher_aux.enabled</text>
   <rect x="1610" y="488" width="126" height="24" rx="12" fill="#DDF2E1"/>
   <text x="1673" y="504" class="chip" text-anchor="middle" fill="#2F6A35">TRAINABLE</text>

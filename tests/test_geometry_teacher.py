@@ -8,7 +8,8 @@ import torch.nn as nn
 from starVLA.model.framework.VLA_JEPA import VLA_JEPA
 from starVLA.model.modules.geometry_teacher import (
     MoGeGeometryTeacher,
-    direct_feature_distillation_loss,
+    QueryGeometryTeacherHead,
+    query_feature_distillation_loss,
 )
 from starVLA.training.trainer_utils.trainer_tools import (
     is_depth_teacher_aux_missing_key_allowed,
@@ -35,16 +36,14 @@ def test_known_moge_feature_dim_without_loading_weights_on_cpu():
 def test_loss_finite_at_zero_init():
     pred = torch.zeros(1, 16, 8, requires_grad=True)
     target = torch.randn(1, 8, 4, 4)
-    loss, metrics = direct_feature_distillation_loss(
+    loss, metrics = query_feature_distillation_loss(
         pred,
         {"features": target},
-        (4, 4),
-        {"similarity_max_tokens": 0},
+        {"query_smooth_l1_beta": 1.0},
     )
     loss.backward()
     assert torch.isfinite(loss)
-    assert torch.isfinite(metrics["depth_teacher_feature_l1_loss"])
-    assert torch.isfinite(metrics["depth_teacher_feature_similarity_loss"])
+    assert torch.isfinite(metrics["depth_teacher_query_smooth_l1_loss"])
     assert torch.isfinite(pred.grad).all()
     assert pred.grad.abs().sum() > 0
 
@@ -54,33 +53,33 @@ def test_loss_drives_pred_toward_target():
     pred = torch.nn.Parameter(torch.zeros(1, 16, 8))
     target = torch.randn(1, 8, 4, 4)
     opt = torch.optim.Adam([pred], lr=5e-2)
-    cfg = {"similarity_max_tokens": 0}
+    cfg = {"query_smooth_l1_beta": 1.0}
 
-    initial, _ = direct_feature_distillation_loss(pred, {"features": target}, (4, 4), cfg)
+    initial, _ = query_feature_distillation_loss(pred, {"features": target}, cfg)
     for _ in range(200):
-        loss, _ = direct_feature_distillation_loss(pred, {"features": target}, (4, 4), cfg)
+        loss, _ = query_feature_distillation_loss(pred, {"features": target}, cfg)
         opt.zero_grad()
         loss.backward()
         opt.step()
-    final, _ = direct_feature_distillation_loss(pred, {"features": target}, (4, 4), cfg)
+    final, _ = query_feature_distillation_loss(pred, {"features": target}, cfg)
 
     assert final.item() < initial.item() * 0.1
 
 
-def test_similarity_subsampling_is_deterministic_for_train_step():
+def test_query_geometry_head_shape():
     torch.manual_seed(0)
-    pred = torch.randn(2, 16, 8, requires_grad=True)
-    target = torch.randn(2, 8, 4, 4)
-    cfg = {"similarity_max_tokens": 8, "similarity_sample_seed": 17}
-
-    loss_a, metrics_a = direct_feature_distillation_loss(pred, {"features": target}, (4, 4), cfg, train_step=5)
-    loss_b, metrics_b = direct_feature_distillation_loss(pred, {"features": target}, (4, 4), cfg, train_step=5)
-
-    assert torch.allclose(loss_a, loss_b)
-    assert torch.allclose(
-        metrics_a["depth_teacher_feature_similarity_loss"],
-        metrics_b["depth_teacher_feature_similarity_loss"],
+    head = QueryGeometryTeacherHead(
+        hidden_size=16,
+        output_size=8,
+        num_output_tokens=16,
+        num_layers=1,
+        num_heads=2,
+        dim_head=4,
     )
+    context = torch.randn(6, 12, 16)
+    pred = head(context)
+
+    assert pred.shape == (6, 16, 8)
 
 
 def test_image_token_gather_alignment():

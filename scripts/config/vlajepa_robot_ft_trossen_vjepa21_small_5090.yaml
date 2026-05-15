@@ -12,6 +12,9 @@ framework:
     attn_implementation: flash_attention_2
     enable_fast_linear_attention: true
     vl_hidden_dim: 1024
+  qwen_state:
+    num_tokens: 8
+    token_template: <|state_{}|>
   action_model:
     action_model_type: DiT-B
     action_hidden_dim: 1024
@@ -73,7 +76,7 @@ datasets:
     dataset_py: preprocessed_subtask_dataset
     data_root_dir: /home/mehul/work/reward_model_small/Subtask_dataset/subtask_labelled_combined_preprocessed
     action_type: delta_qpos
-    CoT_prompt: "Your task is {instruction}. Infer the temporal dynamics from frames {actions} and produce the corresponding policy actions {e_actions}."
+    CoT_prompt: "Your task is {instruction}. Use the robot observations and state to produce the corresponding policy actions. {state}{e_actions}{actions}"
     instruction_text: "Complete the robot task successfully."
     resolution_size: 224
     video_resolution_size: 384

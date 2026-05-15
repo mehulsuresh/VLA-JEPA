@@ -139,34 +139,28 @@ VLA-JEPA/
 <a id="environment-setup"></a>
 ## ⚙️ Environment Setup
 
-Tested on Python 3.10, PyTorch 2.6.0 with CUDA 12.4 wheels, on both 5090 single-GPU and A100×4/×8 nodes. Full setup notes including system packages and scratch-disk layout live in [`docs/repo_environment_setup.md`](./docs/repo_environment_setup.md).
-
-The fastest path on a fresh machine is:
+The recommended fresh-machine path is now the no-compile Python 3.13 setup. It installs the latest PyPI PyTorch/torchvision pair first, then the small runtime package set in [`requirements-py313-min.txt`](./requirements-py313-min.txt). Full setup notes, optional accelerators, and legacy CUDA 12.4 instructions live in [`docs/repo_environment_setup.md`](./docs/repo_environment_setup.md).
 
 ```bash
-# System prerequisites (Debian/Ubuntu)
-sudo apt-get update
-sudo apt-get install -y python3-venv python3-dev build-essential ninja-build \
-    openmpi-bin libopenmpi-dev cuda-nvcc-12-4 cuda-cudart-dev-12-4 cuda-cccl-12-4
-
-# Repo-managed scratch env (creates conda+pip caches under $VLA_JEPA_SCRATCH)
 cd /path/to/VLA-JEPA
-VLA_JEPA_SCRATCH=/mnt/vla-jepa ./scripts/setup_repo_env.sh
-source .venv/bin/activate
+./scripts/setup_py313_min_env.sh
+conda activate vla-jepa-py313-min
+export PYTHONNOUSERSITE=1
 ```
 
 If you prefer a hand-rolled environment:
 
 ```bash
-conda create -n vla-jepa python=3.10 -y
-conda activate vla-jepa
-conda install -y -c conda-forge openmpi
-pip install -r requirements.txt
-pip install flash-attn --no-build-isolation
+conda create -n vla-jepa-py313-min python=3.13 -y
+conda activate vla-jepa-py313-min
+export PYTHONNOUSERSITE=1
+pip install --upgrade pip "setuptools<82" wheel
+pip install --upgrade torch torchvision
+pip install --upgrade -r requirements-py313-min.txt
 pip install -e .
 ```
 
-Note that `requirements.txt` pins `transformers` to git HEAD because the Qwen 3.5 multimodal class is not yet on PyPI, and pulls MoGe-2 + supporting libraries (`utils3d`, `pipeline`, `moge`) directly from GitHub. NumPy is held on the 1.x ABI by `pyarrow==14.0.1` and the canonical parquet loader.
+This path was smoke-tested on Python 3.13.13 with `torch==2.11.0+cu130` / `torchvision==0.26.0+cu130` on an RTX 5090. It also passed the repo `tests/` suite. FlashAttention, DeepSpeed, bitsandbytes, Decord, MoGe, torchcodec, and wandb are intentionally optional installs instead of default setup blockers. For Trossen/LeRobot training in this env, set `datasets.vla_data.video_backend: pyav`; Decord can still be installed explicitly for older Python stacks or a locally built wheel.
 
 <a id="data-preparation"></a>
 ## 📁 Data Preparation
@@ -356,7 +350,7 @@ For each batch the V-JEPA encoder emits latent tokens for both past and future w
 <a id="moge-loss"></a>
 ### MoGe geometry teacher (depth/normal feature distillation)
 
-Inspired by LingBot-VLA's direct geometry alignment, this is feature-embedding distillation rather than depth/normal regression. A trainable [`DirectGeometryTeacherHead`](./starVLA/model/modules/geometry_teacher.py) projects Qwen image-token hidden states into a frozen MoGe-2 feature space; loss is pooled L1 + cosine-similarity (capped at `similarity_max_tokens` to bound memory). The branch is gated by `framework.depth_teacher_aux.enabled` and is off by default. See [`docs/depth_teacher_aux.md`](./docs/depth_teacher_aux.md) for the full design rationale and grid-alignment invariants.
+Inspired by LingBot-VLA's query depth alignment, this is feature-embedding distillation rather than depth/normal regression. A trainable [`QueryGeometryTeacherHead`](./starVLA/model/modules/geometry_teacher.py) consumes Qwen image hidden states plus dedicated `<|geometry_i|>` prompt tokens and predicts 256 frozen MoGe-2 feature tokens per view with a SmoothL1 target. The branch is gated by `framework.depth_teacher_aux.enabled` and is off by default. See [`docs/depth_teacher_aux.md`](./docs/depth_teacher_aux.md) for the full design rationale and token-alignment invariants.
 
 <a id="rabc"></a>
 ### RA-BC: progress-aware action weighting
@@ -455,7 +449,7 @@ Tests under [`tests/`](./tests):
 
 - Single-GPU (5090) and A100×4/×8 paths are exercised regularly; verify multi-node setups on real hardware before treating them as certified.
 - The framework variants other than `VLA_JEPA` (`M1`, `QwenDual`, `QwenFast`, `QwenGR00T`, `QwenOFT`, `QwenPI`) are kept in the tree as legacy reference implementations and are not part of the active training surface.
-- `lerobot_datasets` uses `decord` as the video backend; `canonical_subset_dataset` uses PyAV; `preprocessed_subtask_dataset` decodes JPEGs directly. If you switch dataset paths, reconfirm the decode environment.
+- `lerobot_datasets` defaults to `decord` as the video backend but can be set to `pyav` with `datasets.vla_data.video_backend`; `canonical_subset_dataset` uses PyAV; `preprocessed_subtask_dataset` decodes JPEGs directly. If you switch dataset paths, reconfirm the decode environment.
 - Mixed precision is handled via manual `bfloat16` autocast within the framework rather than `Accelerate`-AMP; `trainer.mixed_precision: no` is intentional.
 - `find_unused_parameters: true` is required because the wm and depth-teacher branches can be inactive on some steps.
 

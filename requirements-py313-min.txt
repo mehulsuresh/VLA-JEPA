@@ -1,0 +1,43 @@
+# Minimal Python 3.13 runtime stack.
+#
+# Install the latest PyTorch pair first, then install this file:
+#   python -m pip install --upgrade torch torchvision
+#   python -m pip install --upgrade -r requirements-py313-min.txt
+#
+# Keep compile-prone, incompatible, or path-specific packages out of this
+# default file: DeepSpeed/mpi4py, bitsandbytes, FlashAttention, Decord,
+# MoGe, torchcodec, wandb, and deployment-only packages should be installed
+# only when needed.
+accelerate
+albumentations
+av
+cloudpickle
+diffusers
+einops
+fastparquet
+fsspec!=2026.4.0,>=2026.3.0
+gcsfs
+google-cloud-storage
+msgpack
+numpydantic
+omegaconf
+opencv-python-headless
+pandas
+peft
+pillow
+platformdirs
+psutil
+pyarrow
+pydantic
+PyYAML
+qwen-vl-utils
+rich
+scipy
+tensorboard
+tiktoken
+timm
+transformers
+websockets
+
+# Validation/smoke-test helper.
+pytest

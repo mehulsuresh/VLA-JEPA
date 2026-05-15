@@ -29,6 +29,9 @@ framework:
     enable_fast_linear_attention: true
     device_map: null
     vl_hidden_dim: 1024
+  qwen_state:
+    num_tokens: 8
+    token_template: <|state_{}|>
   action_model:
     action_model_type: DiT-B
     action_hidden_dim: 1024
@@ -93,7 +96,7 @@ datasets:
     data_root_dir: playground/Datasets/TROSSEN_SUBTASK_COMBINED
     data_mix: trossen_subtask_combined
     action_type: delta_qpos
-    CoT_prompt: "Your task is {instruction}. Infer the temporal dynamics from frames {actions} and produce the corresponding policy actions {e_actions}."
+    CoT_prompt: "Your task is {instruction}. Use the robot observations and state to produce the corresponding policy actions. {state}{e_actions}{actions}"
     resolution_size: 224
     video_resolution_size: 384
     video_frame_stride: 10

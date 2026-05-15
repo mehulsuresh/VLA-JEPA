@@ -321,12 +321,13 @@ class FlowmatchingActionHead(nn.Module):
             return global_timesteps
         return build_sequence_timesteps(global_timesteps, action_timesteps, n_context_tokens)
 
-
     def forward(
         self,
         vl_embs: torch.Tensor,
         actions: torch.Tensor,
         state: torch.Tensor = None,
+        attention_mask: torch.Tensor = None,
+        encoder_attention_mask: torch.Tensor = None,
         action_mask: torch.Tensor = None,
         reduction: str = "mean",
         train_step: int = None,
@@ -388,12 +389,17 @@ class FlowmatchingActionHead(nn.Module):
         model_timestep = self._build_model_timestep(t_global, t_discretized, n_context_tokens)
 
         # Join VLM features with state and action embedding along sequence dimension.
-        model_output = self.model(
-            hidden_states=sa_embs,
-            encoder_hidden_states=vl_embs,
-            timestep=model_timestep,
-            return_all_hidden_states=False,  # NOTE (YL): not using flare now
-        )
+        model_kwargs = {
+            "hidden_states": sa_embs,
+            "encoder_hidden_states": vl_embs,
+            "timestep": model_timestep,
+            "return_all_hidden_states": False,  # NOTE (YL): not using flare now
+        }
+        if attention_mask is not None:
+            model_kwargs["attention_mask"] = attention_mask
+        if encoder_attention_mask is not None:
+            model_kwargs["encoder_attention_mask"] = encoder_attention_mask
+        model_output = self.model(**model_kwargs)
         pred = self.action_decoder(model_output)
         pred_actions = pred[:, -actions.shape[1] :]
 
@@ -423,6 +429,8 @@ class FlowmatchingActionHead(nn.Module):
         self,
         vl_embs: torch.Tensor,
         state: torch.Tensor = None,
+        attention_mask: torch.Tensor = None,
+        encoder_attention_mask: torch.Tensor = None,
         prev_actions: torch.Tensor = None,
         prefix_len: int = 0,
         rtc_config: dict = None,
@@ -509,13 +517,17 @@ class FlowmatchingActionHead(nn.Module):
                 n_context_tokens,
             )
 
-
             # Run model forward.
-            model_output = self.model(
-                hidden_states=sa_embs,
-                encoder_hidden_states=vl_embs,
-                timestep=model_timestep,
-            )
+            model_kwargs = {
+                "hidden_states": sa_embs,
+                "encoder_hidden_states": vl_embs,
+                "timestep": model_timestep,
+            }
+            if attention_mask is not None:
+                model_kwargs["attention_mask"] = attention_mask
+            if encoder_attention_mask is not None:
+                model_kwargs["encoder_attention_mask"] = encoder_attention_mask
+            model_output = self.model(**model_kwargs)
             pred = self.action_decoder(model_output)
 
             pred_velocity = pred[:, -self.action_horizon :]

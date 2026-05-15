@@ -4,13 +4,26 @@ This runbook captures the reusable Python environment setup for this repo. It in
 
 ## Target Environment
 
-- Python 3.10 or newer
-- PyTorch 2.6.0 with CUDA 12.4 wheels
-- torchvision 0.21.0 with CUDA 12.4 wheels
-- Dependencies from `requirements.txt`
+The current recommended baseline is the Python 3.13 minimal environment:
+
+- Python 3.13
+- Latest PyPI `torch` and `torchvision` compatible with that Python
+- Dependencies from `requirements-py313-min.txt`
 - Editable install of this repo with `pip install -e .`
 
-On Debian or Ubuntu VMs, install the small system prerequisites first:
+On the local RTX 5090 test machine this resolved to:
+
+- `torch==2.11.0+cu130`
+- `torchvision==0.26.0+cu130`
+- `av==17.0.1`
+- `pyarrow==24.0.0`
+- `opencv-python-headless==4.13.0.92`
+
+The canonical one-step smoke train completed on this stack, and `pytest -q tests` passed with 43 passed / 1 skipped.
+
+The older Python 3.10 + PyTorch 2.6.0 CUDA 12.4 setup is still useful when reproducing old runs, but it should no longer be the default for a new machine.
+
+For the Python 3.13 minimal setup, a working NVIDIA driver plus conda is enough; the PyPI PyTorch wheel brings its CUDA runtime. Install the build packages below only for the legacy scratch script or optional native-extension paths such as DeepSpeed MPI discovery, GPU Decord, or source-built FlashAttention:
 
 ```bash
 sudo apt-get update
@@ -20,20 +33,71 @@ sudo apt-get install -y python3-venv python3-dev build-essential ninja-build ope
 `python3-dev` provides `Python.h`, which Triton/DeepSpeed may need when compiling small runtime helpers. `openmpi-bin` and `libopenmpi-dev` keep `mpi4py` and DeepSpeed MPI discovery behavior predictable.
 `ninja-build` lets PyTorch extension builds use parallel compilation; without it, large CUDA extensions may fall back to much slower serial builds.
 
-If the VM does not already have a CUDA toolkit matching the PyTorch wheel CUDA version, install the minimal CUDA 12.4 compiler/runtime-dev packages:
+For the legacy CUDA 12.4 path, if the VM does not already have a CUDA toolkit matching the PyTorch wheel CUDA version, install the minimal CUDA 12.4 compiler/runtime-dev packages:
 
 ```bash
 sudo apt-get install -y cuda-nvcc-12-4 cuda-cudart-dev-12-4 cuda-cccl-12-4
 ```
 
-Then export:
+For the legacy CUDA 12.4 path, export:
 
 ```bash
 export CUDA_HOME=/usr/local/cuda-12.4
 export PATH=$CUDA_HOME/bin:$PATH
 ```
 
-## One Command Setup
+## Python 3.13 Minimal Setup
+
+Use the conda-based helper:
+
+```bash
+cd /path/to/VLA-JEPA
+./scripts/setup_py313_min_env.sh
+conda activate vla-jepa-py313-min
+export PYTHONNOUSERSITE=1
+```
+
+The script intentionally installs only the packages needed for the canonical smoke path, LeRobot/Trossen transforms, tests, and common GCS streaming. It leaves compile-prone, incompatible, or path-specific packages out of the default.
+
+Manual equivalent:
+
+```bash
+conda create -n vla-jepa-py313-min python=3.13 -y
+conda activate vla-jepa-py313-min
+export PYTHONNOUSERSITE=1
+python -m pip install --upgrade pip "setuptools<82" wheel
+python -m pip install --upgrade torch torchvision
+python -m pip install --upgrade -r requirements-py313-min.txt
+python -m pip install -e .
+```
+
+Use PyAV for LeRobot/Trossen video reads in this environment:
+
+```yaml
+datasets:
+  vla_data:
+    video_backend: pyav
+```
+
+Decord 0.6.0 does not publish a clean Python 3.13-compatible wheel. The helper leaves it out by default; install it only when you are using an older Python stack or a locally built wheel:
+
+```bash
+VLA_JEPA_INSTALL_DECORD=1 VLA_JEPA_DECORD_WHEEL=/path/to/decord.whl ./scripts/setup_py313_min_env.sh
+```
+
+Run the one-step canonical smoke:
+
+```bash
+ACCELERATE_BIN="$(which accelerate)" \
+RUN_ID=py313_min_smoke_$(date +%Y%m%d_%H%M%S) \
+./scripts/vlajepa_robot_ft_canonical_multi_subset_5090_smoke.sh \
+  --trainer.max_train_steps 1 \
+  --datasets.vla_data.video_decode_backend pyav \
+  --datasets.vla_data.pyav_thread_count 1 \
+  --datasets.vla_data.num_workers 0
+```
+
+## Legacy Scratch Setup
 
 Use a large scratch mount for the environment, package cache, Hugging Face cache, datasets, and checkpoints:
 
@@ -81,9 +145,11 @@ VLA_JEPA_SCRATCH=/mnt/vla-jepa VLA_JEPA_RECREATE_ENV=1 ./scripts/setup_repo_env.
 
 ## Training Accelerators
 
-### CUDA Decord
+### Decord
 
-The PyPI Decord wheels are CPU-only. That is fine for CPU dataloader video reads, but this repo's rank-side VLA-JEPA GPU video decode path defaults to `gpu_video_decode_backend: decord` and calls `decord.gpu(...)`. Build Decord from source when that path is needed.
+Decord is optional. On Python 3.13, Decord 0.6.0 does not publish a compatible PyPI wheel, so the minimal setup uses PyAV for CPU video reads.
+
+On older Python stacks, the PyPI Decord wheels are CPU-only. That is fine for CPU dataloader video reads, but this repo's rank-side VLA-JEPA GPU video decode path defaults to `gpu_video_decode_backend: decord` and calls `decord.gpu(...)`. Build Decord from source when that path is needed.
 
 Install the additional system packages:
 
@@ -117,7 +183,25 @@ VLA_JEPA_INSTALL_DECORD_GPU=1 \
 ./scripts/setup_repo_env.sh
 ```
 
-FlashAttention is optional in this fork. The Qwen 3.5 path falls back to SDPA when `flash-attn` is unavailable, and the world-model attention code also has a fallback path.
+FlashAttention is optional in this fork. The Qwen 3.5 path falls back to SDPA when `flash-attn` is unavailable, and the world-model attention code also has a fallback path. The Python 3.13 smoke train above used this SDPA fallback successfully.
+
+On Python 3.13, the old `flash-attn` 2.x package is still not a no-compile install. FlashAttention 4 publishes a Python 3.13-compatible wheel, but it is a beta path and should be installed explicitly:
+
+```bash
+VLA_JEPA_INSTALL_FLASH_ATTN4=1 ./scripts/setup_py313_min_env.sh
+```
+
+To test it in Qwen, request the FA4 backend explicitly:
+
+```bash
+--framework.qwenvl.attn_implementation flash_attention_4
+```
+
+Keep the default setup on SDPA unless a machine-specific FA4 smoke passes.
+
+The local RTX 5090 test machine installs the FA4 wheel successfully, but FA4's runtime kernel rejects compute capability 12.0 and reports support for 9.x, 10.x, and 11.x only. The Qwen3.5 attention resolver therefore checks GPU capability before selecting FA4; unsupported GPUs fall back to SDPA instead of crashing mid-step.
+
+The `SecondNatureComputing/flash-attn-4-sm120` Hugging Face kernel was also tested on the RTX 5090. Its standalone SM120 GQA smoke works, but Qwen3.5-2B text attention uses `head_dim=256`, and the SM120 kernel documents `head_dim > 128` as unsupported. A one-step training smoke with this kernel selected failed with a shared-memory launch error, so the resolver also checks the model head dimension before enabling SM120 FA4. For the current Qwen3.5-2B training config, SDPA is still the correct no-crash backend.
 
 FlashAttention should be installed as an explicit, machine-specific optimization. Compile only for the GPUs on the VM. For A100, use SM80 only:
 

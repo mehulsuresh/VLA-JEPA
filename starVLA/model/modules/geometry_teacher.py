@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import os
 import hashlib
+import math
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -40,42 +41,121 @@ def _normalize_frame_value_range(value: Any) -> str:
 _MOGE2_VITL_NORMAL_NECK_DIMS = (1024, 256, 128, 64, 32)
 
 
-class DirectGeometryTeacherHead(nn.Module):
-    """LingBot-style direct head: project VLM image tokens into teacher feature space."""
+class _GeometryFeedForward(nn.Module):
+    def __init__(self, dim: int, ff_mult: float = 1.0, dropout: float = 0.0):
+        super().__init__()
+        inner_dim = max(int(dim * ff_mult), dim)
+        self.net = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, inner_dim, bias=False),
+            nn.GELU(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(inner_dim, dim, bias=False),
+            nn.Dropout(float(dropout)),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+class _GeometryPerceiverAttention(nn.Module):
+    def __init__(self, dim: int, dim_head: int = 32, heads: int = 4):
+        super().__init__()
+        self.scale = float(dim_head) ** -0.5
+        self.dim_head = int(dim_head)
+        self.heads = int(heads)
+        inner_dim = self.dim_head * self.heads
+
+        self.norm_context = nn.LayerNorm(dim)
+        self.norm_queries = nn.LayerNorm(dim)
+        self.to_q = nn.Linear(dim, inner_dim, bias=False)
+        self.to_kv = nn.Linear(dim, inner_dim * 2, bias=False)
+        self.to_out = nn.Linear(inner_dim, dim, bias=False)
+
+    def _reshape_heads(self, x: torch.Tensor) -> torch.Tensor:
+        batch, tokens, _ = x.shape
+        return x.view(batch, tokens, self.heads, self.dim_head).transpose(1, 2)
+
+    def forward(self, context: torch.Tensor, queries: torch.Tensor) -> torch.Tensor:
+        context = self.norm_context(context)
+        queries = self.norm_queries(queries)
+
+        q = self._reshape_heads(self.to_q(queries))
+        kv_input = torch.cat([context, queries], dim=1)
+        k, v = self.to_kv(kv_input).chunk(2, dim=-1)
+        k = self._reshape_heads(k)
+        v = self._reshape_heads(v)
+
+        # The sqrt-sqrt scaling mirrors LingBot/OpenFlamingo's fp16-stable attention.
+        scale = 1 / math.sqrt(math.sqrt(self.dim_head))
+        weights = (q * scale) @ (k * scale).transpose(-2, -1)
+        weights = torch.softmax(weights.float(), dim=-1).to(dtype=weights.dtype)
+        out = weights @ v
+        out = out.transpose(1, 2).reshape(queries.shape[0], queries.shape[1], -1)
+        return self.to_out(out)
+
+
+class QueryGeometryTeacherHead(nn.Module):
+    """LingBot-style query head: resample VLM geometry tokens into teacher tokens."""
 
     def __init__(
         self,
         hidden_size: int,
         output_size: int,
-        head_hidden_multiplier: float = 2.0,
+        num_output_tokens: int = 256,
+        num_layers: int = 1,
+        num_heads: int = 4,
+        dim_head: int = 32,
+        ff_mult: float = 1.0,
         dropout: float = 0.0,
-        use_layer_norm: bool = False,
-        final_init_std: float = 0.0,
+        final_init_std: Optional[float] = None,
     ):
         super().__init__()
-        inner_size = max(int(output_size * head_hidden_multiplier), output_size)
-        layers: list[nn.Module] = []
-        if use_layer_norm:
-            layers.append(nn.LayerNorm(hidden_size))
-        layers.extend(
+        self.output_queries = nn.Parameter(
+            torch.randn(1, int(num_output_tokens), int(hidden_size)) / (float(hidden_size) ** 0.5)
+        )
+        self.context_proj = nn.Linear(hidden_size, hidden_size)
+        self.query_proj = nn.Linear(hidden_size, hidden_size)
+        self.layers = nn.ModuleList(
             [
-                nn.Linear(hidden_size, inner_size),
-                nn.GELU(),
-                nn.Dropout(float(dropout)),
-                nn.Linear(inner_size, output_size),
+                nn.ModuleList(
+                    [
+                        _GeometryPerceiverAttention(
+                            dim=hidden_size,
+                            dim_head=int(dim_head),
+                            heads=int(num_heads),
+                        ),
+                        _GeometryFeedForward(
+                            dim=hidden_size,
+                            ff_mult=float(ff_mult),
+                            dropout=float(dropout),
+                        ),
+                    ]
+                )
+                for _ in range(int(num_layers))
             ]
         )
-        self.net = nn.Sequential(*layers)
-        final_layer = self.net[-1]
-        if isinstance(final_layer, nn.Linear):
+        self.proj_out = nn.Linear(hidden_size, output_size)
+        self.norm_out = nn.LayerNorm(output_size)
+        if final_init_std is not None:
+            final_init_std = float(final_init_std)
             if final_init_std <= 0.0:
-                nn.init.zeros_(final_layer.weight)
+                nn.init.zeros_(self.proj_out.weight)
             else:
-                nn.init.normal_(final_layer.weight, mean=0.0, std=float(final_init_std))
-            nn.init.zeros_(final_layer.bias)
+                nn.init.normal_(self.proj_out.weight, mean=0.0, std=final_init_std)
+            nn.init.zeros_(self.proj_out.bias)
 
-    def forward(self, image_tokens: torch.Tensor) -> torch.Tensor:
-        return self.net(image_tokens)
+    def forward(self, context_tokens: torch.Tensor) -> torch.Tensor:
+        context = self.context_proj(context_tokens)
+        queries = self.output_queries.repeat(context_tokens.shape[0], 1, 1)
+        queries = queries.to(device=context_tokens.device, dtype=context_tokens.dtype)
+        queries = self.query_proj(queries)
+
+        for attn, ff in self.layers:
+            queries = attn(context, queries) + queries
+            queries = ff(queries) + queries
+
+        return self.norm_out(self.proj_out(queries))
 
 
 class MoGeGeometryTeacher:
@@ -393,24 +473,27 @@ class MoGeGeometryTeacher:
         return {"features": feature_map.detach().to(device=frames.device)}
 
 
-def direct_feature_distillation_loss(
+def _tokens_to_grid(num_tokens: int, height: int, width: int) -> tuple[int, int]:
+    aspect_ratio = float(width) / max(float(height), 1.0)
+    grid_h = max(round((float(num_tokens) / aspect_ratio) ** 0.5), 1)
+    grid_w = max(round(float(num_tokens) / float(grid_h)), 1)
+    if grid_h * grid_w != int(num_tokens):
+        grid_h = max(int(round(float(num_tokens) ** 0.5)), 1)
+        grid_w = max(int(num_tokens) // grid_h, 1)
+    if grid_h * grid_w != int(num_tokens):
+        raise ValueError(f"Cannot map {num_tokens} geometry tokens to a rectangular feature grid")
+    return int(grid_h), int(grid_w)
+
+
+def query_feature_distillation_loss(
     predictions: torch.Tensor,
     teacher_output: dict[str, torch.Tensor | tuple[int, int]],
-    token_grid_hw: tuple[int, int],
     cfg: Any,
-    train_step: Optional[int] = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    """LingBot direct-mode loss: pooled teacher-feature L1 plus feature-similarity L1."""
+    """LingBot query-mode loss: SmoothL1 over resampled teacher feature tokens."""
 
     if predictions.ndim != 3:
         raise ValueError(f"Expected predictions [N, L, D], got {tuple(predictions.shape)}")
-    grid_h, grid_w = int(token_grid_hw[0]), int(token_grid_hw[1])
-    expected_tokens = grid_h * grid_w
-    if predictions.shape[1] != expected_tokens:
-        raise ValueError(
-            f"Prediction token count {predictions.shape[1]} does not match Qwen grid {grid_h}x{grid_w}"
-        )
-
     feature_map = teacher_output.get("features")
     if not isinstance(feature_map, torch.Tensor):
         raise RuntimeError("MoGe teacher output did not include feature embeddings")
@@ -422,44 +505,35 @@ def direct_feature_distillation_loss(
         )
     if feature_map.shape[1] != predictions.shape[-1]:
         raise ValueError(
-            f"Teacher feature dim {feature_map.shape[1]} does not match direct head dim {predictions.shape[-1]}"
+            f"Teacher feature dim {feature_map.shape[1]} does not match query head dim {predictions.shape[-1]}"
         )
 
+    grid_h, grid_w = _tokens_to_grid(
+        int(predictions.shape[1]),
+        int(feature_map.shape[-2]),
+        int(feature_map.shape[-1]),
+    )
     target = F.adaptive_avg_pool2d(
         feature_map.to(device=predictions.device, dtype=torch.float32),
         (grid_h, grid_w),
     )
     target = target.flatten(2).transpose(1, 2).contiguous()
-    pred = predictions.float()
+    if target.shape[1] != predictions.shape[1]:
+        raise ValueError(
+            f"Teacher target token count {target.shape[1]} does not match predictions {predictions.shape[1]}"
+        )
 
-    l1_loss = F.l1_loss(pred, target.detach(), reduction="mean")
-
-    flat_pred = pred.reshape(-1, pred.shape[-1])
-    flat_target = target.reshape(-1, target.shape[-1])
-    max_tokens = int(_cfg_get(cfg, "similarity_max_tokens", 4096))
-    if max_tokens > 0 and flat_pred.shape[0] > max_tokens:
-        sample_seed = _cfg_get(cfg, "similarity_sample_seed", None)
-        if train_step is not None or sample_seed is not None:
-            seed = int(0 if sample_seed is None else sample_seed) + int(0 if train_step is None else train_step)
-            generator = torch.Generator(device=flat_pred.device).manual_seed(seed)
-            indices = torch.randperm(flat_pred.shape[0], device=flat_pred.device, generator=generator)[:max_tokens]
-        else:
-            indices = torch.randperm(flat_pred.shape[0], device=flat_pred.device)[:max_tokens]
-        flat_pred = flat_pred.index_select(0, indices)
-        flat_target = flat_target.index_select(0, indices)
-
-    pred_norm = F.normalize(flat_pred, p=2, dim=-1, eps=1e-6)
-    target_norm = F.normalize(flat_target.detach(), p=2, dim=-1, eps=1e-6)
-    pred_sim = torch.matmul(pred_norm, pred_norm.transpose(0, 1))
-    target_sim = torch.matmul(target_norm, target_norm.transpose(0, 1))
-    sim_loss = F.l1_loss(pred_sim, target_sim.detach(), reduction="mean")
-
-    total = (
-        float(_cfg_get(cfg, "feature_l1_weight", 1.0)) * l1_loss
-        + float(_cfg_get(cfg, "feature_similarity_weight", 1.0)) * sim_loss
-    )
+    beta = float(_cfg_get(cfg, "query_smooth_l1_beta", 1.0))
+    if beta > 0.0:
+        loss = F.smooth_l1_loss(predictions.float(), target.detach(), reduction="mean", beta=beta)
+    else:
+        loss = F.l1_loss(predictions.float(), target.detach(), reduction="mean")
     metrics = {
-        "depth_teacher_feature_l1_loss": l1_loss.detach(),
-        "depth_teacher_feature_similarity_loss": sim_loss.detach(),
+        "depth_teacher_query_smooth_l1_loss": loss.detach(),
+        "depth_teacher_query_tokens": torch.tensor(
+            float(predictions.shape[1]),
+            device=predictions.device,
+            dtype=loss.dtype,
+        ),
     }
-    return total, metrics
+    return loss, metrics
