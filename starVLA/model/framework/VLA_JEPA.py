@@ -143,6 +143,10 @@ class VLA_JEPA(baseframework):
         super().__init__()
         self.config = config
         self.qwen_vl_interface = get_vlm_model(config=self.config)
+        self.qwen_hidden_size = int(self.qwen_vl_interface.model.config.hidden_size)
+        self._validate_qwen_hidden_size_config()
+        self.qwen_blockwise_attention_cfg = self._resolve_qwen_blockwise_attention_cfg()
+        self.qwen_blockwise_attention_enabled = bool(self.qwen_blockwise_attention_cfg.get("enabled", False))
         self.depth_teacher_aux_cfg = self.config.framework.get("depth_teacher_aux", {})
         self.depth_teacher_aux_enabled = bool(self.depth_teacher_aux_cfg.get("enabled", False))
         if self.depth_teacher_aux_enabled:
@@ -188,7 +192,7 @@ class VLA_JEPA(baseframework):
                 )
             )
             self.depth_teacher_aux_head = QueryGeometryTeacherHead(
-                hidden_size=self.qwen_vl_interface.model.config.hidden_size,
+                hidden_size=self.qwen_hidden_size,
                 output_size=teacher_feature_dim,
                 num_output_tokens=self.depth_teacher_aux_num_output_tokens,
                 num_layers=int(self.depth_teacher_aux_cfg.get("query_num_layers", 1)),
@@ -223,14 +227,14 @@ class VLA_JEPA(baseframework):
             num_state_tokens=self.qwen_state_num_tokens,
         )
 
-        self.config.framework.action_model.diffusion_model_cfg.cross_attention_dim = self.qwen_vl_interface.model.config.hidden_size
+        self.config.framework.action_model.diffusion_model_cfg.cross_attention_dim = self.qwen_hidden_size
         self.qwen_state_dim = int(self.config.framework.action_model.get("state_dim", 0) or 0)
         self.qwen_state_projector = (
             nn.Sequential(
                 nn.LayerNorm(self.qwen_state_dim),
                 nn.Linear(
                     self.qwen_state_dim,
-                    self.qwen_vl_interface.model.config.hidden_size * self.qwen_state_num_tokens,
+                    self.qwen_hidden_size * self.qwen_state_num_tokens,
                 ),
             )
             if self.qwen_state_dim > 0 and self.qwen_state_num_tokens > 0
@@ -268,7 +272,7 @@ class VLA_JEPA(baseframework):
             depth=self.config.framework.vj2_model.depth,
             num_heads=self.config.framework.vj2_model.num_heads,
             embed_dim=hidden_size * self.vj_num_video_views,
-            action_embed_dim=self.qwen_vl_interface.model.config.hidden_size,
+            action_embed_dim=self.qwen_hidden_size,
             num_add_tokens=self.config.framework.vj2_model.num_action_tokens_per_timestep,
             use_activation_checkpointing=bool(
                 self.config.get("trainer", {}).get("enable_gradient_checkpointing", False)
@@ -518,6 +522,46 @@ class VLA_JEPA(baseframework):
     def _get_qwen_device(self) -> torch.device:
         return next(self.qwen_vl_interface.model.parameters()).device
 
+    def _validate_qwen_hidden_size_config(self) -> None:
+        qwenvl_cfg = self.config.framework.get("qwenvl", {})
+        configured_hidden_size = qwenvl_cfg.get("vl_hidden_dim", "auto")
+        if configured_hidden_size is None:
+            return
+        if isinstance(configured_hidden_size, str) and configured_hidden_size.lower() == "auto":
+            return
+        configured_hidden_size = int(configured_hidden_size)
+        if configured_hidden_size != self.qwen_hidden_size:
+            raise RuntimeError(
+                "framework.qwenvl.vl_hidden_dim does not match the loaded Qwen hidden size: "
+                f"configured {configured_hidden_size}, loaded {self.qwen_hidden_size}. "
+                "Set `vl_hidden_dim: auto` to make Qwen3-VL size swaps config-only."
+            )
+
+    def _resolve_qwen_blockwise_attention_cfg(self) -> dict:
+        qwenvl_cfg = self.config.framework.get("qwenvl", {})
+        blockwise_cfg = qwenvl_cfg.get("blockwise_attention", {})
+        if isinstance(blockwise_cfg, bool):
+            return {"enabled": bool(blockwise_cfg)}
+        return dict(blockwise_cfg) if blockwise_cfg is not None else {"enabled": False}
+
+    @staticmethod
+    def _normalize_qwen_attn_implementation_name(value: Optional[str]) -> str:
+        normalized = (value or "flash_attention_2").strip().lower()
+        alias_map = {
+            "flash": "flash_attention_2",
+            "flash2": "flash_attention_2",
+            "flash4": "flash_attention_4",
+            "flash_attn": "flash_attention_2",
+            "flash_attn_2": "flash_attention_2",
+            "flash_attn_4": "flash_attention_4",
+            "flash-attn": "flash_attention_2",
+            "flash-attn-2": "flash_attention_2",
+            "flash-attn-4": "flash_attention_4",
+            "flex": "flex_attention",
+            "flex-attn": "flex_attention",
+        }
+        return alias_map.get(normalized, normalized)
+
     def _qwen_requires_grad(self) -> bool:
         if self._qwen_grad_cache is None:
             self._qwen_grad_cache = any(param.requires_grad for param in self.qwen_vl_interface.model.parameters())
@@ -636,16 +680,40 @@ class VLA_JEPA(baseframework):
                 )
 
         if bool(qwenvl_cfg.get("strict_attn_implementation", False)):
-            requested_attn = str(qwenvl_cfg.get("attn_implementation", "flash_attention_2")).lower()
-            actual_attn = str(getattr(self.qwen_vl_interface, "attn_implementation", "")).lower()
-            if requested_attn in {"flash", "flash2", "flash_attn", "flash_attn_2", "flash-attn", "flash-attn-2"}:
-                requested_attn = "flash_attention_2"
-            if requested_attn in {"flash4", "flash_attn_4", "flash-attn-4"}:
-                requested_attn = "flash_attention_4"
+            requested_attn = self._normalize_qwen_attn_implementation_name(
+                str(qwenvl_cfg.get("attn_implementation", "flash_attention_2"))
+            )
+            actual_attn = self._normalize_qwen_attn_implementation_name(
+                str(getattr(self.qwen_vl_interface, "attn_implementation", ""))
+            )
             if requested_attn != actual_attn:
                 raise RuntimeError(
                     f"Qwen attention backend mismatch under strict mode: requested `{requested_attn}`, "
                     f"loaded `{actual_attn}`."
+                )
+
+        if self.qwen_blockwise_attention_enabled:
+            actual_attn = self._normalize_qwen_attn_implementation_name(
+                str(getattr(self.qwen_vl_interface, "attn_implementation", ""))
+            )
+            if actual_attn != "flex_attention":
+                raise RuntimeError(
+                    "Qwen blockwise attention requires `framework.qwenvl.attn_implementation: flex_attention`; "
+                    f"loaded `{actual_attn}`."
+                )
+            supports_blockwise = getattr(self.qwen_vl_interface, "supports_blockwise_attention", None)
+            if callable(supports_blockwise) and not supports_blockwise():
+                raise RuntimeError(
+                    "Qwen blockwise attention requires a full-attention VLM. The loaded Qwen backend reports "
+                    "hybrid or unsupported attention layers."
+                )
+            if not self._qwen_requires_grad() and not bool(
+                self.qwen_blockwise_attention_cfg.get("allow_frozen_qwen", False)
+            ):
+                raise RuntimeError(
+                    "Qwen blockwise attention is enabled while Qwen has no trainable parameters. "
+                    "Unfreeze Qwen for full fine-tuning, or set "
+                    "`framework.qwenvl.blockwise_attention.allow_frozen_qwen: true` only for an explicit ablation."
                 )
 
         rtc_cfg = self.config.framework.action_model.get("rtc_training", {})
@@ -1148,6 +1216,72 @@ class VLA_JEPA(baseframework):
         key_block_ids = torch.where(embodied_mask, torch.full_like(key_block_ids, 3), key_block_ids)
         return context, keep_mask.to(device=last_hidden.device), key_block_ids.to(device=last_hidden.device)
 
+    def _build_qwen_blockwise_attention_block_ids(
+        self,
+        qwen_inputs: dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        """
+        pi0/OpenPI-style block ids for Qwen-internal block-causal attention.
+
+        Blocks are fully bidirectional internally, and later blocks can attend
+        all earlier blocks:
+          0: text + image prefix
+          1: projected state tokens
+          2: embodied action query tokens
+          3: auxiliary V-JEPA / geometry tokens plus trailing chat delimiters
+        """
+        input_ids = qwen_inputs["input_ids"]
+        if input_ids.ndim != 2:
+            raise ValueError(f"Expected Qwen input_ids with shape [B, S], got {tuple(input_ids.shape)}")
+
+        attention_mask = qwen_inputs.get("attention_mask")
+        if attention_mask is None:
+            valid_mask = torch.ones_like(input_ids, dtype=torch.bool)
+        else:
+            valid_mask = attention_mask.to(device=input_ids.device, dtype=torch.bool)
+
+        state_token_ids = self._qwen_state_token_ids_t.to(input_ids.device)
+        state_mask = (
+            torch.isin(input_ids, state_token_ids)
+            if state_token_ids.numel() > 0
+            else torch.zeros_like(input_ids, dtype=torch.bool)
+        )
+        embodied_token_id = self._embodied_token_id_t.to(input_ids.device)
+        embodied_mask = torch.isin(input_ids, embodied_token_id)
+        action_token_ids = self._action_token_ids_t.to(input_ids.device)
+        auxiliary_mask = torch.isin(input_ids, action_token_ids)
+        geometry_token_ids = self._geometry_token_ids_t.to(input_ids.device)
+        if geometry_token_ids.numel() > 0:
+            auxiliary_mask = auxiliary_mask | torch.isin(input_ids, geometry_token_ids)
+
+        positions = torch.arange(input_ids.shape[1], device=input_ids.device).unsqueeze(0)
+        auxiliary_positions = torch.where(
+            auxiliary_mask,
+            positions.expand_as(input_ids),
+            torch.full_like(input_ids, input_ids.shape[1]),
+        )
+        first_auxiliary_position = auxiliary_positions.amin(dim=1)
+        trailing_auxiliary_mask = valid_mask & (positions >= first_auxiliary_position.unsqueeze(1))
+
+        block_ids = torch.full_like(input_ids, -1, dtype=torch.long)
+        prefix_mask = valid_mask & ~state_mask & ~embodied_mask & ~trailing_auxiliary_mask
+        block_ids = torch.where(prefix_mask, torch.zeros_like(block_ids), block_ids)
+        block_ids = torch.where(state_mask & valid_mask, torch.full_like(block_ids, 1), block_ids)
+        block_ids = torch.where(embodied_mask & valid_mask, torch.full_like(block_ids, 2), block_ids)
+        block_ids = torch.where(
+            (trailing_auxiliary_mask | auxiliary_mask) & valid_mask,
+            torch.full_like(block_ids, 3),
+            block_ids,
+        )
+        return block_ids
+
+    @staticmethod
+    def _build_blockwise_visibility_from_block_ids(block_ids: torch.Tensor) -> torch.Tensor:
+        valid = block_ids >= 0
+        query_blocks = block_ids.unsqueeze(2)
+        key_blocks = block_ids.unsqueeze(1)
+        return valid.unsqueeze(2) & valid.unsqueeze(1) & (key_blocks <= query_blocks)
+
     @staticmethod
     def _build_blockwise_cross_attention_mask(
         *,
@@ -1280,7 +1414,7 @@ class VLA_JEPA(baseframework):
         state_embeds = self.qwen_state_projector(state_flat).reshape(
             batch_size,
             self.qwen_state_num_tokens,
-            self.qwen_vl_interface.model.config.hidden_size,
+            self.qwen_hidden_size,
         )
         return state_embeds, state_mask
 
@@ -2264,6 +2398,11 @@ class VLA_JEPA(baseframework):
             qwen_inputs=qwen_inputs,
             batch_size=int(input_ids.shape[0]),
         )
+        qwen_blockwise_block_ids = (
+            self._build_qwen_blockwise_attention_block_ids(qwen_inputs)
+            if self.qwen_blockwise_attention_enabled
+            else None
+        )
         with qwen_context, torch.autocast("cuda", dtype=torch.bfloat16):
             # Use feature-extraction path: skips LM head and avoids storing all
             # intermediate hidden states (saves both compute and memory).
@@ -2271,6 +2410,7 @@ class VLA_JEPA(baseframework):
                 **qwen_inputs,
                 token_replacement_embeds=state_replacement_embeds,
                 token_replacement_mask=state_replacement_mask,
+                qwen_blockwise_block_ids=qwen_blockwise_block_ids,
             )
             B, _, H = last_hidden.shape
             action_tokens = last_hidden[action_indices[0], action_indices[1], :].view(B, -1, H)
@@ -2540,12 +2680,18 @@ class VLA_JEPA(baseframework):
             qwen_inputs=qwen_inputs,
             batch_size=int(qwen_inputs["input_ids"].shape[0]),
         )
+        qwen_blockwise_block_ids = (
+            self._build_qwen_blockwise_attention_block_ids(qwen_inputs)
+            if self.qwen_blockwise_attention_enabled
+            else None
+        )
 
         with torch.autocast("cuda", dtype=torch.bfloat16):
             last_hidden = self.qwen_vl_interface.forward_features(
                 **qwen_inputs,
                 token_replacement_embeds=state_replacement_embeds,
                 token_replacement_mask=state_replacement_mask,
+                qwen_blockwise_block_ids=qwen_blockwise_block_ids,
             )
             B, _, H = last_hidden.shape
             embodied_action_tokens = last_hidden[embodied_action_indices[0], embodied_action_indices[1], :].view(B, -1, H)

@@ -7,9 +7,11 @@ is_debug: false
 framework:
   name: VLA_JEPA
   qwenvl:
-    base_vlm: /home/dataset-local/models/Qwen3-VL-2B-Instruct
-    attn_implementation: flash_attention_2
-    vl_hidden_dim: 2048
+    base_vlm: "Qwen/Qwen3-VL-2B-Instruct"
+    attn_implementation: flex_attention
+    vl_hidden_dim: auto
+    blockwise_attention:
+      enabled: true
   qwen_state:
     num_tokens: 8
     token_template: <|state_{}|>
@@ -43,7 +45,7 @@ framework:
       condition_dit_tokens: false
     num_target_vision_tokens: 32
     diffusion_model_cfg:
-      cross_attention_dim: 2048
+      cross_attention_dim: auto
       dropout: 0.2
       final_dropout: true
       interleave_self_attention: true
@@ -95,6 +97,8 @@ datasets:
     resolution_size: 224   # image input of VLA will be resized and video will not, video will be precessed by world model videoprocessor
     per_device_batch_size: 32
     video_resolution_size: 256
+    video_backend: pyav
+    video_backend_num_threads: 1
     load_all_data_for_training: true
     with_state: true
 

@@ -8,10 +8,12 @@ is_debug: false
 framework:
   name: VLA_JEPA
   qwenvl:
-    base_vlm: "Qwen/Qwen3.5-0.8B"
-    attn_implementation: flash_attention_2
+    base_vlm: "Qwen/Qwen3-VL-2B-Instruct"
+    attn_implementation: sdpa
     enable_fast_linear_attention: true
-    vl_hidden_dim: 1024
+    vl_hidden_dim: auto
+    blockwise_attention:
+      enabled: false
   qwen_state:
     num_tokens: 8
     token_template: <|state_{}|>
@@ -44,7 +46,7 @@ framework:
       condition_dit_tokens: false
     num_target_vision_tokens: 32
     diffusion_model_cfg:
-      cross_attention_dim: 1024
+      cross_attention_dim: auto
       dropout: 0.2
       final_dropout: true
       interleave_self_attention: true

@@ -7,9 +7,11 @@ is_debug: false
 framework:
   name: QwenJEVLA
   qwenvl:
-    base_vlm: /home/dataset-local/models/Qwen3-VL-2B-Instruct
-    attn_implementation: flash_attention_2
-    vl_hidden_dim: 2048
+    base_vlm: "Qwen/Qwen3-VL-2B-Instruct"
+    attn_implementation: flex_attention
+    vl_hidden_dim: auto
+    blockwise_attention:
+      enabled: true
   action_model:
     action_model_type: DiT-B
     action_hidden_dim: 1024
@@ -29,7 +31,7 @@ framework:
     num_inference_timesteps: 4
     num_target_vision_tokens: 32
     diffusion_model_cfg:
-      cross_attention_dim: 2048
+      cross_attention_dim: auto
       dropout: 0.2
       final_dropout: true
       interleave_self_attention: true
@@ -57,6 +59,8 @@ datasets:
       {actions} and produce the corresponding policy actions {e_actions}.
     resolution_size: 224
     video_resolution_size: 256
+    video_backend: pyav
+    video_backend_num_threads: 1
     per_device_batch_size: 32
     load_all_data_for_training: true
     action_horizon: 7
