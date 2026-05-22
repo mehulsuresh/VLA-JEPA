@@ -139,7 +139,9 @@ VLA-JEPA/
 <a id="environment-setup"></a>
 ## ⚙️ Environment Setup
 
-The recommended fresh-machine path is now the no-compile Python 3.13 setup. It installs the latest PyPI PyTorch/torchvision pair first, then the small runtime package set in [`requirements-py313-min.txt`](./requirements-py313-min.txt). Full setup notes, optional accelerators, and legacy CUDA 12.4 instructions live in [`docs/repo_environment_setup.md`](./docs/repo_environment_setup.md).
+For cloud GPU training, prefer the Docker runtime in [`docs/docker_training.md`](./docs/docker_training.md). It packages the Python 3.13, PyTorch, PyAV, Qwen3-VL, optional MoGe, and optional DeepSpeed stack behind one image and includes a preflight check for H100/A100-style machines.
+
+For local bare-metal development, the recommended path is the no-compile Python 3.13 setup. It installs the latest PyPI PyTorch/torchvision pair first, then the small runtime package set in [`requirements-py313-min.txt`](./requirements-py313-min.txt). Full setup notes, optional accelerators, and legacy CUDA 12.4 instructions live in [`docs/repo_environment_setup.md`](./docs/repo_environment_setup.md).
 
 ```bash
 cd /path/to/VLA-JEPA
@@ -419,6 +421,9 @@ See [`deployment/readme-deployment.md`](./deployment/readme-deployment.md) for t
 | File | Purpose |
 | --- | --- |
 | [`scripts/setup_repo_env.sh`](./scripts/setup_repo_env.sh) | One-command scratch-mount conda env bootstrap |
+| [`scripts/docker_build_training.sh`](./scripts/docker_build_training.sh) | Build the cloud GPU training Docker image |
+| [`scripts/docker_run_training.sh`](./scripts/docker_run_training.sh) | Run commands inside the training Docker image with GPU/cache mounts |
+| [`scripts/preflight_runtime.py`](./scripts/preflight_runtime.py) | Verify CUDA, PyAV, Qwen, FlexAttention, MoGe, and DeepSpeed readiness |
 | [`scripts/build_decord_gpu.sh`](./scripts/build_decord_gpu.sh) | Builds GPU-enabled `decord` for canonical/lerobot decode paths |
 | [`scripts/prefill_canonical_gcs_cache.py`](./scripts/prefill_canonical_gcs_cache.py) | Warms the local video cache before a long canonical run |
 | [`scripts/diagnose_canonical_dataset_decode.py`](./scripts/diagnose_canonical_dataset_decode.py) | Reproduces decode failures on a single shard |
@@ -442,6 +447,7 @@ Tests under [`tests/`](./tests):
 - [`docs/vla_jepa_architecture.md`](./docs/vla_jepa_architecture.md) — training/inference diagrams, freeze-train status, tensor shapes.
 - [`docs/yonduai_fork_changes.md`](./docs/yonduai_fork_changes.md) — fork-vs-upstream change inventory.
 - [`docs/depth_teacher_aux.md`](./docs/depth_teacher_aux.md) — MoGe-2 feature-distillation design.
+- [`docs/docker_training.md`](./docs/docker_training.md) — cloud GPU Docker build/run/preflight guide.
 - [`docs/repo_environment_setup.md`](./docs/repo_environment_setup.md) — production environment runbook.
 
 <a id="notes-and-caveats"></a>
@@ -449,7 +455,7 @@ Tests under [`tests/`](./tests):
 
 - Single-GPU (5090) and A100×4/×8 paths are exercised regularly; verify multi-node setups on real hardware before treating them as certified.
 - The framework variants other than `VLA_JEPA` (`M1`, `QwenDual`, `QwenFast`, `QwenGR00T`, `QwenOFT`, `QwenPI`) are kept in the tree as legacy reference implementations and are not part of the active training surface.
-- `lerobot_datasets` defaults to `decord` as the video backend but can be set to `pyav` with `datasets.vla_data.video_backend`; `canonical_subset_dataset` uses PyAV; `preprocessed_subtask_dataset` decodes JPEGs directly. If you switch dataset paths, reconfirm the decode environment.
+- Active `lerobot_datasets` configs use `video_backend: pyav`; `canonical_subset_dataset` uses PyAV; `preprocessed_subtask_dataset` decodes JPEGs directly. If you switch dataset paths, reconfirm the decode environment.
 - Mixed precision is handled via manual `bfloat16` autocast within the framework rather than `Accelerate`-AMP; `trainer.mixed_precision: no` is intentional.
 - `find_unused_parameters: true` is required because the wm and depth-teacher branches can be inactive on some steps.
 

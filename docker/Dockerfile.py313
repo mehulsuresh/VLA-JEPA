@@ -1,0 +1,102 @@
+# syntax=docker/dockerfile:1.7
+
+ARG BASE_IMAGE=nvidia/cuda:13.0.2-cudnn-devel-ubuntu24.04
+FROM ${BASE_IMAGE}
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+ARG PYTHON_VERSION=3.13
+ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cu130
+ARG INSTALL_DEEPSPEED=1
+ARG INSTALL_MOGE=1
+ARG INSTALL_FLASH_ATTN=0
+ARG FLASH_ATTN_SPEC=flash-attn
+ARG MOGE_REF=07444410f1e33f402353b99d6ccd26bd31e469e8
+ARG UTILS3D_REF=3fab839f0be9931dac7c8488eb0e1600c236e183
+ARG PIPELINE_REF=866f059d2a05cde05e4a52211ec5051fd5f276d6
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONUNBUFFERED=1 \
+    TOKENIZERS_PARALLELISM=false \
+    CONDA_DIR=/opt/conda \
+    CONDA_DEFAULT_ENV=vla-jepa \
+    CONDA_PREFIX=/opt/conda/envs/vla-jepa \
+    PATH=/opt/conda/envs/vla-jepa/bin:/opt/conda/bin:/usr/local/cuda/bin:${PATH}
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      bash \
+      build-essential \
+      ca-certificates \
+      curl \
+      ffmpeg \
+      git \
+      git-lfs \
+      htop \
+      ibverbs-providers \
+      less \
+      libglib2.0-0 \
+      libgl1 \
+      libibverbs1 \
+      libnuma1 \
+      libopenmpi-dev \
+      libsm6 \
+      libxext6 \
+      libxrender1 \
+      ninja-build \
+      openssh-client \
+      openmpi-bin \
+      pciutils \
+      pkg-config \
+      rdma-core \
+      rsync \
+      tmux \
+      vim \
+      wget \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN arch="$(uname -m)" \
+    && case "${arch}" in \
+      x86_64) miniforge_arch="x86_64" ;; \
+      aarch64) miniforge_arch="aarch64" ;; \
+      *) echo "Unsupported architecture: ${arch}" >&2; exit 1 ;; \
+    esac \
+    && curl -fsSL "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-${miniforge_arch}.sh" -o /tmp/miniforge.sh \
+    && bash /tmp/miniforge.sh -b -p "${CONDA_DIR}" \
+    && rm /tmp/miniforge.sh \
+    && conda create -y -n "${CONDA_DEFAULT_ENV}" -c conda-forge "python=${PYTHON_VERSION}" pip \
+    && conda clean -afy
+
+WORKDIR /workspace/VLA-JEPA
+
+COPY requirements-py313-min.txt /tmp/requirements-py313-min.txt
+RUN python -m pip install --upgrade pip setuptools wheel packaging ninja \
+    && python -m pip install --upgrade torch torchvision --index-url "${TORCH_INDEX_URL}" \
+    && python -m pip install --upgrade -r /tmp/requirements-py313-min.txt
+
+RUN if [[ "${INSTALL_DEEPSPEED}" == "1" ]]; then \
+      DS_BUILD_OPS=0 python -m pip install --upgrade deepspeed mpi4py; \
+    fi
+
+RUN if [[ "${INSTALL_MOGE}" == "1" ]]; then \
+      python -m pip install --upgrade matplotlib trimesh moderngl; \
+      python -m pip install --upgrade \
+        "utils3d @ git+https://github.com/EasternJournalist/utils3d.git@${UTILS3D_REF}" \
+        "pipeline @ git+https://github.com/EasternJournalist/pipeline.git@${PIPELINE_REF}"; \
+      python -m pip install --no-deps \
+        "moge @ git+https://github.com/microsoft/MoGe.git@${MOGE_REF}"; \
+    fi
+
+RUN if [[ "${INSTALL_FLASH_ATTN}" == "1" ]]; then \
+      python -m pip install --no-build-isolation --upgrade "${FLASH_ATTN_SPEC}"; \
+    fi
+
+COPY . /workspace/VLA-JEPA
+RUN python -m pip install -e .
+
+COPY docker/entrypoint.sh /usr/local/bin/starvla-entrypoint
+RUN chmod +x /usr/local/bin/starvla-entrypoint scripts/preflight_runtime.py
+
+ENTRYPOINT ["/usr/local/bin/starvla-entrypoint"]
+CMD ["bash"]
