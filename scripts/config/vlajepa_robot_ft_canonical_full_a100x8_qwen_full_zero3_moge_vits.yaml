@@ -125,7 +125,8 @@ datasets:
     dataset_ids: []
     exclude_dataset_ids_path: []
     exclude_dataset_ids: []
-    exclude_sids: []
+    exclude_sids:
+      - BAAI-DataCube__AgiBotWorld-Beta_G1_task_392_Brush_water_bottle
     adapter_group_ids: []
     camera_slots: [left, right, main]
     qwen_camera_slots: [main, left, right]
