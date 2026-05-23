@@ -179,6 +179,39 @@ class _QWen3_VL_Interface(nn.Module):
             )
 
     @staticmethod
+    def _apply_image_processor_size_overrides(processor, qwenvl_config) -> Optional[tuple[int, int]]:
+        image_processor_cfg = qwenvl_config.get("image_processor", {}) or {}
+        min_override = image_processor_cfg.get("min_pixels", image_processor_cfg.get("shortest_edge", None))
+        max_override = image_processor_cfg.get("max_pixels", image_processor_cfg.get("longest_edge", None))
+        if min_override is None and max_override is None:
+            return None
+
+        image_processor = getattr(processor, "image_processor", None)
+        if image_processor is None or not hasattr(image_processor, "size"):
+            raise ValueError("Qwen image_processor size override requested, but processor.image_processor.size is unavailable.")
+
+        current_size = dict(getattr(image_processor, "size") or {})
+        current_min = int(current_size.get("shortest_edge", current_size.get("min_pixels", 0)) or 0)
+        current_max = int(current_size.get("longest_edge", current_size.get("max_pixels", current_min)) or 0)
+        min_pixels = current_min if min_override is None else int(min_override)
+        max_pixels = current_max if max_override is None else int(max_override)
+        if min_pixels <= 0 or max_pixels <= 0:
+            raise ValueError(
+                "Qwen image_processor pixel limits must be positive; "
+                f"got min_pixels={min_pixels}, max_pixels={max_pixels}."
+            )
+        if min_pixels > max_pixels:
+            raise ValueError(
+                "Qwen image_processor min_pixels cannot exceed max_pixels; "
+                f"got min_pixels={min_pixels}, max_pixels={max_pixels}."
+            )
+
+        current_size["shortest_edge"] = min_pixels
+        current_size["longest_edge"] = max_pixels
+        image_processor.size = current_size
+        return min_pixels, max_pixels
+
+    @staticmethod
     def _normalize_name_list(value) -> Optional[list[str]]:
         if value is None:
             return None
@@ -324,6 +357,7 @@ class _QWen3_VL_Interface(nn.Module):
         model = self._maybe_apply_lora(model, compile_qwen_model=compile_qwen_model)
         processor = AutoProcessor.from_pretrained(model_id)
         processor.tokenizer.padding_side = "left"
+        image_processor_size = self._apply_image_processor_size_overrides(processor, qwenvl_config)
 
         self.model = model
         self.processor = processor
@@ -339,6 +373,13 @@ class _QWen3_VL_Interface(nn.Module):
             f"Loaded `{model_id}` with attention backend `{attn_implementation}` "
             f"(requested `{requested_attn_implementation}`)",
         )
+        if image_processor_size is not None:
+            min_pixels, max_pixels = image_processor_size
+            self._safe_log(
+                "info",
+                "Configured Qwen image processor pixel limits "
+                f"(min_pixels={min_pixels}, max_pixels={max_pixels})",
+            )
 
     def supports_blockwise_attention(self) -> bool:
         text_config = getattr(self.model.config, "text_config", self.model.config)

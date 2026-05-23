@@ -2,7 +2,16 @@
 # Shared helpers for training launchers. This file is sourced by scripts/*.sh.
 
 starvla_detect_default_ifname() {
-  ip route show default 2>/dev/null | awk 'NR==1 {print $5}'
+  if command -v ip >/dev/null 2>&1; then
+    ip route show default 2>/dev/null | awk 'NR==1 {print $5}'
+    return
+  fi
+  for candidate in ens9 ens8 eth0 enp0s9; do
+    if [[ -d "/sys/class/net/${candidate}" ]]; then
+      printf '%s\n' "${candidate}"
+      return
+    fi
+  done
 }
 
 starvla_sanitize_ld_library_path() {

@@ -612,8 +612,8 @@ class VLA_JEPA(baseframework):
             if not bool(self.depth_teacher_aux_cfg.get("allow_zero_loss_scale", False)):
                 raise RuntimeError(
                     "depth_teacher_aux is enabled but its resolved loss scale is <= 0. "
-                    "Set trainer.loss_scale.depth_teacher or framework.depth_teacher_aux.loss_weight "
-                    "to a positive value, or set allow_zero_loss_scale=true for an explicit dry run."
+                    "Set trainer.loss_scale.depth_teacher to a positive value, or set "
+                    "allow_zero_loss_scale=true for an explicit dry run."
                 )
 
         if self.depth_teacher_aux_head is None or not any(
@@ -1411,11 +1411,17 @@ class VLA_JEPA(baseframework):
                 f"got {actual_counts.detach().cpu().tolist()}"
             )
 
-        state_embeds = self.qwen_state_projector(state_flat).reshape(
-            batch_size,
-            self.qwen_state_num_tokens,
-            self.qwen_hidden_size,
-        )
+        projector_dtype = torch.float32
+        for projector_param in self.qwen_state_projector.parameters():
+            projector_dtype = projector_param.dtype
+            break
+
+        with torch.autocast(input_ids.device.type, enabled=False):
+            state_embeds = self.qwen_state_projector(state_flat.to(dtype=projector_dtype)).reshape(
+                batch_size,
+                self.qwen_state_num_tokens,
+                self.qwen_hidden_size,
+            )
         return state_embeds, state_mask
 
     def _build_qwen_inputs_from_examples(self, examples: List[dict]) -> dict[str, torch.Tensor]:

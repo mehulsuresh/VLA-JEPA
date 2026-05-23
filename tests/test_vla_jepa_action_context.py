@@ -1,4 +1,5 @@
 import inspect
+import pytest
 import torch
 import yaml
 from pathlib import Path
@@ -210,6 +211,40 @@ def test_prompt_places_state_and_embodied_queries_before_auxiliary_tokens():
     assert reordered.count("{e_actions}") == 1
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA autocast")
+def test_qwen_state_projector_disables_outer_cuda_bf16_autocast():
+    model = object.__new__(VLA_JEPA)
+    model.qwen_state_dim = 2
+    model.qwen_state_num_tokens = 2
+    model.qwen_hidden_size = 2
+    model._qwen_state_token_ids_t = torch.tensor([40, 41], dtype=torch.long)
+    object.__setattr__(
+        model,
+        "qwen_state_projector",
+        torch.nn.Sequential(
+            torch.nn.LayerNorm(model.qwen_state_dim),
+            torch.nn.Linear(model.qwen_state_dim, model.qwen_hidden_size * model.qwen_state_num_tokens),
+        ).cuda(),
+    )
+
+    qwen_inputs = {
+        "input_ids": torch.tensor([[1, 40, 41, 2]], device="cuda", dtype=torch.long),
+    }
+    state = torch.tensor([[0.5, -0.5]], device="cuda", dtype=torch.float32)
+
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        state_embeds, state_mask = VLA_JEPA._prepare_qwen_state_replacements(
+            model,
+            state=state,
+            qwen_inputs=qwen_inputs,
+            batch_size=1,
+        )
+
+    assert state_embeds.shape == (1, 2, 2)
+    assert state_embeds.dtype == torch.float32
+    assert state_mask.tolist() == [[False, True, True, False]]
+
+
 def test_qwen_prompt_split_places_images_before_state_and_action_slots():
     interface = object.__new__(_QWen3_5_Interface)
     prompt = (
@@ -247,6 +282,25 @@ def test_qwen3_vl_wrapper_exposes_vla_jepa_contract():
 
 def test_qwen3_vl_respects_explicit_sdpa_attention_backend():
     assert _QWen3_VL_Interface._resolve_attn_implementation("sdpa") == "sdpa"
+
+
+def test_qwen3_vl_image_processor_size_override():
+    class DummyImageProcessor:
+        size = {"shortest_edge": 65536, "longest_edge": 1003520}
+
+    class DummyProcessor:
+        image_processor = DummyImageProcessor()
+
+    applied = _QWen3_VL_Interface._apply_image_processor_size_overrides(
+        DummyProcessor(),
+        {"image_processor": {"min_pixels": 50176, "max_pixels": 50176}},
+    )
+
+    assert applied == (50176, 50176)
+    assert DummyProcessor.image_processor.size == {
+        "shortest_edge": 50176,
+        "longest_edge": 50176,
+    }
 
 
 def test_qwen3_blockwise_attention_uses_flex_block_mask():
@@ -310,5 +364,9 @@ def test_vla_jepa_configs_declare_state_tokens_and_ordered_prompts():
         if framework_cfg.get("depth_teacher_aux", {}).get("enabled", False):
             assert "{geometry}" in prompt, path
             assert prompt.index("{actions}") < prompt.index("{geometry}"), path
+            assert "loss_weight" not in framework_cfg["depth_teacher_aux"], path
+            assert cfg["trainer"]["loss_scale"]["depth_teacher"] > 0, path
+            if "qwen_full_zero3_moge_vits" in str(path):
+                assert cfg["trainer"]["loss_scale"]["depth_teacher"] == 0.016, path
         else:
             assert "{geometry}" not in prompt, path

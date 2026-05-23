@@ -1,10 +1,10 @@
 # A100x8 canonical GCS full-run profile:
-# - Full Qwen fine-tuning under the stable DeepSpeed ZeRO-2 profile; no LoRA adapter.
+# - Full Qwen fine-tuning under raw DDP on 8x A100; no LoRA adapter.
 # - V-JEPA teacher stays frozen by design.
 # - MoGe teacher uses the smallest normal-capable MoGe-2 checkpoint.
 # - Canonical dataset indexes compatible GCS shards lazily instead of
 #   materializing every stride window up front.
-run_id: robot_ft_canonical_full_a100x8_qwen_full_zero2stable_b26_moge_vits
+run_id: robot_ft_canonical_full_a100x8_qwen_full_rawddp_b26_moge_vits
 run_root_dir: /mnt/vla-jepa/checkpoints
 seed: 42
 trackers:
@@ -16,28 +16,15 @@ framework:
   qwenvl:
     base_vlm: "Qwen/Qwen3-VL-2B-Instruct"
     attn_implementation: flex_attention
-    enable_fast_linear_attention: false
     device_map: null
     vl_hidden_dim: auto
     blockwise_attention:
       enabled: true
+    image_processor:
+      min_pixels: 50176
+      max_pixels: 50176
     lora:
       enabled: false
-      adapter_name: temporal_policy
-      r: 16
-      alpha: 32
-      dropout: 0.05
-      bias: none
-      layers_pattern: layers
-      train_last_n_layers: 16
-      target_modules:
-        - q_proj
-        - k_proj
-        - v_proj
-        - o_proj
-        - gate_proj
-        - up_proj
-        - down_proj
     strict_attn_implementation: true
     strict_tensor_input_fast_path: true
     strict_full_trainable: true
@@ -63,8 +50,8 @@ framework:
     rtc_training:
       enabled: true
       method: prefix
-      max_delay: 11
-      distribution: uniform
+      max_delay: 7
+      distribution: exponential
       rtc_prob: 1.0
       warmup_steps: 100000
       ramp_steps: 500000
@@ -99,7 +86,6 @@ framework:
     teacher_feature_level: 0
     teacher_feature_dim: auto
     frame_value_range: uint8
-    loss_weight: 0.004
     detach_vlm_steps: 5
     detach_vlm_fraction: 0.01
     use_fp16: true
@@ -129,7 +115,6 @@ framework:
 datasets:
   vla_data:
     dataset_py: canonical_subset_vla
-    data_root_dir: /mnt/vla-jepa/datasets/canonical_gcs
     dataset_canonicalization_root: /mnt/vla-jepa/src/dataset-canonicalization
     manifest_path: /mnt/vla-jepa/src/dataset-canonicalization/configs/manifests/dataset_manifests.jsonl.gz
     adapter_dir: /mnt/vla-jepa/src/dataset-canonicalization/configs/dataset_adapters
@@ -143,6 +128,7 @@ datasets:
     exclude_sids: []
     adapter_group_ids: []
     camera_slots: [left, right, main]
+    qwen_camera_slots: [main, left, right]
     preferred_fps: []  # Empty means allow all manifest FPS values.
     allow_gcs_download: true
     gcs_download_timeout_seconds: 900
@@ -160,7 +146,7 @@ datasets:
     pyav_reader_cache_size: 8
     pyav_thread_count: 1
     pyav_thread_type: SLICE
-    pyav_decode_retry_extra_frames: 900
+    pyav_decode_retry_extra_frames: 120
     pyav_corrupt_warning_limit: 20
     video_cache_max_gb: 500
     video_cache_prune_interval_downloads: 8
@@ -177,7 +163,6 @@ datasets:
     video_frame_stride: 10
     video_target_shift_steps: 2
     gpu_video_decode_on_rank: false
-    cpu_video_decode_drop_worker_images: true
     runtime_timing_logging: true
     per_device_batch_size: 26
     num_workers: 4
@@ -195,7 +180,6 @@ datasets:
     worker_cv2_threads: 1
     pin_memory: true
     drop_last: true
-    with_state: true
 
 trainer:
   epochs: 1
@@ -220,7 +204,7 @@ trainer:
     wm: 0.1
     wm_initial: 0.3
     wm_warmup_steps: 2000
-    depth_teacher: 0.004
+    depth_teacher: 0.016
   warmup_ratio: 0.0
   logging_frequency: 10
   progress_eta_window: 50
@@ -242,8 +226,8 @@ trainer:
   resume_epoch: null
   resume_step: null
   enable_gradient_checkpointing: true
-  enable_mixed_precision_training: false
-  mixed_precision: no
+  enable_mixed_precision_training: true
+  mixed_precision: bf16
   channels_last: true
   compile_qwen_model: false
   compile_qwen_model_dynamic: false
@@ -258,6 +242,7 @@ trainer:
   compile_mode: default
   compile_backend: inductor
   compile_dynamic: false
+  strict_torch_compile: true
   save_plain_weights_in_checkpoints: false
   drop_checkpoint_page_cache: true
   trim_process_memory_after_checkpoint: true

@@ -93,7 +93,6 @@ framework:
     teacher_feature_level: 0
     teacher_feature_dim: auto
     frame_value_range: uint8
-    loss_weight: 0.004
     detach_vlm_steps: 5
     detach_vlm_fraction: 0.01
     use_fp16: true

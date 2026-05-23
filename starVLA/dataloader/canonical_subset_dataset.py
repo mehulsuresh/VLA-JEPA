@@ -654,7 +654,7 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
         self.sidecar_cache_size = max(int(_cfg_get(data_cfg, "sidecar_cache_size", 16)), 0)
         self.slow_sample_log_seconds = float(_cfg_get(data_cfg, "slow_sample_log_seconds", 0.0) or 0.0)
         self.pyav_corrupt_warning_limit = max(int(_cfg_get(data_cfg, "pyav_corrupt_warning_limit", 20)), 0)
-        self.pyav_decode_retry_extra_frames = max(int(_cfg_get(data_cfg, "pyav_decode_retry_extra_frames", 900)), 0)
+        self.pyav_decode_retry_extra_frames = max(int(_cfg_get(data_cfg, "pyav_decode_retry_extra_frames", 120)), 0)
         self.pyav_reader_cache_size = max(int(_cfg_get(data_cfg, "pyav_reader_cache_size", self.reader_cache_size)), 0)
         self.pyav_thread_count = _parse_pyav_thread_count(_cfg_get(data_cfg, "pyav_thread_count", 1))
         self.pyav_thread_type = str(_cfg_get(data_cfg, "pyav_thread_type", "SLICE")).upper()

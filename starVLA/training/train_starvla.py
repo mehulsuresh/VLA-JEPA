@@ -716,8 +716,12 @@ def prepare_data(cfg, accelerator, output_dir, model=None) -> Tuple[DataLoader, 
             f"via `{dataset_py}`"
         )
     else:
+        data_location = cfg.datasets.vla_data.get(
+            "data_root_dir",
+            cfg.datasets.vla_data.get("cache_dir", "<unset>"),
+        )
         logger.info(
-            f"Creating VLA Dataset from `{cfg.datasets.vla_data.data_root_dir}` "
+            f"Creating VLA Dataset from `{data_location}` "
             f"via `{dataset_py}`"
         )
     vla_train_dataloader = build_dataloader(
@@ -1586,16 +1590,27 @@ class VLATrainer(TrainerUtils):
         wm_scale = float(loss_scale_cfg.get("wm", loss_scale_cfg.get("vlm", 0.1)))
         wm_initial_scale = float(loss_scale_cfg.get("wm_initial", loss_scale_cfg.get("wm_start", wm_scale)))
         wm_warmup_steps = max(int(loss_scale_cfg.get("wm_warmup_steps", 0)), 0)
-        depth_teacher_default = 0.0
         depth_teacher_cfg = self.config.framework.get("depth_teacher_aux", {})
         if bool(depth_teacher_cfg.get("enabled", False)):
-            depth_teacher_default = float(depth_teacher_cfg.get("loss_weight", 0.004))
-        depth_teacher_scale = float(
-            loss_scale_cfg.get(
-                "depth_teacher",
-                loss_scale_cfg.get("depth_aux", depth_teacher_default),
-            )
-        )
+            if depth_teacher_cfg.get("loss_weight", None) is not None:
+                raise ValueError(
+                    "Depth teacher loss weight must be configured only at "
+                    "`trainer.loss_scale.depth_teacher`; remove "
+                    "`framework.depth_teacher_aux.loss_weight`."
+                )
+            if loss_scale_cfg.get("depth_aux", None) is not None:
+                raise ValueError(
+                    "Depth teacher loss weight must be configured only at "
+                    "`trainer.loss_scale.depth_teacher`; remove legacy "
+                    "`trainer.loss_scale.depth_aux`."
+                )
+            if loss_scale_cfg.get("depth_teacher", None) is None:
+                raise ValueError(
+                    "depth_teacher_aux is enabled but `trainer.loss_scale.depth_teacher` is not set."
+                )
+            depth_teacher_scale = float(loss_scale_cfg.get("depth_teacher"))
+        else:
+            depth_teacher_scale = float(loss_scale_cfg.get("depth_teacher", 0.0))
         return action_scale, wm_scale, wm_initial_scale, wm_warmup_steps, depth_teacher_scale
 
     def _current_wm_loss_scale(self) -> float:
@@ -1936,11 +1951,12 @@ class VLATrainer(TrainerUtils):
                     train_step=self.completed_steps,
                 )
                 current_wm_loss_scale = self._current_wm_loss_scale()
-                total_loss = (
-                    output_dict.get("action_loss", 0.0) * self.action_loss_scale
-                    + output_dict.get("wm_loss", 0.0) * current_wm_loss_scale
-                    + output_dict.get("depth_teacher_loss", 0.0) * self.depth_teacher_loss_scale
+                weighted_action_loss = output_dict.get("action_loss", 0.0) * self.action_loss_scale
+                weighted_wm_loss = output_dict.get("wm_loss", 0.0) * current_wm_loss_scale
+                weighted_depth_teacher_loss = (
+                    output_dict.get("depth_teacher_loss", 0.0) * self.depth_teacher_loss_scale
                 )
+                total_loss = weighted_action_loss + weighted_wm_loss + weighted_depth_teacher_loss
             forward_time = time.perf_counter() - forward_start
             if self.completed_steps == 0 and self.accelerator.is_main_process:
                 logger.info("Step 0 debug: finished model.forward")
@@ -1981,7 +1997,23 @@ class VLATrainer(TrainerUtils):
                 # Surface the non-prefetch Qwen build timing under the existing progress-bar key.
                 result_dict["qwen_tensor_build_time"] = result_dict["qwen_input_build_time"]
             result_dict["total_loss"] = total_loss.detach() if isinstance(total_loss, torch.Tensor) else total_loss
+            result_dict["weighted_action_loss"] = (
+                weighted_action_loss.detach()
+                if isinstance(weighted_action_loss, torch.Tensor)
+                else weighted_action_loss
+            )
+            result_dict["weighted_wm_loss"] = (
+                weighted_wm_loss.detach() if isinstance(weighted_wm_loss, torch.Tensor) else weighted_wm_loss
+            )
+            result_dict["weighted_depth_teacher_loss"] = (
+                weighted_depth_teacher_loss.detach()
+                if isinstance(weighted_depth_teacher_loss, torch.Tensor)
+                else weighted_depth_teacher_loss
+            )
+            result_dict["action_loss_scale"] = self.action_loss_scale
             result_dict["wm_loss_scale"] = current_wm_loss_scale
+            result_dict["target_wm_loss_scale"] = self.wm_loss_scale
+            result_dict["depth_teacher_loss_scale"] = self.depth_teacher_loss_scale
             for key, value in rabc_stats.items():
                 result_dict[key] = value.detach() if isinstance(value, torch.Tensor) else value
             if grad_norm is not None:

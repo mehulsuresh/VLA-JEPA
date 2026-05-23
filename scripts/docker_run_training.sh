@@ -77,6 +77,22 @@ if [[ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]]; then
   )
 fi
 
+GCLOUD_SDK_ROOT="${GCLOUD_SDK_ROOT:-/usr/lib/google-cloud-sdk}"
+if [[ -z "${GCLOUD_CONFIG_DIR:-}" && -d "/mnt/vla-jepa/gcloud-config" ]]; then
+  GCLOUD_CONFIG_DIR="/mnt/vla-jepa/gcloud-config"
+fi
+if [[ "${MOUNT_GCLOUD:-auto}" != "0" && -d "${GCLOUD_SDK_ROOT}" && -n "${GCLOUD_CONFIG_DIR:-}" && -d "${GCLOUD_CONFIG_DIR}" ]]; then
+  DOCKER_ARGS+=(
+    -v "${GCLOUD_SDK_ROOT}:${GCLOUD_SDK_ROOT}:ro"
+    -v "${GCLOUD_CONFIG_DIR}:/root/.config/gcloud"
+    -e "CLOUDSDK_CONFIG=/root/.config/gcloud"
+    -e "PATH=${GCLOUD_SDK_ROOT}/bin:/opt/conda/envs/vla-jepa/bin:/opt/conda/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  )
+elif [[ "${MOUNT_GCLOUD:-auto}" == "1" ]]; then
+  echo "MOUNT_GCLOUD=1 but could not find GCLOUD_SDK_ROOT=${GCLOUD_SDK_ROOT} and GCLOUD_CONFIG_DIR=${GCLOUD_CONFIG_DIR:-<unset>}" >&2
+  exit 1
+fi
+
 if [[ -n "${WANDB_API_KEY:-}" ]]; then
   DOCKER_ARGS+=(-e "WANDB_API_KEY=${WANDB_API_KEY}")
 fi

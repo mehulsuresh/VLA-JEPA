@@ -58,6 +58,12 @@ class VisionTransformerPredictorAC(nn.Module):
         self.action_encoder = nn.Linear(action_embed_dim, predictor_embed_dim, bias=True)
         self.state_encoder = nn.Linear(action_embed_dim, predictor_embed_dim, bias=True)
         self.extrinsics_encoder = nn.Linear(action_embed_dim - 1, predictor_embed_dim, bias=True)
+        # Legacy modules retained for checkpoint compatibility. The current
+        # predictor path does not consume state tokens, and extrinsics are
+        # optional, so keep inactive parameters out of DDP gradient reduction.
+        self.state_encoder.requires_grad_(False)
+        if not self.use_extrinsics:
+            self.extrinsics_encoder.requires_grad_(False)
 
         # Determine positional embedding
         if type(img_size) is int:

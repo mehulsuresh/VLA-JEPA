@@ -529,5 +529,7 @@ def test_full_qwen_zero3_config_enables_rtc_warmup():
     rtc_config = cfg["framework"]["action_model"]["rtc_training"]
     assert rtc_config["enabled"] is True
     assert rtc_config["condition_dit_tokens"] is True
+    assert rtc_config["max_delay"] == 7
+    assert rtc_config["distribution"] == "exponential"
     assert rtc_config["warmup_steps"] > 0
     assert rtc_config["ramp_steps"] > 0
