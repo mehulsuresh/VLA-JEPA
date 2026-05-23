@@ -53,12 +53,16 @@ DEFAULT_QWEN_CAMERA_SLOTS = ("main", "left", "right", "extra")
 DEFAULT_VJEPA_CAMERA_SLOTS = ("left", "right", "main")
 
 
-class _RecoverableVideoDecodeError(RuntimeError):
-    """Video decode failure that can be handled by sampling a different window."""
+class _RecoverableSampleError(RuntimeError):
+    """Sample failure that can be handled by sampling a different window."""
 
     def __init__(self, message: str, path_key: str | None = None):
         super().__init__(message)
         self.path_key = path_key
+
+
+class _RecoverableVideoDecodeError(_RecoverableSampleError):
+    """Video decode failure that can be handled by sampling a different window."""
 
 
 def collate_fn(batch):
@@ -2188,8 +2192,8 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
         stride = 100_003
         return int(index + attempt * stride) % self.total_windows
 
-    def _decode_failure_to_recoverable(self, exc: Exception) -> _RecoverableVideoDecodeError | None:
-        if isinstance(exc, _RecoverableVideoDecodeError):
+    def _decode_failure_to_recoverable(self, exc: Exception) -> _RecoverableSampleError | None:
+        if isinstance(exc, _RecoverableSampleError):
             return exc
         return None
 
@@ -2211,15 +2215,44 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
     def _sample_context(self, index: int) -> dict[str, Any]:
         window = self._window_from_index(index) if self.index_windows_lazily else self.windows[index]
         shard = self.shards[window.shard_index]
-        self._schedule_shard_data_prefetch(window.shard_index)
-        shard_data = self._get_shard_data(window.shard_index)
+        try:
+            self._schedule_shard_data_prefetch(window.shard_index)
+            shard_data = self._get_shard_data(window.shard_index)
+        except Exception as exc:
+            raise _RecoverableSampleError(
+                "Canonical shard data fetch failed: "
+                f"sid={shard.sid} data_file={shard.data_relative_path} "
+                f"error={type(exc).__name__}: {exc}"
+            ) from exc
         episode = shard.episodes[window.episode_index]
         row_base = episode.local_start + window.base_index
+        available_rows = min(
+            len(shard_data.state),
+            len(shard_data.action),
+            len(shard_data.action_mask),
+            len(shard_data.timestamp),
+            len(shard_data.frame_index),
+            len(shard_data.episode_index),
+            len(shard_data.task_index),
+        )
+        if available_rows <= 0:
+            raise _RecoverableSampleError(
+                "Canonical shard sidecar has no usable rows: "
+                f"sid={shard.sid} data_file={shard.data_relative_path}"
+            )
+        if row_base >= available_rows:
+            raise _RecoverableSampleError(
+                "Canonical window starts beyond available sidecar rows: "
+                f"sid={shard.sid} data_file={shard.data_relative_path} "
+                f"episode_index={window.episode_index} base_index={window.base_index} "
+                f"row_base={row_base} available_rows={available_rows}"
+            )
         action_rows = episode.local_start + np.clip(
             window.base_index + self._action_offsets,
             0,
             episode.length - 1,
         )
+        action_rows = np.clip(action_rows, 0, available_rows - 1)
         compact_offsets = self._compact_offsets()
         qwen_frame_offset = self._qwen_frame_offset()
         qwen_compact_offset = compact_offsets[qwen_frame_offset]
@@ -2237,7 +2270,15 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
                 0,
                 episode.length - 1,
             )
-            video_path = self._ensure_episode_video(shard, episode.video_paths[slot])
+            try:
+                video_path = self._ensure_episode_video(shard, episode.video_paths[slot])
+            except Exception as exc:
+                video_path_key = episode.video_paths[slot].as_posix()
+                raise _RecoverableSampleError(
+                    "Canonical video fetch failed: "
+                    f"path={video_path_key} error={type(exc).__name__}: {exc}",
+                    path_key=video_path_key,
+                ) from exc
             lock_path = self._episode_video_lock_path(shard, video_path)
             video_frames[slot] = (video_path, frame_indices.astype(np.int64, copy=False), lock_path)
             qwen_frame_positions[slot] = qwen_frame_offset if slot in vjepa_decode_slots else 0
@@ -2323,10 +2364,18 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
         touched_videos: list[str] = []
         try:
             max_attempts = self.max_sample_decode_retries + 1 if self.skip_corrupt_videos else 1
-            last_error: _RecoverableVideoDecodeError | None = None
+            last_error: _RecoverableSampleError | None = None
             for attempt in range(max_attempts):
                 sample_index = original_index if attempt == 0 else self._retry_index(original_index, attempt)
-                context = self._sample_context(sample_index)
+                try:
+                    context = self._sample_context(sample_index)
+                except Exception as exc:
+                    recoverable = self._decode_failure_to_recoverable(exc)
+                    if recoverable is None or not self.skip_corrupt_videos:
+                        raise
+                    last_error = recoverable
+                    self._mark_bad_video(recoverable.path_key, type(recoverable).__name__)
+                    continue
                 window = context["window"]
                 shard = context["shard"]
                 episode = context["episode"]
@@ -2386,14 +2435,22 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
     def __getitems__(self, indices: list[int]) -> list[dict[str, Any]]:
         original_indices = [int(index) for index in indices]
         max_attempts = self.max_sample_decode_retries + 1 if self.skip_corrupt_videos else 1
-        last_error: _RecoverableVideoDecodeError | None = None
+        last_error: _RecoverableSampleError | None = None
         for attempt in range(max_attempts):
             batch_indices = (
                 original_indices
                 if attempt == 0
                 else [self._retry_index(index, attempt) for index in original_indices]
             )
-            contexts = [self._sample_context(index) for index in batch_indices]
+            try:
+                contexts = [self._sample_context(index) for index in batch_indices]
+            except Exception as exc:
+                recoverable = self._decode_failure_to_recoverable(exc)
+                if recoverable is None or not self.skip_corrupt_videos:
+                    raise
+                last_error = recoverable
+                self._mark_bad_video(recoverable.path_key, type(recoverable).__name__)
+                continue
             bad_path = next((path for context in contexts if (path := self._context_bad_video_path(context))), None)
             if bad_path is not None:
                 last_error = _RecoverableVideoDecodeError(

@@ -375,6 +375,86 @@ def test_canonical_getitems_retries_corrupt_video_batch(monkeypatch, tmp_path):
     ]
 
 
+def test_canonical_sample_context_clamps_action_rows_to_sidecar_length(monkeypatch):
+    dataset = canonical.CanonicalSubsetVLADataset.__new__(canonical.CanonicalSubsetVLADataset)
+    dataset.index_windows_lazily = False
+    dataset.windows = [canonical.WindowSpec(shard_index=0, episode_index=0, base_index=5)]
+    dataset.data_file_prefetch_shards = 0
+    dataset._action_offsets = np.arange(50, dtype=np.int64)
+    dataset.video_horizon = 8
+    dataset.video_target_shift_steps = 0
+    dataset.video_frame_stride = 1
+    dataset._compact_offsets_cache = None
+
+    shard = SimpleNamespace(
+        sid="sid",
+        data_relative_path="data/chunk-000/file-000.parquet",
+        decode_camera_slots=(),
+        vjepa_camera_slots=(),
+        qwen_camera_slots=(),
+        episodes=[
+            canonical.EpisodeSpec(
+                local_start=0,
+                length=20,
+                task="task",
+                video_paths={},
+                video_base_frames={},
+            )
+        ],
+    )
+    shard_data = SimpleNamespace(
+        state=np.zeros((10, canonical.STATE_DIM), dtype=np.float32),
+        action=np.zeros((10, canonical.ACTION_DIM), dtype=np.float32),
+        action_mask=np.ones((10, canonical.ACTION_DIM), dtype=bool),
+        timestamp=np.zeros(10, dtype=np.float32),
+        frame_index=np.arange(10, dtype=np.int64),
+        episode_index=np.zeros(10, dtype=np.int64),
+        task_index=np.zeros(10, dtype=np.int64),
+    )
+    dataset.shards = [shard]
+    monkeypatch.setattr(dataset, "_schedule_shard_data_prefetch", lambda _shard_index: None)
+    monkeypatch.setattr(dataset, "_get_shard_data", lambda _shard_index: shard_data)
+
+    context = dataset._sample_context(0)
+
+    assert context["row_base"] == 5
+    assert context["action_rows"][-1] == 9
+    assert context["action_rows"].max() == 9
+
+
+def test_canonical_getitems_retries_sidecar_tail_window(monkeypatch):
+    dataset = canonical.CanonicalSubsetVLADataset.__new__(canonical.CanonicalSubsetVLADataset)
+    dataset.skip_corrupt_videos = True
+    dataset.max_sample_decode_retries = 2
+    dataset.total_windows = 1_000_000
+    dataset._bad_video_paths = set()
+    dataset._bad_video_warning_count = 0
+    dataset.pyav_corrupt_warning_limit = 10
+
+    attempts = []
+
+    def fake_sample_context(index):
+        attempts.append(index)
+        if index in {1, 2}:
+            raise canonical._RecoverableSampleError("sidecar tail")
+        return {"sample_index": index, "video_frames": {}}
+
+    monkeypatch.setattr(dataset, "_sample_context", fake_sample_context)
+    monkeypatch.setattr(
+        dataset,
+        "_sample_from_context",
+        lambda context, decoded_frames=None: {"sample_index": context["sample_index"]},
+    )
+
+    samples = dataset.__getitems__([1, 2])
+
+    assert attempts == [1, dataset._retry_index(1, 1), dataset._retry_index(2, 1)]
+    assert [sample["sample_index"] for sample in samples] == [
+        dataset._retry_index(1, 1),
+        dataset._retry_index(2, 1),
+    ]
+
+
 def test_canonical_subtask_spans_parse_episode_metadata():
     dataset = canonical.CanonicalSubsetVLADataset.__new__(canonical.CanonicalSubsetVLADataset)
     dataset.append_subtask_to_prompt = True

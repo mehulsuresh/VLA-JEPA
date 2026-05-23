@@ -132,8 +132,8 @@ datasets:
     qwen_camera_slots: [main, left, right]
     preferred_fps: []  # Empty means allow all manifest FPS values.
     allow_gcs_download: true
-    gcs_download_timeout_seconds: 900
-    gcs_download_retries: 3
+    gcs_download_timeout_seconds: 180
+    gcs_download_retries: 2
     gcs_download_retry_backoff_seconds: 5
     data_file_prefetch_shards: 1
     max_shards: 0
