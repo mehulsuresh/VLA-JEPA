@@ -53,6 +53,14 @@ DEFAULT_QWEN_CAMERA_SLOTS = ("main", "left", "right", "extra")
 DEFAULT_VJEPA_CAMERA_SLOTS = ("left", "right", "main")
 
 
+class _RecoverableVideoDecodeError(RuntimeError):
+    """Video decode failure that can be handled by sampling a different window."""
+
+    def __init__(self, message: str, path_key: str | None = None):
+        super().__init__(message)
+        self.path_key = path_key
+
+
 def collate_fn(batch):
     return batch
 
@@ -655,6 +663,10 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
         self.slow_sample_log_seconds = float(_cfg_get(data_cfg, "slow_sample_log_seconds", 0.0) or 0.0)
         self.pyav_corrupt_warning_limit = max(int(_cfg_get(data_cfg, "pyav_corrupt_warning_limit", 20)), 0)
         self.pyav_decode_retry_extra_frames = max(int(_cfg_get(data_cfg, "pyav_decode_retry_extra_frames", 120)), 0)
+        self.skip_corrupt_videos = bool(_cfg_get(data_cfg, "skip_corrupt_videos", True))
+        self.max_sample_decode_retries = max(int(_cfg_get(data_cfg, "max_sample_decode_retries", 128)), 0)
+        self.pyav_max_missing_frames_for_fill = max(int(_cfg_get(data_cfg, "pyav_max_missing_frames_for_fill", 0)), 0)
+        self.pyav_fail_on_decode_error_recovery = bool(_cfg_get(data_cfg, "pyav_fail_on_decode_error_recovery", True))
         self.pyav_reader_cache_size = max(int(_cfg_get(data_cfg, "pyav_reader_cache_size", self.reader_cache_size)), 0)
         self.pyav_thread_count = _parse_pyav_thread_count(_cfg_get(data_cfg, "pyav_thread_count", 1))
         self.pyav_thread_type = str(_cfg_get(data_cfg, "pyav_thread_type", "SLICE")).upper()
@@ -674,6 +686,8 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
         self._decord_readers: OrderedDict[str, Any] = OrderedDict()
         self._pyav_readers: OrderedDict[str, _PyAVReader] = OrderedDict()
         self._pyav_corrupt_warning_count = 0
+        self._bad_video_paths: set[str] = set()
+        self._bad_video_warning_count = 0
         self._loaded_shards: OrderedDict[int, _ShardData] = OrderedDict()
         self._known_local_relative_paths: set[tuple[str, str]] = set()
         self._redownloaded_relative_paths: set[tuple[str, str]] = set()
@@ -705,6 +719,8 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
         state["_decord_readers"] = OrderedDict()
         state["_pyav_readers"] = OrderedDict()
         state["_pyav_corrupt_warning_count"] = 0
+        state["_bad_video_paths"] = set()
+        state["_bad_video_warning_count"] = 0
         state["_loaded_shards"] = OrderedDict()
         state["_known_local_relative_paths"] = set()
         state["_redownloaded_relative_paths"] = set()
@@ -1744,6 +1760,8 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
         try:
             with _shared_file_lock(lock_path):
                 return self._decode_video(video_path, frame_indices)
+        except _RecoverableVideoDecodeError:
+            raise
         except Exception:
             redownloaded_path = self._redownload_episode_video(
                 shard,
@@ -1755,6 +1773,8 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
             try:
                 with _shared_file_lock(lock_path):
                     return self._decode_video(redownloaded_path, frame_indices)
+            except _RecoverableVideoDecodeError:
+                raise
             except Exception as retry_exc:
                 raise RuntimeError(
                     "Canonical video decode failed after forced GCS redownload: "
@@ -1865,6 +1885,11 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
     def _decode_video_pyav(self, path_key: str, frame_indices: np.ndarray) -> np.ndarray:
         if av is None:
             raise RuntimeError("PyAV is required for canonical PyAV video decoding.")
+        if self.skip_corrupt_videos and path_key in getattr(self, "_bad_video_paths", set()):
+            raise _RecoverableVideoDecodeError(
+                f"Canonical video was previously marked corrupt in this worker: {path_key}",
+                path_key=path_key,
+            )
 
         base_reader = self._get_pyav_reader(path_key)
         base_reader_is_cached = self.pyav_reader_cache_size > 0
@@ -1892,7 +1917,7 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
 
         found: dict[int, np.ndarray] = {}
         fill_candidates: dict[int, np.ndarray] = {}
-        retry_extra_frames = max(self.pyav_decode_retry_extra_frames, max_decode_slop)
+        retry_extra_frames = max(0, self.pyav_decode_retry_extra_frames)
         positive_offsets = [0, 10, 20, 30, 35, 40, 45, 50, 60, 75, 90, 120, 180, 240, 360, 540, 720, 900]
         negative_offsets = [-30, -60, -120, -240, -480, -720, -900]
         attempt_frames: list[int] = []
@@ -1994,15 +2019,39 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
             available_frames = {**fill_candidates, **found}
             if available_frames:
                 available = sorted(available_frames)
+                should_fail_recovery = (
+                    self.skip_corrupt_videos
+                    and (
+                        len(missing) > self.pyav_max_missing_frames_for_fill
+                        or (attempted_after_error and self.pyav_fail_on_decode_error_recovery)
+                    )
+                )
+                if should_fail_recovery:
+                    raise _RecoverableVideoDecodeError(
+                        "Canonical PyAV corrupt recovery exceeded training skip threshold: "
+                        f"path={path_key} requested={unique_targets[:8]} missing={missing[:8]} "
+                        f"total_missing={len(missing)} available={available[:8]} "
+                        f"retried_after_error={attempted_after_error} "
+                        f"last_error={self._format_pyav_error(last_error)}",
+                        path_key=path_key,
+                    )
                 for target in missing:
                     nearest = min(available, key=lambda value: abs(value - target))
                     found[target] = available_frames[nearest]
                 self._warn_pyav_recovery(path_key, unique_targets, missing, available, last_error, attempted_after_error)
             else:
-                raise RuntimeError(
-                    f"PyAV decoded no usable frames from {path_key}; requested={unique_targets[:8]}"
-                )
+                message = f"PyAV decoded no usable frames from {path_key}; requested={unique_targets[:8]}"
+                if self.skip_corrupt_videos:
+                    raise _RecoverableVideoDecodeError(message, path_key=path_key)
+                raise RuntimeError(message)
         elif attempted_after_error and retry_recovered_seek_frame is not None:
+            if self.skip_corrupt_videos and self.pyav_fail_on_decode_error_recovery:
+                raise _RecoverableVideoDecodeError(
+                    "Canonical PyAV recovered only after decode-error retry; skipping for production training: "
+                    f"path={path_key} requested={unique_targets[:8]} retry_seek_frame={retry_recovered_seek_frame} "
+                    f"last_error={self._format_pyav_error(last_error)}",
+                    path_key=path_key,
+                )
             self._warn_pyav_retry_recovery(path_key, unique_targets, retry_recovered_seek_frame, last_error)
 
         frames = np.stack([found[int(index)] for index in indices], axis=0)
@@ -2102,6 +2151,47 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
         unique_indices = np.asarray(sorted({int(index) for index in frame_indices.tolist()}), dtype=np.int64)
         decoded = self._decode_episode_video(shard, video_path, unique_indices, lock_path)
         return {int(index): decoded[offset] for offset, index in enumerate(unique_indices.tolist())}
+
+    def _mark_bad_video(self, path_key: str | None, reason: str) -> None:
+        if not path_key:
+            return
+        self._bad_video_paths.add(path_key)
+        warning_count = int(getattr(self, "_bad_video_warning_count", 0))
+        self._bad_video_warning_count = warning_count + 1
+        if warning_count >= self.pyav_corrupt_warning_limit:
+            return
+        suffix = ""
+        if warning_count + 1 == self.pyav_corrupt_warning_limit:
+            suffix = " Further corrupt-video skip warnings are suppressed in this worker."
+        print(
+            "Canonical corrupt video marked for skip: "
+            f"path={path_key} reason={reason}.{suffix}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    def _context_bad_video_path(self, context: dict[str, Any]) -> str | None:
+        bad_paths = getattr(self, "_bad_video_paths", set())
+        if not bad_paths:
+            return None
+        for video_path, _, _ in context["video_frames"].values():
+            path_key = video_path.as_posix()
+            if path_key in bad_paths:
+                return path_key
+        return None
+
+    def _retry_index(self, index: int, attempt: int) -> int:
+        if self.total_windows <= 0:
+            return int(index)
+        # Use a large odd stride so repeated retries escape local corrupt spans
+        # without needing shared mutable state across dataloader workers.
+        stride = 100_003
+        return int(index + attempt * stride) % self.total_windows
+
+    def _decode_failure_to_recoverable(self, exc: Exception) -> _RecoverableVideoDecodeError | None:
+        if isinstance(exc, _RecoverableVideoDecodeError):
+            return exc
+        return None
 
     def _resize_video(self, video: np.ndarray) -> np.ndarray:
         if video.shape[1] == self.video_resolution_size and video.shape[2] == self.video_resolution_size:
@@ -2226,22 +2316,47 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
 
     def __getitem__(self, index: int) -> dict[str, Any]:
         start_time = time.monotonic()
+        original_index = int(index)
         window: WindowSpec | None = None
         shard: ShardSpec | None = None
         episode: EpisodeSpec | None = None
         touched_videos: list[str] = []
         try:
-            context = self._sample_context(int(index))
-            window = context["window"]
-            shard = context["shard"]
-            episode = context["episode"]
-            for slot in context["video_frames"]:
-                video_path, _, _ = context["video_frames"][slot]
+            max_attempts = self.max_sample_decode_retries + 1 if self.skip_corrupt_videos else 1
+            last_error: _RecoverableVideoDecodeError | None = None
+            for attempt in range(max_attempts):
+                sample_index = original_index if attempt == 0 else self._retry_index(original_index, attempt)
+                context = self._sample_context(sample_index)
+                window = context["window"]
+                shard = context["shard"]
+                episode = context["episode"]
+                touched_videos = []
+                for slot in context["video_frames"]:
+                    video_path, _, _ = context["video_frames"][slot]
+                    try:
+                        touched_videos.append(f"{slot}:{video_path.relative_to(shard.root).as_posix()}")
+                    except ValueError:
+                        touched_videos.append(f"{slot}:{video_path.as_posix()}")
+                bad_path = self._context_bad_video_path(context)
+                if bad_path is not None:
+                    last_error = _RecoverableVideoDecodeError(
+                        f"Canonical sample touches known corrupt video: {bad_path}",
+                        path_key=bad_path,
+                    )
+                    continue
                 try:
-                    touched_videos.append(f"{slot}:{video_path.relative_to(shard.root).as_posix()}")
-                except ValueError:
-                    touched_videos.append(f"{slot}:{video_path.as_posix()}")
-            return self._sample_from_context(context)
+                    return self._sample_from_context(context)
+                except Exception as exc:
+                    recoverable = self._decode_failure_to_recoverable(exc)
+                    if recoverable is None or not self.skip_corrupt_videos:
+                        raise
+                    last_error = recoverable
+                    self._mark_bad_video(recoverable.path_key, type(recoverable).__name__)
+                    continue
+            raise RuntimeError(
+                "Canonical sample decode failed after corrupt-video retries: "
+                f"index={original_index} attempts={max_attempts}"
+            ) from last_error
         finally:
             if self.slow_sample_log_seconds > 0:
                 elapsed = time.monotonic() - start_time
@@ -2269,26 +2384,53 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
                     )
 
     def __getitems__(self, indices: list[int]) -> list[dict[str, Any]]:
-        contexts = [self._sample_context(int(index)) for index in indices]
-        frame_requests: dict[tuple[str, str], tuple[ShardSpec, Path, Path, list[np.ndarray]]] = {}
-        for context in contexts:
-            for slot in context["video_frames"]:
-                video_path, frame_indices, lock_path = context["video_frames"][slot]
-                key = (slot, video_path.as_posix())
-                if key not in frame_requests:
-                    frame_requests[key] = (context["shard"], video_path, lock_path, [])
-                frame_requests[key][3].append(frame_indices)
-
-        decoded_frames: dict[tuple[str, str], dict[int, np.ndarray]] = {}
-        for key, (shard, video_path, lock_path, request_chunks) in frame_requests.items():
-            decoded_frames[key] = self._decode_video_frame_map(
-                shard,
-                video_path,
-                np.concatenate(request_chunks),
-                lock_path,
+        original_indices = [int(index) for index in indices]
+        max_attempts = self.max_sample_decode_retries + 1 if self.skip_corrupt_videos else 1
+        last_error: _RecoverableVideoDecodeError | None = None
+        for attempt in range(max_attempts):
+            batch_indices = (
+                original_indices
+                if attempt == 0
+                else [self._retry_index(index, attempt) for index in original_indices]
             )
+            contexts = [self._sample_context(index) for index in batch_indices]
+            bad_path = next((path for context in contexts if (path := self._context_bad_video_path(context))), None)
+            if bad_path is not None:
+                last_error = _RecoverableVideoDecodeError(
+                    f"Canonical batch touches known corrupt video: {bad_path}",
+                    path_key=bad_path,
+                )
+                continue
+            frame_requests: dict[tuple[str, str], tuple[ShardSpec, Path, Path, list[np.ndarray]]] = {}
+            for context in contexts:
+                for slot in context["video_frames"]:
+                    video_path, frame_indices, lock_path = context["video_frames"][slot]
+                    key = (slot, video_path.as_posix())
+                    if key not in frame_requests:
+                        frame_requests[key] = (context["shard"], video_path, lock_path, [])
+                    frame_requests[key][3].append(frame_indices)
 
-        return [self._sample_from_context(context, decoded_frames) for context in contexts]
+            decoded_frames: dict[tuple[str, str], dict[int, np.ndarray]] = {}
+            try:
+                for key, (shard, video_path, lock_path, request_chunks) in frame_requests.items():
+                    decoded_frames[key] = self._decode_video_frame_map(
+                        shard,
+                        video_path,
+                        np.concatenate(request_chunks),
+                        lock_path,
+                    )
+                return [self._sample_from_context(context, decoded_frames) for context in contexts]
+            except Exception as exc:
+                recoverable = self._decode_failure_to_recoverable(exc)
+                if recoverable is None or not self.skip_corrupt_videos:
+                    raise
+                last_error = recoverable
+                self._mark_bad_video(recoverable.path_key, type(recoverable).__name__)
+                continue
+        raise RuntimeError(
+            "Canonical batch decode failed after corrupt-video retries: "
+            f"indices={original_indices[:8]} batch_size={len(original_indices)} attempts={max_attempts}"
+        ) from last_error
 
     def save_dataset_statistics(self, save_path: str | Path) -> None:
         save_path = Path(save_path)

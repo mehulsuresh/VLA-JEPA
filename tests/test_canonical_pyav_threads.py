@@ -327,6 +327,54 @@ def test_canonical_sample_returns_qwen_frames_without_duplicate_qwen_views(tmp_p
     assert sample["subtask_label"] == "grasp object"
 
 
+def test_canonical_getitems_retries_corrupt_video_batch(monkeypatch, tmp_path):
+    dataset = canonical.CanonicalSubsetVLADataset.__new__(canonical.CanonicalSubsetVLADataset)
+    dataset.skip_corrupt_videos = True
+    dataset.max_sample_decode_retries = 2
+    dataset.total_windows = 1_000_000
+    dataset._bad_video_paths = set()
+    dataset._bad_video_warning_count = 0
+    dataset.pyav_corrupt_warning_limit = 10
+
+    bad_path = tmp_path / "bad.mp4"
+    good_path = tmp_path / "good.mp4"
+    shard = SimpleNamespace(root=tmp_path)
+    attempts = []
+
+    def fake_sample_context(index):
+        path = bad_path if index in {1, 2} else good_path
+        return {
+            "sample_index": index,
+            "shard": shard,
+            "video_frames": {
+                "main": (path, np.asarray([0, 1], dtype=np.int64), tmp_path / f"{path.stem}.lock")
+            },
+        }
+
+    def fake_decode_video_frame_map(_shard, video_path, frame_indices, _lock_path):
+        attempts.append(video_path.name)
+        if video_path == bad_path:
+            raise canonical._RecoverableVideoDecodeError("bad video", path_key=video_path.as_posix())
+        return {int(index): np.zeros((2, 2, 3), dtype=np.uint8) for index in frame_indices.tolist()}
+
+    monkeypatch.setattr(dataset, "_sample_context", fake_sample_context)
+    monkeypatch.setattr(dataset, "_decode_video_frame_map", fake_decode_video_frame_map)
+    monkeypatch.setattr(
+        dataset,
+        "_sample_from_context",
+        lambda context, decoded_frames=None: {"sample_index": context["sample_index"]},
+    )
+
+    samples = dataset.__getitems__([1, 2])
+
+    assert attempts == ["bad.mp4", "good.mp4"]
+    assert bad_path.as_posix() in dataset._bad_video_paths
+    assert [sample["sample_index"] for sample in samples] == [
+        dataset._retry_index(1, 1),
+        dataset._retry_index(2, 1),
+    ]
+
+
 def test_canonical_subtask_spans_parse_episode_metadata():
     dataset = canonical.CanonicalSubsetVLADataset.__new__(canonical.CanonicalSubsetVLADataset)
     dataset.append_subtask_to_prompt = True
