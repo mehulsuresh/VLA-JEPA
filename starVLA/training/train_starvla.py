@@ -67,6 +67,10 @@ configure_runtime_logging()
 
 # Third-Party Libraries
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+os.environ.setdefault("OMP_NUM_THREADS", os.environ.get("VLA_JEPA_MAIN_TORCH_THREADS", "1"))
+os.environ.setdefault("MKL_NUM_THREADS", os.environ.get("VLA_JEPA_MAIN_TORCH_THREADS", "1"))
+os.environ.setdefault("OPENBLAS_NUM_THREADS", os.environ.get("VLA_JEPA_MAIN_TORCH_THREADS", "1"))
+os.environ.setdefault("NUMEXPR_NUM_THREADS", os.environ.get("VLA_JEPA_MAIN_TORCH_THREADS", "1"))
 import torch
 import torch.distributed as dist
 import yaml
@@ -88,6 +92,26 @@ from starVLA.model.modules.action_model.rtc_training import rtc_training_probabi
 
 # Sane Defaults
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+try:
+    import faulthandler
+    import sys
+
+    faulthandler.enable(file=sys.stderr, all_threads=True)
+except Exception:
+    pass
+
+try:
+    _main_torch_threads = max(1, int(os.environ.get("VLA_JEPA_MAIN_TORCH_THREADS", "1")))
+    torch.set_num_threads(_main_torch_threads)
+except Exception:
+    pass
+
+try:
+    _main_torch_interop_threads = max(1, int(os.environ.get("VLA_JEPA_MAIN_TORCH_INTEROP_THREADS", "1")))
+    torch.set_num_interop_threads(_main_torch_interop_threads)
+except Exception:
+    pass
+
 if torch.cuda.is_available():
     torch.backends.cudnn.benchmark = True
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -95,6 +119,12 @@ if torch.cuda.is_available():
         torch.set_float32_matmul_precision("high")
     except AttributeError:
         pass
+
+_disable_autograd_mt = os.environ.get("VLA_JEPA_DISABLE_AUTOGRAD_MULTITHREADING", "1").strip().lower()
+if _disable_autograd_mt not in {"0", "false", "no", "off"}:
+    _set_autograd_mt = getattr(torch.autograd, "set_multithreading_enabled", None)
+    if _set_autograd_mt is not None:
+        _set_autograd_mt(False)
 
 
 logger = get_logger(__name__)

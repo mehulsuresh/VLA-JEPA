@@ -329,6 +329,7 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets", model=None):
             instruction_text=vla_dataset_cfg.get("instruction_text", "Complete the task successfully."),
             current_cameras=vla_dataset_cfg.get("current_cameras", None),
             frame_cache_size=vla_dataset_cfg.get("frame_cache_size", 256),
+            data_cfg=vla_dataset_cfg,
         )
 
         collate_fn = _identity_collate
@@ -338,11 +339,17 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets", model=None):
                 prompt_template=vla_dataset_cfg.get("CoT_prompt", ""),
                 replace_prompt=model.replace_prompt,
                 embodied_replace_prompt=model.embodied_replace_prompt,
+                state_replace_prompt=getattr(model, "qwen_state_replace_prompt", ""),
+                geometry_replace_prompt=getattr(model, "geometry_replace_prompt", ""),
                 special_action_token=cfg.framework.vj2_model.special_action_token,
                 max_action_tokens=cfg.framework.action_model.action_horizon * 4,
                 embodied_action_token=cfg.framework.vj2_model.get(
                     "embodied_action_token", "<|embodied_action|>"
                 ),
+                extra_special_tokens=[
+                    *getattr(model, "geometry_tokens", []),
+                    *getattr(model, "qwen_state_tokens", []),
+                ],
             )
             safe_worker_cap = int(vla_dataset_cfg.get("safe_num_workers_cap", 2))
             if num_workers > safe_worker_cap:

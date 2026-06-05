@@ -213,9 +213,17 @@ class VLA_JEPA(baseframework):
         self.geometry_token_template = str(
             self.depth_teacher_aux_cfg.get("geometry_token_template", "<|geometry_{}|>")
         )
-        self.qwen_state_cfg = self.config.framework.get("qwen_state", {})
-        self.qwen_state_num_tokens = int(self.qwen_state_cfg.get("num_tokens", 8))
-        self.qwen_state_token_template = str(self.qwen_state_cfg.get("token_template", "<|state_{}|>"))
+        self.qwen_state_cfg = self.config.framework.get("qwen_state", None)
+        self.qwen_state_num_tokens = (
+            int(self.qwen_state_cfg.get("num_tokens", 8))
+            if self.qwen_state_cfg is not None
+            else 0
+        )
+        self.qwen_state_token_template = (
+            str(self.qwen_state_cfg.get("token_template", "<|state_{}|>"))
+            if self.qwen_state_cfg is not None
+            else "<|state_{}|>"
+        )
         action_tokens, self.action_token_ids, self.embodied_action_token_id, self.geometry_tokens, self.geometry_token_ids, self.qwen_state_tokens, self.qwen_state_token_ids = self.expand_tokenizer(
             tokenizer=self.qwen_vl_interface.processor.tokenizer,
             special_action_token=self.config.framework.vj2_model.special_action_token,
@@ -566,6 +574,18 @@ class VLA_JEPA(baseframework):
         if self._qwen_grad_cache is None:
             self._qwen_grad_cache = any(param.requires_grad for param in self.qwen_vl_interface.model.parameters())
         return self._qwen_grad_cache
+
+    def _qwen_forward_requires_grad(
+        self,
+        token_replacement_embeds: Optional[torch.Tensor],
+    ) -> bool:
+        if self._qwen_requires_grad():
+            return True
+        return bool(
+            token_replacement_embeds is not None
+            and isinstance(token_replacement_embeds, torch.Tensor)
+            and token_replacement_embeds.requires_grad
+        )
 
     def refresh_runtime_caches(self) -> None:
         self._qwen_grad_cache = any(param.requires_grad for param in self.qwen_vl_interface.model.parameters())
@@ -1322,11 +1342,13 @@ class VLA_JEPA(baseframework):
         key_keep_mask: torch.Tensor,
         key_block_ids: torch.Tensor,
         action_horizon: int,
+        state_token_count: int = 0,
         dtype: torch.dtype,
     ) -> torch.Tensor:
         num_future_tokens = int(self.config.framework.action_model.num_target_vision_tokens)
         query_block_ids = torch.cat(
             (
+                torch.full((int(state_token_count),), 2, device=key_block_ids.device, dtype=torch.long),
                 torch.full((num_future_tokens,), 3, device=key_block_ids.device, dtype=torch.long),
                 torch.full((int(action_horizon),), 4, device=key_block_ids.device, dtype=torch.long),
             ),
@@ -1346,16 +1368,19 @@ class VLA_JEPA(baseframework):
         action_horizon: int,
         device: torch.device,
         dtype: torch.dtype,
+        state_token_count: int = 0,
     ) -> torch.Tensor:
         """
         Block mask for the DiT token sequence:
-        future/query tokens are block 3 and noisy flow-action tokens are block 4.
+        optional legacy state tokens are block 2, future/query tokens are block 3,
+        and noisy flow-action tokens are block 4.
         This prevents noisy action values from flowing back into the query tokens
         when the DiT is configured with interleaved self-attention.
         """
         num_future_tokens = int(self.config.framework.action_model.num_target_vision_tokens)
         token_block_ids = torch.cat(
             (
+                torch.full((int(state_token_count),), 2, device=device, dtype=torch.long),
                 torch.full((num_future_tokens,), 3, device=device, dtype=torch.long),
                 torch.full((int(action_horizon),), 4, device=device, dtype=torch.long),
             ),
@@ -1423,6 +1448,31 @@ class VLA_JEPA(baseframework):
                 self.qwen_hidden_size,
             )
         return state_embeds, state_mask
+
+    def _prepare_action_head_state(
+        self,
+        *,
+        state,
+        device: torch.device,
+        batch_size: int,
+    ) -> Optional[torch.Tensor]:
+        if state is None or self.qwen_state_projector is not None or self.action_model.state_encoder is None:
+            return None
+        if isinstance(state, torch.Tensor):
+            state_tensor = state.to(device=device, dtype=torch.float32, non_blocking=True)
+        else:
+            state_tensor = torch.from_numpy(np.asarray(state, dtype=np.float32)).to(
+                device=device,
+                dtype=torch.float32,
+                non_blocking=True,
+            )
+        if state_tensor.shape[0] != batch_size:
+            raise ValueError(
+                f"Action-head state batch size mismatch: expected {batch_size}, got {state_tensor.shape[0]}"
+            )
+        if state_tensor.ndim == 2:
+            state_tensor = state_tensor.unsqueeze(1)
+        return state_tensor
 
     def _build_qwen_inputs_from_examples(self, examples: List[dict]) -> dict[str, torch.Tensor]:
         batch_images = [example["image"] for example in examples]
@@ -2397,7 +2447,6 @@ class VLA_JEPA(baseframework):
             geometry_token_ids = self._geometry_token_ids_t.to(input_ids.device)
             geometry_indices = torch.isin(input_ids, geometry_token_ids).nonzero(as_tuple=True)
         
-        qwen_context = nullcontext() if self._qwen_requires_grad() else torch.no_grad()
         qwen_forward_start = time.perf_counter()
         state_replacement_embeds, state_replacement_mask = self._prepare_qwen_state_replacements(
             state=state if has_state else None,
@@ -2408,6 +2457,11 @@ class VLA_JEPA(baseframework):
             self._build_qwen_blockwise_attention_block_ids(qwen_inputs)
             if self.qwen_blockwise_attention_enabled
             else None
+        )
+        qwen_context = (
+            nullcontext()
+            if self._qwen_forward_requires_grad(state_replacement_embeds)
+            else torch.no_grad()
         )
         with qwen_context, torch.autocast("cuda", dtype=torch.bfloat16):
             # Use feature-extraction path: skips LM head and avoids storing all
@@ -2502,10 +2556,21 @@ class VLA_JEPA(baseframework):
                     device=last_hidden.device, non_blocking=True
                 )
             actions_target = self._slice_training_action_chunk(actions)
+            action_head_state = self._prepare_action_head_state(
+                state=state if has_state else None,
+                device=last_hidden.device,
+                batch_size=action_head_context.shape[0],
+            )
+            action_head_state_token_count = (
+                int(action_head_state.shape[1])
+                if action_head_state is not None and action_head_state.ndim >= 3
+                else 0
+            )
             action_head_encoder_attention_mask = self._build_action_head_encoder_attention_mask(
                 key_keep_mask=action_head_key_keep_mask,
                 key_block_ids=action_head_key_block_ids,
                 action_horizon=actions_target.shape[1],
+                state_token_count=action_head_state_token_count,
                 dtype=last_hidden.dtype,
             )
             action_head_self_attention_mask = self._build_action_head_self_attention_mask(
@@ -2513,11 +2578,19 @@ class VLA_JEPA(baseframework):
                 action_horizon=actions_target.shape[1],
                 device=last_hidden.device,
                 dtype=last_hidden.dtype,
+                state_token_count=action_head_state_token_count,
             )
 
             repeated_diffusion_steps = self._repeated_diffusion_steps
             actions_target_repeated = actions_target.repeat(repeated_diffusion_steps, 1, 1)
             action_head_context_repeated = action_head_context.repeat(repeated_diffusion_steps, 1, 1)
+            action_head_state_repeated = (
+                action_head_state.repeat(
+                    (repeated_diffusion_steps,) + (1,) * (action_head_state.ndim - 1)
+                )
+                if action_head_state is not None
+                else None
+            )
             action_head_encoder_attention_mask_repeated = action_head_encoder_attention_mask.repeat(
                 repeated_diffusion_steps,
                 1,
@@ -2544,7 +2617,7 @@ class VLA_JEPA(baseframework):
                 loss_sum, loss_count = self.action_model(
                     action_head_context_repeated,
                     actions_target_repeated,
-                    None,
+                    action_head_state_repeated,
                     attention_mask=action_head_self_attention_mask_repeated,
                     encoder_attention_mask=action_head_encoder_attention_mask_repeated,
                     action_mask=action_mask_repeated,
@@ -2565,7 +2638,7 @@ class VLA_JEPA(baseframework):
                 action_loss = self.action_model(
                     action_head_context_repeated,
                     actions_target_repeated,
-                    None,
+                    action_head_state_repeated,
                     attention_mask=action_head_self_attention_mask_repeated,
                     encoder_attention_mask=action_head_encoder_attention_mask_repeated,
                     action_mask=action_mask_repeated,
@@ -2705,10 +2778,21 @@ class VLA_JEPA(baseframework):
                 last_hidden=last_hidden,
                 qwen_inputs=qwen_inputs,
             )
+            action_head_state = self._prepare_action_head_state(
+                state=state if has_state else None,
+                device=last_hidden.device,
+                batch_size=action_head_context.shape[0],
+            )
+            action_head_state_token_count = (
+                int(action_head_state.shape[1])
+                if action_head_state is not None and action_head_state.ndim >= 3
+                else 0
+            )
             action_head_encoder_attention_mask = self._build_action_head_encoder_attention_mask(
                 key_keep_mask=action_head_key_keep_mask,
                 key_block_ids=action_head_key_block_ids,
                 action_horizon=self.action_model.action_horizon,
+                state_token_count=action_head_state_token_count,
                 dtype=last_hidden.dtype,
             )
             action_head_self_attention_mask = self._build_action_head_self_attention_mask(
@@ -2716,6 +2800,7 @@ class VLA_JEPA(baseframework):
                 action_horizon=self.action_model.action_horizon,
                 device=last_hidden.device,
                 dtype=last_hidden.dtype,
+                state_token_count=action_head_state_token_count,
             )
         prev_actions = kwargs.get("prev_actions")
         prefix_len = int(kwargs.get("prefix_len", 0) or 0)
@@ -2730,7 +2815,7 @@ class VLA_JEPA(baseframework):
         with torch.autocast("cuda", dtype=torch.bfloat16):
             pred_actions = self.action_model.predict_action(
                 action_head_context,
-                None,
+                action_head_state,
                 attention_mask=action_head_self_attention_mask,
                 encoder_attention_mask=action_head_encoder_attention_mask,
                 prev_actions=prev_actions,

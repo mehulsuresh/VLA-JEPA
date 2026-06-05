@@ -492,6 +492,8 @@ class EpisodeSpec:
     video_paths: dict[str, Path]
     video_base_frames: dict[str, int]
     subtask_spans: tuple[SubtaskSpan, ...] = ()
+    episode_index: int | None = None
+    dataset_from_index: int | None = None
 
 
 @dataclass(frozen=True)
@@ -671,6 +673,10 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
         self.max_sample_decode_retries = max(int(_cfg_get(data_cfg, "max_sample_decode_retries", 128)), 0)
         self.pyav_max_missing_frames_for_fill = max(int(_cfg_get(data_cfg, "pyav_max_missing_frames_for_fill", 0)), 0)
         self.pyav_fail_on_decode_error_recovery = bool(_cfg_get(data_cfg, "pyav_fail_on_decode_error_recovery", True))
+        self.pyav_max_nearest_fill_distance = max(
+            int(_cfg_get(data_cfg, "pyav_max_nearest_fill_distance", 2)),
+            0,
+        )
         self.pyav_reader_cache_size = max(int(_cfg_get(data_cfg, "pyav_reader_cache_size", self.reader_cache_size)), 0)
         self.pyav_thread_count = _parse_pyav_thread_count(_cfg_get(data_cfg, "pyav_thread_count", 1))
         self.pyav_thread_type = str(_cfg_get(data_cfg, "pyav_thread_type", "SLICE")).upper()
@@ -1095,6 +1101,7 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
         columns = [
             "data/chunk_index",
             "data/file_index",
+            "episode_index",
             "dataset_from_index",
             "length",
             "task_index",
@@ -1404,6 +1411,8 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
                     video_paths=video_paths,
                     video_base_frames=video_base_frames,
                     subtask_spans=self._episode_subtask_spans(episode),
+                    episode_index=int(episode["episode_index"]) if "episode_index" in episode else len(specs),
+                    dataset_from_index=int(episode["dataset_from_index"]),
                 )
             )
             projected_windows += max(1, (int(episode["length"]) + self.sample_stride - 1) // self.sample_stride)
@@ -2039,9 +2048,25 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
                         f"last_error={self._format_pyav_error(last_error)}",
                         path_key=path_key,
                     )
+                distant_fills: list[tuple[int, int, int]] = []
                 for target in missing:
                     nearest = min(available, key=lambda value: abs(value - target))
+                    distance = abs(nearest - target)
+                    if distance > self.pyav_max_nearest_fill_distance:
+                        distant_fills.append((target, nearest, distance))
+                        continue
                     found[target] = available_frames[nearest]
+                if distant_fills:
+                    message = (
+                        "PyAV nearest-frame fill exceeded safety distance: "
+                        f"path={path_key} requested={unique_targets[:8]} missing={missing[:8]} "
+                        f"max_distance={self.pyav_max_nearest_fill_distance} "
+                        f"distant_fills={distant_fills[:8]} available={available[:8]} "
+                        f"last_error={self._format_pyav_error(last_error)}"
+                    )
+                    if self.skip_corrupt_videos:
+                        raise _RecoverableVideoDecodeError(message, path_key=path_key)
+                    raise RuntimeError(message)
                 self._warn_pyav_recovery(path_key, unique_targets, missing, available, last_error, attempted_after_error)
             else:
                 message = f"PyAV decoded no usable frames from {path_key}; requested={unique_targets[:8]}"

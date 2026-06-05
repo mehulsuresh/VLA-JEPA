@@ -160,6 +160,13 @@ class _QWen3_5_Interface(nn.Module):
                 and _QWen3_5_Interface._prepare_flash_attn_4(max_head_dim=max_head_dim)
             ) else "flash_attention_2"
 
+        if normalized in {"flex", "flex_attention", "flex-attn"}:
+            raise RuntimeError(
+                "Qwen3.5 uses a hybrid linear/full-attention stack and does not support "
+                "the VLA-JEPA blockwise FlexAttention path. Use a Qwen3-VL config for "
+                "blockwise attention, or disable framework.qwenvl.blockwise_attention."
+            )
+
         flash2_available = torch.cuda.is_available() and is_flash_attn_2_available()
         flash4_installed = torch.cuda.is_available() and is_flash_attn_4_available()
         flash4_available = flash4_installed and _QWen3_5_Interface._prepare_flash_attn_4(max_head_dim=max_head_dim)
@@ -474,6 +481,9 @@ class _QWen3_5_Interface(nn.Module):
         self._compile_prepared = False
         self._chat_wrapper_cache: dict[tuple[int, bool], tuple[str, str]] = {}
 
+    def supports_blockwise_attention(self) -> bool:
+        return False
+
     def prepare_for_compile(self) -> int:
         """
         Make the Qwen3.5 model compile-friendly enough for torch.compile.
@@ -527,6 +537,12 @@ class _QWen3_5_Interface(nn.Module):
 
         Saves compute (skips vocab-size matmul) and memory (no per-layer state tuple).
         """
+        qwen_blockwise_block_ids = kwargs.pop("qwen_blockwise_block_ids", None)
+        if qwen_blockwise_block_ids is not None:
+            raise RuntimeError(
+                "Qwen3.5 does not support VLA-JEPA Qwen-internal blockwise attention. "
+                "Disable framework.qwenvl.blockwise_attention for Qwen3.5 configs."
+            )
         kwargs.pop("labels", None)
         kwargs["output_hidden_states"] = False
         kwargs["output_attentions"] = False

@@ -300,7 +300,7 @@ class FlowmatchingActionHead(nn.Module):
         return patched
 
     def sample_time(self, batch_size, device, dtype):
-        sample = self.beta_dist.sample([batch_size]).to(device, dtype=dtype)
+        sample = self.beta_dist.sample([batch_size]).to(device, dtype=dtype).clamp(max=self.noise_s)
         return (self.noise_s - sample) / self.noise_s
 
     def prepare_input(self, batch: dict) -> BatchFeature:

@@ -8,6 +8,9 @@ import yaml
 
 import starVLA.model.modules.action_model.GR00T_ActionHeader as gr00t_action_header
 from starVLA.model.modules.action_model.GR00T_ActionHeader import ActionEncoder, FlowmatchingActionHead
+from starVLA.model.modules.action_model.LayerwiseFM_ActionHeader import (
+    LayerwiseFlowmatchingActionHead,
+)
 from starVLA.model.modules.action_model.flow_matching_head.cross_attention_dit import DiT
 from starVLA.model.modules.action_model.rtc_training import (
     apply_rtc_time_conditioning,
@@ -15,6 +18,14 @@ from starVLA.model.modules.action_model.rtc_training import (
     rtc_training_probability,
     sample_rtc_training_delays,
 )
+
+
+class _FixedBeta:
+    def __init__(self, value):
+        self.value = float(value)
+
+    def sample(self, shape):
+        return torch.full(tuple(shape), self.value)
 
 
 def test_rtc_delay_sampling_and_time_conditioning():
@@ -278,6 +289,28 @@ def test_gr00t_head_uses_reference_scalar_dit_timestep_by_default():
     assert model_timestep.shape == (2,)
 
 
+def test_gr00t_sample_time_clamps_beta_sample_to_noise_s():
+    head = object.__new__(FlowmatchingActionHead)
+    head.beta_dist = _FixedBeta(1.0)
+    head.noise_s = 0.999
+
+    t = head.sample_time(batch_size=4, device="cpu", dtype=torch.float32)
+
+    assert torch.all(t >= 0)
+    assert torch.allclose(t, torch.zeros(4))
+
+
+def test_layerwise_sample_time_clamps_beta_sample_to_noise_s():
+    head = object.__new__(LayerwiseFlowmatchingActionHead)
+    head.beta_dist = _FixedBeta(1.0)
+    head.config = SimpleNamespace(noise_s=0.999)
+
+    t = head.sample_time(batch_size=4, device="cpu", dtype=torch.float32)
+
+    assert torch.all(t >= 0)
+    assert torch.allclose(t, torch.zeros(4))
+
+
 def test_rtc_masked_loss_uses_global_valid_token_mean():
     per_token_loss = torch.tensor(
         [
@@ -507,8 +540,9 @@ def test_predict_action_warns_when_rtc_requested_without_prefix():
     assert pred.shape == (2, 5, 3)
 
 
-def test_robot_ft_configs_keep_rtc_and_per_token_dit_disabled():
+def test_robot_ft_configs_keep_per_token_dit_disabled_except_full_qwen():
     explicit_rtc_configs = {
+        Path("scripts/config/vlajepa_robot_ft_lerobot_trossen_qwen35_08b_lora_moge_vits_5090.yaml"),
         Path("scripts/config/vlajepa_robot_ft_canonical_full_a100x8_qwen_full_zero3_moge_vits.yaml"),
     }
     for path in sorted(Path("scripts/config").glob("vlajepa_robot_ft*.yaml")):
@@ -519,6 +553,20 @@ def test_robot_ft_configs_keep_rtc_and_per_token_dit_disabled():
         rtc_config = cfg["framework"]["action_model"]["rtc_training"]
         assert rtc_config["enabled"] is False, path
         assert rtc_config["condition_dit_tokens"] is False, path
+
+
+def test_lerobot_qwen35_lora_config_enables_rtc_without_per_token_dit():
+    path = Path("scripts/config/vlajepa_robot_ft_lerobot_trossen_qwen35_08b_lora_moge_vits_5090.yaml")
+    with path.open("r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)
+
+    rtc_config = cfg["framework"]["action_model"]["rtc_training"]
+    assert rtc_config["enabled"] is True
+    assert rtc_config["condition_dit_tokens"] is False
+    assert rtc_config["max_delay"] == 11
+    assert rtc_config["distribution"] == "uniform"
+    assert rtc_config["warmup_steps"] == 10000
+    assert rtc_config["ramp_steps"] == 50000
 
 
 def test_full_qwen_zero3_config_enables_rtc_warmup():

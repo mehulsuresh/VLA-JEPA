@@ -2,6 +2,7 @@ import json
 
 import numpy as np
 
+from starVLA.dataloader.prompt_labels import append_task_id_label_to_language
 from starVLA.dataloader.preprocessed_subtask_dataset import PreprocessedSubtaskVLADataset
 
 
@@ -78,3 +79,56 @@ def test_preprocessed_dataset_statistics_report_optional_label_coverage(tmp_path
     assert stats["episodes_with_mistake_labels"] == 0
     assert stats["episodes_with_global_complexity_to_go"] == 0
     assert stats["episodes_with_local_complexity_to_go"] == 0
+
+
+def test_task_id_prompt_label_helper_appends_text_label_once():
+    cfg = {
+        "append_task_id_to_prompt": True,
+        "task_id_prompt_separator": " | ",
+        "task_id_label_map": {
+            "3": "firmly grasp the item",
+        },
+    }
+
+    language, label = append_task_id_label_to_language("Put the shirt in the other bin", 3, cfg)
+    assert label == "firmly grasp the item"
+    assert language == "Put the shirt in the other bin | firmly grasp the item"
+
+    language, label = append_task_id_label_to_language(language, 3, cfg)
+    assert label == "firmly grasp the item"
+    assert language == "Put the shirt in the other bin | firmly grasp the item"
+
+
+def test_preprocessed_dataset_appends_task_id_label_to_prompt(tmp_path):
+    _write_episode(
+        tmp_path,
+        labels={
+            "subtask_id": [2, 2, 3],
+            "mistake_label": [1.0, 1.0, 1.0],
+        },
+    )
+
+    dataset = PreprocessedSubtaskVLADataset(
+        tmp_path,
+        action_horizon=2,
+        video_horizon=3,
+        video_target_shift_steps=1,
+        resolution_size=4,
+        video_resolution_size=4,
+        current_cameras=["observation.images.cam_high"],
+        frame_cache_size=0,
+        data_cfg={
+            "append_task_id_to_prompt": True,
+            "task_id_prompt_separator": " | ",
+            "task_id_label_map": {
+                2: "reach hand inside",
+                3: "firmly grasp the item",
+            },
+        },
+    )
+
+    sample = dataset[0]
+
+    assert sample["task_id"] == 2
+    assert sample["task_id_label"] == "reach hand inside"
+    assert sample["lang"] == "Complete the task successfully. | reach hand inside"

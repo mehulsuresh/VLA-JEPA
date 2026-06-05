@@ -322,6 +322,32 @@ def test_qwen3_blockwise_attention_uses_flex_block_mask():
     assert block_mask.shape == (1, 1, 3, 3)
 
 
+def test_qwen_forward_keeps_autograd_for_trainable_state_replacements_when_qwen_frozen():
+    model = object.__new__(VLA_JEPA)
+    model._qwen_grad_cache = False
+
+    trainable_state_embeds = torch.zeros(1, 2, 4, requires_grad=True)
+    frozen_state_embeds = trainable_state_embeds.detach()
+
+    assert VLA_JEPA._qwen_forward_requires_grad(model, trainable_state_embeds)
+    assert not VLA_JEPA._qwen_forward_requires_grad(model, frozen_state_embeds)
+    assert not VLA_JEPA._qwen_forward_requires_grad(model, None)
+
+
+def test_qwen35_rejects_blockwise_attention_path():
+    interface = object.__new__(_QWen3_5_Interface)
+
+    assert not _QWen3_5_Interface.supports_blockwise_attention(interface)
+    with pytest.raises(RuntimeError, match="does not support"):
+        _QWen3_5_Interface._resolve_attn_implementation("flex_attention")
+    with pytest.raises(RuntimeError, match="does not support"):
+        _QWen3_5_Interface.forward_features(
+            interface,
+            input_ids=torch.tensor([[1, 2]], dtype=torch.long),
+            qwen_blockwise_block_ids=torch.tensor([[0, 1]], dtype=torch.long),
+        )
+
+
 def test_vlm_factory_keeps_qwen35_rollback_route():
     source = inspect.getsource(get_vlm_model)
 
@@ -339,7 +365,14 @@ def test_vla_jepa_configs_declare_state_tokens_and_ordered_prompts():
         framework_cfg = cfg["framework"]
         assert framework_cfg["name"] == "VLA_JEPA", path
         qwenvl_cfg = framework_cfg["qwenvl"]
-        assert qwenvl_cfg["base_vlm"] == "Qwen/Qwen3-VL-2B-Instruct", path
+        is_qwen35_lora_experiment = "qwen35_08b_lora" in path.name
+        if is_qwen35_lora_experiment:
+            assert qwenvl_cfg["base_vlm"] == "Qwen/Qwen3.5-0.8B", path
+            assert bool(qwenvl_cfg.get("lora", {}).get("enabled", False)), path
+            assert not bool(qwenvl_cfg.get("blockwise_attention", {}).get("enabled", False)), path
+            assert not bool(qwenvl_cfg.get("enable_fast_linear_attention", True)), path
+        else:
+            assert qwenvl_cfg["base_vlm"] == "Qwen/Qwen3-VL-2B-Instruct", path
         assert qwenvl_cfg["vl_hidden_dim"] == "auto", path
         assert framework_cfg["action_model"]["diffusion_model_cfg"]["cross_attention_dim"] == "auto", path
         assert framework_cfg["qwen_state"] == {
@@ -360,7 +393,8 @@ def test_vla_jepa_configs_declare_state_tokens_and_ordered_prompts():
         assert "temporal dynamics from frames" not in prompt, path
         assert prompt.index("{state}") < prompt.index("{e_actions}") < prompt.index("{actions}"), path
         if cfg["datasets"]["vla_data"].get("dataset_py") == "lerobot_datasets":
-            assert cfg["datasets"]["vla_data"].get("video_backend") == "pyav", path
+            expected_backend = "decord" if is_qwen35_lora_experiment else "pyav"
+            assert cfg["datasets"]["vla_data"].get("video_backend") == expected_backend, path
         if framework_cfg.get("depth_teacher_aux", {}).get("enabled", False):
             assert "{geometry}" in prompt, path
             assert prompt.index("{actions}") < prompt.index("{geometry}"), path

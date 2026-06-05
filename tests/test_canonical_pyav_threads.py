@@ -49,10 +49,73 @@ class _FakeAV:
         return self.container
 
 
+class _FakeDecodeError(Exception):
+    pass
+
+
+class _FakeDecodeFrame:
+    def __init__(self, index):
+        self.index = index
+        self.pts = index
+        self.time = index / 30.0
+
+    def to_ndarray(self, format="rgb24"):
+        assert format == "rgb24"
+        return np.full((2, 2, 3), self.index, dtype=np.uint8)
+
+
+class _FakeDecodeContainer:
+    def __init__(self):
+        self.seek_pts = None
+        self.closed = False
+
+    def seek(self, pts, stream=None, backward=True, any_frame=False):
+        self.seek_pts = int(pts)
+
+    def decode(self, stream):
+        if self.seek_pts == 0:
+            for index in range(11):
+                yield _FakeDecodeFrame(index)
+        raise _FakeDecodeError("decode failed")
+
+    def close(self):
+        self.closed = True
+
+
 def _make_dataset(thread_count):
     dataset = canonical.CanonicalSubsetVLADataset.__new__(canonical.CanonicalSubsetVLADataset)
     dataset.pyav_thread_count = thread_count
     dataset.pyav_thread_type = "SLICE"
+    return dataset
+
+
+def _make_pyav_decode_dataset(max_fill_distance):
+    dataset = canonical.CanonicalSubsetVLADataset.__new__(canonical.CanonicalSubsetVLADataset)
+    dataset.pyav_reader_cache_size = 0
+    dataset.pyav_decode_retry_extra_frames = 120
+    dataset.pyav_max_nearest_fill_distance = max_fill_distance
+    dataset.skip_corrupt_videos = False
+    dataset.pyav_max_missing_frames_for_fill = 0
+    dataset.pyav_fail_on_decode_error_recovery = True
+    dataset.pyav_corrupt_warning_limit = 0
+    dataset._pyav_corrupt_warning_count = 0
+    dataset._bad_video_paths = set()
+    dataset.video_resolution_size = 2
+
+    def make_reader(path_key):
+        container = _FakeDecodeContainer()
+        return SimpleNamespace(
+            container=container,
+            stream=object(),
+            fps=30.0,
+            time_base=1.0 / 30.0,
+            start_time=0,
+            frame_count=1000,
+        )
+
+    dataset._get_pyav_reader = make_reader
+    dataset._make_pyav_reader = make_reader
+    dataset._drop_pyav_reader = lambda path_key: None
     return dataset
 
 
@@ -86,6 +149,24 @@ def test_make_pyav_reader_can_leave_ffmpeg_auto_threads_enabled(monkeypatch):
 
     assert stream.codec_context.thread_count == 0
     assert stream.thread_type == "SLICE"
+
+
+def test_pyav_nearest_frame_fill_rejects_distant_candidates(monkeypatch):
+    monkeypatch.setattr(canonical, "av", object())
+    dataset = _make_pyav_decode_dataset(max_fill_distance=2)
+
+    with pytest.raises(RuntimeError, match="nearest-frame fill exceeded safety distance"):
+        dataset._decode_video_pyav("episode.mp4", np.asarray([100], dtype=np.int64))
+
+
+def test_pyav_nearest_frame_fill_allows_small_distance(monkeypatch):
+    monkeypatch.setattr(canonical, "av", object())
+    dataset = _make_pyav_decode_dataset(max_fill_distance=2)
+
+    frames = dataset._decode_video_pyav("episode.mp4", np.asarray([12], dtype=np.int64))
+
+    assert frames.shape == (1, 2, 2, 3)
+    assert np.all(frames[0] == 10)
 
 
 def test_gcloud_file_copy_uses_atomic_temp_path(monkeypatch, tmp_path):

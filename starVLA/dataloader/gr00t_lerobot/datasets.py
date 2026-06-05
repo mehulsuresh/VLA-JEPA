@@ -51,6 +51,7 @@ from starVLA.dataloader.gr00t_lerobot.schema import (
     LeRobotStateActionMetadata,
 )
 from starVLA.dataloader.gr00t_lerobot.transform import ComposedModalityTransform
+from starVLA.dataloader.prompt_labels import append_task_id_label_to_language
 
 from functools import partial
 from typing import Tuple, List
@@ -2037,6 +2038,16 @@ class LeRobotMixtureDataset(Dataset):
                             if isinstance(label_value, np.generic):
                                 label_value = label_value.item()
                             return_dict[f"future_{label_key}"] = label_value
+
+                    if "task_id" in label_row.index:
+                        prompt_language, task_id_label = append_task_id_label_to_language(
+                            return_dict["lang"],
+                            label_row["task_id"],
+                            dataset.data_cfg,
+                        )
+                        return_dict["lang"] = prompt_language
+                        if task_id_label is not None:
+                            return_dict["task_id_label"] = task_id_label
 
                     if "sub_task_id" in label_row.index:
                         current_ok_flag = float(label_row["sub_task_id"])

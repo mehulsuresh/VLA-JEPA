@@ -12,6 +12,8 @@ from PIL import Image
 from torch.utils.data import Dataset
 from transformers import AutoProcessor
 
+from starVLA.dataloader.prompt_labels import append_task_id_label_to_language
+
 
 ALL_CAMERAS = [
     "observation.images.cam_high",
@@ -30,6 +32,9 @@ class PreprocessedSubtaskCollator:
         special_action_token: str,
         max_action_tokens: int,
         embodied_action_token: str,
+        state_replace_prompt: str = "",
+        geometry_replace_prompt: str = "",
+        extra_special_tokens: list[str] | None = None,
     ) -> None:
         self.model_id = model_id
         self.prompt_template = prompt_template
@@ -38,6 +43,9 @@ class PreprocessedSubtaskCollator:
         self.special_action_token = special_action_token
         self.max_action_tokens = int(max_action_tokens)
         self.embodied_action_token = embodied_action_token
+        self.state_replace_prompt = state_replace_prompt
+        self.geometry_replace_prompt = geometry_replace_prompt
+        self.extra_special_tokens = list(extra_special_tokens or [])
         self._processor = None
 
     def _get_processor(self):
@@ -47,11 +55,14 @@ class PreprocessedSubtaskCollator:
             action_tokens = [
                 self.special_action_token.format(i) for i in range(self.max_action_tokens)
             ]
-            new_tokens = [tok for tok in action_tokens if tok not in processor.tokenizer.get_vocab()]
+            special_tokens = [
+                *action_tokens,
+                self.embodied_action_token,
+                *self.extra_special_tokens,
+            ]
+            new_tokens = [tok for tok in special_tokens if tok not in processor.tokenizer.get_vocab()]
             if new_tokens:
                 processor.tokenizer.add_tokens(new_tokens, special_tokens=True)
-            if self.embodied_action_token not in processor.tokenizer.get_vocab():
-                processor.tokenizer.add_tokens([self.embodied_action_token], special_tokens=True)
             self._processor = processor
         return self._processor
 
@@ -63,6 +74,8 @@ class PreprocessedSubtaskCollator:
             prompt = self.prompt_template.replace("{instruction}", sample["lang"])
             prompt = prompt.replace("{actions}", self.replace_prompt)
             prompt = prompt.replace("{e_actions}", self.embodied_replace_prompt)
+            prompt = prompt.replace("{state}", self.state_replace_prompt)
+            prompt = prompt.replace("{geometry}", self.geometry_replace_prompt)
             content = [{"type": "image", "image": img} for img in sample["image"]]
             content.append({"type": "text", "text": prompt})
             messages.append([{"role": "user", "content": content}])
@@ -136,6 +149,7 @@ class PreprocessedSubtaskVLADataset(Dataset):
         instruction_text: str = "Complete the task successfully.",
         current_cameras: list[str] | None = None,
         frame_cache_size: int = 256,
+        data_cfg: Any | None = None,
     ) -> None:
         self.root = Path(data_root_dir)
         self.action_horizon = int(action_horizon)
@@ -150,6 +164,7 @@ class PreprocessedSubtaskVLADataset(Dataset):
         self.resolution_size = int(resolution_size)
         self.video_resolution_size = int(video_resolution_size)
         self.instruction_text = instruction_text
+        self.data_cfg = data_cfg
         self.current_cameras = list(current_cameras or ALL_CAMERAS)
         self.frame_cache_size = max(int(frame_cache_size), 0)
 
@@ -412,11 +427,16 @@ class PreprocessedSubtaskVLADataset(Dataset):
         future_stage_progress = (future_stage_idx + future_local_progress) / num_stages
         current_global_progress = 1.0 - self._safe_progress(current_global_ctg, 1.0)
         future_global_progress = 1.0 - self._safe_progress(future_global_ctg, 1.0)
+        language, task_id_label = append_task_id_label_to_language(
+            self.instruction_text,
+            current_task,
+            self.data_cfg,
+        )
 
         sample = {
             "action": action,
             "image": image_list,
-            "lang": self.instruction_text,
+            "lang": language,
             "video_compact": np.stack(compact_video_views, axis=0),
             "state": state,
             "frame_index": current_frame_idx,
@@ -429,6 +449,8 @@ class PreprocessedSubtaskVLADataset(Dataset):
             "local_complexity_to_go": current_local_ctg,
             "future_local_complexity_to_go": future_local_ctg,
         }
+        if task_id_label is not None:
+            sample["task_id_label"] = task_id_label
         if episode["has_global_complexity_to_go"]:
             sample["rabc_global_progress"] = current_global_progress
             sample["rabc_future_global_progress"] = future_global_progress
