@@ -143,8 +143,13 @@ when present. Optional environment variables:
 export DATA_ROOT=/mnt/datasets
 export CHECKPOINT_ROOT=/mnt/checkpoints
 export HF_HOME=/mnt/hf
+export VLA_JEPA_SCRATCH=/mnt/vla-jepa
 export GOOGLE_APPLICATION_CREDENTIALS=/mnt/secrets/gcloud.json
 ```
+
+Set `VLA_JEPA_SCRATCH` when configs reference helper checkouts or caches under a
+shared scratch root, for example `/mnt/vla-jepa/src/vjepa2` and
+`/mnt/vla-jepa/src/dataset-canonicalization`.
 
 Then run:
 

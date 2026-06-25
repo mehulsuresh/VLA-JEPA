@@ -26,6 +26,27 @@ DOCKER_ARGS=(
   -e "FFMPEG_THREADS=${FFMPEG_THREADS:-1}"
 )
 
+DOCKER_MOUNT_TARGETS=("${CONTAINER_WORKDIR}")
+
+add_docker_mount() {
+  local source_path="$1"
+  local target_path="${2:-$1}"
+  local mount_suffix="${3:-}"
+
+  if [[ -z "${source_path}" || ! -e "${source_path}" ]]; then
+    return 0
+  fi
+
+  for existing_target in "${DOCKER_MOUNT_TARGETS[@]}"; do
+    if [[ "${existing_target}" == "${target_path}" ]]; then
+      return 0
+    fi
+  done
+
+  DOCKER_ARGS+=(-v "${source_path}:${target_path}${mount_suffix}")
+  DOCKER_MOUNT_TARGETS+=("${target_path}")
+}
+
 case "${DOCKER_GPU_MODE}" in
   runtime)
     DOCKER_ARGS+=(
@@ -55,26 +76,31 @@ elif [[ "${DOCKER_TTY:-auto}" != "0" && "${DOCKER_TTY:-auto}" != "auto" ]]; then
   exit 1
 fi
 
+if [[ -n "${VLA_JEPA_SCRATCH:-}" ]]; then
+  add_docker_mount "${VLA_JEPA_SCRATCH}"
+fi
+
 if [[ -n "${HF_HOME:-}" ]]; then
-  DOCKER_ARGS+=(-e "HF_HOME=${HF_HOME}" -v "${HF_HOME}:${HF_HOME}")
+  DOCKER_ARGS+=(-e "HF_HOME=${HF_HOME}")
+  add_docker_mount "${HF_HOME}"
 elif [[ -d "${HOME}/.cache/huggingface" ]]; then
-  DOCKER_ARGS+=(-v "${HOME}/.cache/huggingface:/root/.cache/huggingface")
+  add_docker_mount "${HOME}/.cache/huggingface" "/root/.cache/huggingface"
 fi
 
 if [[ -n "${DATA_ROOT:-}" ]]; then
-  DOCKER_ARGS+=(-v "${DATA_ROOT}:${DATA_ROOT}")
+  add_docker_mount "${DATA_ROOT}"
 fi
 
 if [[ -n "${CHECKPOINT_ROOT:-}" ]]; then
   mkdir -p "${CHECKPOINT_ROOT}"
-  DOCKER_ARGS+=(-v "${CHECKPOINT_ROOT}:${CHECKPOINT_ROOT}")
+  add_docker_mount "${CHECKPOINT_ROOT}"
 fi
 
 if [[ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]]; then
   DOCKER_ARGS+=(
     -e "GOOGLE_APPLICATION_CREDENTIALS=${GOOGLE_APPLICATION_CREDENTIALS}"
-    -v "${GOOGLE_APPLICATION_CREDENTIALS}:${GOOGLE_APPLICATION_CREDENTIALS}:ro"
   )
+  add_docker_mount "${GOOGLE_APPLICATION_CREDENTIALS}" "${GOOGLE_APPLICATION_CREDENTIALS}" ":ro"
 fi
 
 GCLOUD_SDK_ROOT="${GCLOUD_SDK_ROOT:-/usr/lib/google-cloud-sdk}"
@@ -83,11 +109,11 @@ if [[ -z "${GCLOUD_CONFIG_DIR:-}" && -d "/mnt/vla-jepa/gcloud-config" ]]; then
 fi
 if [[ "${MOUNT_GCLOUD:-auto}" != "0" && -d "${GCLOUD_SDK_ROOT}" && -n "${GCLOUD_CONFIG_DIR:-}" && -d "${GCLOUD_CONFIG_DIR}" ]]; then
   DOCKER_ARGS+=(
-    -v "${GCLOUD_SDK_ROOT}:${GCLOUD_SDK_ROOT}:ro"
-    -v "${GCLOUD_CONFIG_DIR}:/root/.config/gcloud"
     -e "CLOUDSDK_CONFIG=/root/.config/gcloud"
     -e "PATH=${GCLOUD_SDK_ROOT}/bin:/opt/conda/envs/vla-jepa/bin:/opt/conda/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
   )
+  add_docker_mount "${GCLOUD_SDK_ROOT}" "${GCLOUD_SDK_ROOT}" ":ro"
+  add_docker_mount "${GCLOUD_CONFIG_DIR}" "/root/.config/gcloud"
 elif [[ "${MOUNT_GCLOUD:-auto}" == "1" ]]; then
   echo "MOUNT_GCLOUD=1 but could not find GCLOUD_SDK_ROOT=${GCLOUD_SDK_ROOT} and GCLOUD_CONFIG_DIR=${GCLOUD_CONFIG_DIR:-<unset>}" >&2
   exit 1
