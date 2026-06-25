@@ -43,6 +43,27 @@ sagemaker = [
     "boto3",
     "sagemaker"
 ]
+libero-eval = [
+    "bddl",
+    "easydict",
+    "gym",
+    "imageio",
+    "matplotlib",
+    "mediapy",
+    "msgpack",
+    "mujoco==2.3.7",
+    "omegaconf",
+    "opencv-python-headless",
+    "requests",
+    "rich",
+    "robosuite==1.4.1",
+    "scikit-image",
+    "torchcodec",
+    "tqdm",
+    "tyro",
+    "wand",
+    "websockets",
+]
 
 
 [tool.setuptools.packages.find]

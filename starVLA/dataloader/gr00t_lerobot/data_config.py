@@ -848,12 +848,85 @@ class TrossenAIStationaryDataConfig:
 ###########################################################################################
 
 
+class RealmanBimanualDataConfig(TrossenAIStationaryDataConfig):
+    pass
+
+
+###########################################################################################
+
+
+class RealmanBimanualSourceDataConfig(TrossenAIStationaryDataConfig):
+    state_keys = [
+        "state.source",
+    ]
+    action_keys = [
+        "action.source",
+    ]
+
+    def transform(self):
+        transforms = [
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionTransform(
+                apply_to=self.state_keys,
+                normalization_modes={
+                    "state.source": "min_max",
+                },
+            ),
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                normalization_modes={
+                    "action.source": "min_max",
+                },
+            ),
+        ]
+
+        return ComposedModalityTransform(transforms=transforms)
+
+
+###########################################################################################
+
+
+class RealmanBimanualSourceNoBaseDataConfig(RealmanBimanualSourceDataConfig):
+    action_keys = [
+        "action.source_controls",
+        "action.source_head_lift",
+    ]
+
+    def transform(self):
+        transforms = [
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionTransform(
+                apply_to=self.state_keys,
+                normalization_modes={
+                    "state.source": "min_max",
+                },
+            ),
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                normalization_modes={
+                    "action.source_controls": "min_max",
+                    "action.source_head_lift": "min_max",
+                },
+            ),
+        ]
+
+        return ComposedModalityTransform(transforms=transforms)
+
+
+###########################################################################################
+
+
 
 ROBOT_TYPE_CONFIG_MAP = {
     "libero_franka": Libero4in1DataConfig,
     "droid_franka": LeRobotDroidDataConfig,
     "fr3_real_world": FR3RealWorldConfig,
     "trossen_ai_stationary": TrossenAIStationaryDataConfig,
+    "realman_bimanual": RealmanBimanualDataConfig,
+    "realman_bimanual_source": RealmanBimanualSourceDataConfig,
+    "realman_bimanual_source_no_base": RealmanBimanualSourceNoBaseDataConfig,
     #"oxe_droid": OxeDroidDataConfig(),
     "oxe_bridge": OxeBridgeDataConfig,
     "oxe_rt1": OxeRT1DataConfig,

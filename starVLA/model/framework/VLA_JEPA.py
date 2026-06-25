@@ -1408,7 +1408,8 @@ class VLA_JEPA(baseframework):
         if isinstance(state, torch.Tensor):
             state_tensor = state.to(device=input_ids.device, dtype=torch.float32, non_blocking=True)
         else:
-            state_tensor = torch.from_numpy(np.asarray(state, dtype=np.float32)).to(
+            state_array = np.array(state, dtype=np.float32, copy=True)
+            state_tensor = torch.from_numpy(state_array).to(
                 device=input_ids.device,
                 dtype=torch.float32,
                 non_blocking=True,
@@ -2354,6 +2355,45 @@ class VLA_JEPA(baseframework):
     def _slice_training_action_chunk(self, action_tensor: torch.Tensor) -> torch.Tensor:
         return action_tensor[:, -self._training_action_chunk_size() :, ...]
 
+    def _build_training_action_loss_mask(
+        self,
+        *,
+        action_mask,
+        action_is_pad,
+        actions_target: torch.Tensor,
+        device: torch.device,
+    ) -> torch.Tensor | None:
+        action_loss_mask = None
+        if action_mask is not None:
+            if isinstance(action_mask, torch.Tensor):
+                action_mask = action_mask.to(device=device, dtype=torch.float32, non_blocking=True)
+            else:
+                action_mask = torch.from_numpy(np.asarray(action_mask, dtype=np.float32)).to(
+                    device=device, non_blocking=True
+                )
+            action_loss_mask = self._slice_training_action_chunk(action_mask)
+
+        if action_is_pad is not None:
+            if isinstance(action_is_pad, torch.Tensor):
+                action_is_pad_tensor = action_is_pad.to(device=device, dtype=torch.bool, non_blocking=True)
+            else:
+                action_is_pad_tensor = torch.from_numpy(np.asarray(action_is_pad, dtype=bool)).to(
+                    device=device, non_blocking=True
+                )
+            pad_keep_mask = (~self._slice_training_action_chunk(action_is_pad_tensor)).to(dtype=torch.float32)
+            if pad_keep_mask.ndim == 2:
+                pad_keep_mask = pad_keep_mask.unsqueeze(-1)
+            pad_keep_mask = pad_keep_mask.expand_as(actions_target)
+            action_loss_mask = (
+                pad_keep_mask
+                if action_loss_mask is None
+                else action_loss_mask * pad_keep_mask
+            )
+
+        if action_loss_mask is not None and action_loss_mask.shape != actions_target.shape:
+            action_loss_mask = action_loss_mask.expand_as(actions_target)
+        return action_loss_mask
+
     def forward(
         self,
         examples: List[dict] = None,
@@ -2375,6 +2415,7 @@ class VLA_JEPA(baseframework):
         if isinstance(examples, dict):
             actions = examples.get("action")
             action_mask = examples.get("action_mask")
+            action_is_pad = examples.get("action_is_pad")
             state = examples.get("state")
             has_actions = actions is not None
             has_state = has_actions and state is not None
@@ -2394,6 +2435,7 @@ class VLA_JEPA(baseframework):
         else:
             actions = [example["action"] for example in examples] if "action" in examples[0] else None
             action_mask = [example["action_mask"] for example in examples] if "action_mask" in examples[0] else None
+            action_is_pad = [example["action_is_pad"] for example in examples] if "action_is_pad" in examples[0] else None
             state = [example["state"] for example in examples] if "state" in examples[0] else None
             has_actions = actions is not None
             has_state = has_actions and state is not None
@@ -2602,16 +2644,18 @@ class VLA_JEPA(baseframework):
                 1,
             )
 
-            action_mask_repeated = None
-            if action_mask is not None:
-                if isinstance(action_mask, torch.Tensor):
-                    action_mask = action_mask.to(device=last_hidden.device, dtype=torch.float32, non_blocking=True)
-                else:
-                    action_mask = torch.from_numpy(np.asarray(action_mask, dtype=np.float32)).to(
-                        device=last_hidden.device, non_blocking=True
-                    )
-                action_mask_target = self._slice_training_action_chunk(action_mask)
-                action_mask_repeated = action_mask_target.repeat(repeated_diffusion_steps, 1, 1)
+            action_loss_mask = self._build_training_action_loss_mask(
+                action_mask=action_mask,
+                action_is_pad=action_is_pad,
+                actions_target=actions_target,
+                device=last_hidden.device,
+            )
+
+            action_mask_repeated = (
+                action_loss_mask.repeat(repeated_diffusion_steps, 1, 1)
+                if action_loss_mask is not None
+                else None
+            )
 
             if rabc_weights is not None:
                 loss_sum, loss_count = self.action_model(

@@ -41,3 +41,26 @@ websockets
 
 # Validation/smoke-test helper.
 pytest
+
+# Optional LIBERO / LIBERO-Plus evaluation extras.
+# Uncomment or install explicitly only for simulator eval environments.
+# The LIBERO-Plus repository itself is cloned separately and added to PYTHONPATH.
+# robosuite==1.4.1
+# mujoco==2.3.7
+# bddl
+# easydict
+# wand
+# scikit-image
+# gym
+# rich
+# omegaconf
+# websockets
+# msgpack
+# tyro
+# mediapy
+# imageio
+# opencv-python-headless
+# matplotlib
+# requests
+# tqdm
+# torchcodec

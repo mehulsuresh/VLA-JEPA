@@ -1,5 +1,6 @@
 import torch
 
+from starVLA.model.modules.action_model.rtc_training import reduce_masked_loss
 from starVLA.model.framework.VLA_JEPA import VLA_JEPA
 
 
@@ -31,3 +32,28 @@ def test_training_action_mask_is_chunked_like_actions():
     assert torch.equal(action_chunk, actions[:, -4:, :])
     assert torch.equal(mask_chunk, action_mask[:, -4:, :])
     assert torch.all(mask_chunk == 1)
+
+
+def test_action_is_pad_masks_padded_future_loss():
+    model = _make_vlajepa_with_future_window(3)
+    actions_target = torch.zeros(1, 4, 2)
+    action_is_pad = torch.tensor([[False, False, False, True, True, True]])
+
+    loss_mask = model._build_training_action_loss_mask(
+        action_mask=None,
+        action_is_pad=action_is_pad,
+        actions_target=actions_target,
+        device=actions_target.device,
+    )
+
+    expected = torch.tensor([[[1.0, 1.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0]]])
+    assert torch.equal(loss_mask, expected)
+
+    base_loss = torch.ones_like(actions_target)
+    changed_padded_loss = base_loss.clone()
+    changed_padded_loss[:, 1:] = 1000.0
+
+    assert torch.equal(
+        reduce_masked_loss(base_loss, loss_mask=loss_mask),
+        reduce_masked_loss(changed_padded_loss, loss_mask=loss_mask),
+    )

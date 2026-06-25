@@ -75,6 +75,7 @@ def get_vla_dataset(
     """
     data_root_dir = data_cfg.data_root_dir
     data_mix = data_cfg.data_mix
+    delete_pause_frame = bool(data_cfg.get("delete_pause_frame", delete_pause_frame))
     video_backend_num_threads = max(1, int(data_cfg.get("video_backend_num_threads", 1)))
     video_backend = str(data_cfg.get("video_backend", "decord"))
     video_backend_kwargs = {"num_threads": video_backend_num_threads}

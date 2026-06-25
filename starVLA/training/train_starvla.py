@@ -1774,6 +1774,9 @@ class VLATrainer(TrainerUtils):
             action_mask = examples.get("action_mask")
             if action_mask is not None:
                 action_mask = action_mask.cpu().numpy()
+            action_is_pad = examples.get("action_is_pad")
+            if action_is_pad is not None:
+                action_is_pad = action_is_pad.cpu().numpy()
             with torch.no_grad():
                 output_dict = infer_model.predict_action(
                     batch=examples,
@@ -1783,6 +1786,7 @@ class VLATrainer(TrainerUtils):
         else:
             actions = [example["action"] for example in examples]
             action_mask = [example["action_mask"] for example in examples] if "action_mask" in examples[0] else None
+            action_is_pad = [example["action_is_pad"] for example in examples] if "action_is_pad" in examples[0] else None
             state = [example["state"] for example in examples] if "state" in examples[0] else None
             with torch.no_grad():
                 output_dict = infer_model.predict_action(
@@ -1795,10 +1799,19 @@ class VLATrainer(TrainerUtils):
         actions = np.asarray(actions, dtype=np.float32)
         normalized_actions = np.asarray(output_dict["normalized_actions"], dtype=np.float32)
         diff = normalized_actions - actions
+        metric_mask = None
         if action_mask is not None:
-            mask = np.asarray(action_mask, dtype=np.float32)
-            diff = diff * mask
-            metric_count = float(mask.sum())
+            metric_mask = np.asarray(action_mask, dtype=np.float32)
+        if action_is_pad is not None:
+            timestep_mask = (~np.asarray(action_is_pad, dtype=bool)).astype(np.float32)
+            if timestep_mask.ndim == 2:
+                timestep_mask = timestep_mask[..., None]
+            metric_mask = timestep_mask if metric_mask is None else metric_mask * timestep_mask
+        if metric_mask is not None:
+            if metric_mask.shape != diff.shape:
+                metric_mask = np.broadcast_to(metric_mask, diff.shape)
+            diff = diff * metric_mask
+            metric_count = float(metric_mask.sum())
         else:
             metric_count = float(diff.size)
         local_metrics = torch.tensor(

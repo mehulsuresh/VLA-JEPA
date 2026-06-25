@@ -5,6 +5,7 @@ import argparse
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from bisect import bisect_right
 import json
+import multiprocessing as mp
 import os
 from pathlib import Path
 import time
@@ -1167,6 +1168,7 @@ def _run_corrupt_video_audit(dataset: Any, args: argparse.Namespace) -> None:
                 "datasets": len({shard.dataset_id for shard in dataset.shards}),
                 "resume": bool(args.audit_resume),
                 "workers": int(args.audit_workers),
+                "multiprocessing_context": args.multiprocessing_context or "default",
                 "training_skip_disabled": True,
                 "delete_video_cache_after_processing": bool(args.audit_delete_video_cache_after_processing),
                 "shards": len(dataset.shards),
@@ -1279,7 +1281,8 @@ def _run_corrupt_video_audit(dataset: Any, args: argparse.Namespace) -> None:
                         flush=True,
                     )
         else:
-            executor = ProcessPoolExecutor(max_workers=workers)
+            worker_context = mp.get_context(args.multiprocessing_context) if args.multiprocessing_context else None
+            executor = ProcessPoolExecutor(max_workers=workers, mp_context=worker_context)
             try:
                 futures = {executor.submit(_run_video_audit_job, job): job["video_key"] for job in remaining_jobs}
                 for future in as_completed(futures):
@@ -1339,6 +1342,7 @@ def _run_corrupt_video_audit(dataset: Any, args: argparse.Namespace) -> None:
         "fetch_failures": fetch_failures,
         "deleted_video_cache_files": deleted_video_cache_files,
         "deleted_video_cache_gib": round(deleted_video_cache_bytes / 1024 / 1024 / 1024, 2),
+        "multiprocessing_context": args.multiprocessing_context or "default",
         "training_skip_disabled": True,
         "elapsed_sec": round(time.monotonic() - start_time, 2),
         "outputs": {

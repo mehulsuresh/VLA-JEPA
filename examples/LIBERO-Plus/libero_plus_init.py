@@ -5,6 +5,7 @@ import random
 import torch
 import re
 
+from pathlib import Path
 from typing import List, NamedTuple, Type
 from libero.libero import get_libero_path
 from libero.libero.benchmark.libero_suite_task_map import libero_task_map
@@ -98,6 +99,25 @@ for libero_suite in libero_suites:
         # print(language, "\n", f"{task}.bddl", "\n")
         # print("")
 
+def _resolve_task_classification_path() -> Path:
+    candidates = []
+    if os.environ.get("LIBERO_PLUS_TASK_CLASSIFICATION_PATH"):
+        candidates.append(Path(os.environ["LIBERO_PLUS_TASK_CLASSIFICATION_PATH"]))
+    if os.environ.get("LIBERO_HOME"):
+        candidates.append(Path(os.environ["LIBERO_HOME"]) / "libero/libero/benchmark/task_classification.json")
+    candidates.append(Path(__file__).with_name("task_classification.json"))
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+
+    raise FileNotFoundError(
+        "Could not find LIBERO-Plus task_classification.json. Set "
+        "LIBERO_PLUS_TASK_CLASSIFICATION_PATH=/path/to/task_classification.json "
+        "or LIBERO_HOME=/path/to/LIBERO-plus."
+    )
+
+
 def get_ids_by_category(category_value):
     """
     Retrieve the list of matching IDs from all suites based on the given category value.
@@ -118,7 +138,7 @@ def get_ids_by_category(category_value):
     """
     import json
     # read json classification file
-    with open('/home/dataset-assist-0/algorithm/ginwind/LIBERO-plus/libero/libero/benchmark/task_classification.json', 'r', encoding='utf-8') as f:
+    with _resolve_task_classification_path().open('r', encoding='utf-8') as f:
         data = json.load(f)
     
     result = {}

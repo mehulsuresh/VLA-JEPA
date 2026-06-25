@@ -4,8 +4,11 @@ from pathlib import Path
 from typing import Any
 
 
-_TROSSEN_CAMERA_HINTS = {
+_CAMERA_ORDER_HINTS = {
     "trossen_subtask_combined": ["cam_high", "cam_left_wrist", "cam_right_wrist"],
+    "ogrealman_source_v3": ["head", "wrist_left", "wrist_right"],
+    "ogrealman_source_no_base_v3": ["head", "wrist_left", "wrist_right"],
+    "ogrealman_canonical_v3": ["head", "wrist_left", "wrist_right"],
 }
 
 
@@ -174,7 +177,7 @@ def build_policy_metadata(policy, checkpoint_path: str | Path) -> dict[str, Any]
         "default_unnorm_key": default_unnorm_key,
         "action_stats_by_key": action_stats_by_key,
         "state_stats_by_key": state_stats_by_key,
-        "camera_order_hint": _TROSSEN_CAMERA_HINTS.get(data_mix),
+        "camera_order_hint": _CAMERA_ORDER_HINTS.get(data_mix),
         **norm_mode_hints,
     }
     return metadata

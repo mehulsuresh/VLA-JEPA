@@ -20,6 +20,10 @@ DATASET_NAMED_MIXTURES = {
                 # ("libero_90_no_noops_lerobot", 1.0, "libero_franka"),
     ],
 
+    "libero_plus": [
+        ("libero_plus", 1.0, "libero_franka", "v3.0"),
+    ],
+
     "droid": [
         ("", 1.0, "libero_franka"),
     ],
@@ -30,6 +34,18 @@ DATASET_NAMED_MIXTURES = {
 
     "trossen_subtask_combined": [
         ("", 1.0, "trossen_ai_stationary"),
+    ],
+
+    "ogrealman_canonical_v3": [
+        ("", 1.0, "realman_bimanual", "v3.0"),
+    ],
+
+    "ogrealman_source_v3": [
+        ("", 1.0, "realman_bimanual_source", "v3.0"),
+    ],
+
+    "ogrealman_source_no_base_v3": [
+        ("", 1.0, "realman_bimanual_source_no_base", "v3.0"),
     ],
 
     "libero_goal": [

@@ -46,3 +46,26 @@ gradio==6.14.0
 utils3d @ git+https://github.com/EasternJournalist/utils3d.git@3fab839f0be9931dac7c8488eb0e1600c236e183
 pipeline @ git+https://github.com/EasternJournalist/pipeline.git@866f059d2a05cde05e4a52211ec5051fd5f276d6
 moge @ git+https://github.com/microsoft/MoGe.git@07444410f1e33f402353b99d6ccd26bd31e469e8
+
+# Optional LIBERO / LIBERO-Plus evaluation extras.
+# Uncomment or install explicitly only for simulator eval environments.
+# The LIBERO-Plus repository itself is cloned separately and added to PYTHONPATH.
+# robosuite==1.4.1
+# mujoco==2.3.7
+# bddl
+# easydict
+# wand
+# scikit-image
+# gym
+# rich
+# omegaconf
+# websockets
+# msgpack
+# tyro
+# mediapy
+# imageio
+# opencv-python-headless
+# matplotlib
+# requests
+# tqdm
+# torchcodec

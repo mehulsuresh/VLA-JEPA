@@ -1,0 +1,235 @@
+# Local LoRA experiment for the cleaned Realman LeRobot v3 dataset, using the
+# same AH50 state, V-JEPA, and MoGe geometry setup as the validated Trossen run.
+run_id: robot_ft_lerobot_ogrealman_qwen35_08b_lora_moge_vits_5090
+run_root_dir: checkpoints
+seed: 42
+trackers:
+  - tensorboard
+is_debug: false
+
+framework:
+  name: VLA_JEPA
+  qwenvl:
+    base_vlm: "Qwen/Qwen3.5-0.8B"
+    attn_implementation: sdpa
+    strict_attn_implementation: false
+    enable_fast_linear_attention: false
+    strict_fast_linear_attention: false
+    device_map: null
+    vl_hidden_dim: auto
+    blockwise_attention:
+      enabled: false
+    lora:
+      enabled: true
+      adapter_name: temporal_policy
+      r: 16
+      alpha: 32
+      dropout: 0.05
+      bias: none
+      layers_pattern: layers
+      train_last_n_layers: 12
+      strict_trainable: true
+      target_modules:
+        - q_proj
+        - k_proj
+        - v_proj
+        - o_proj
+        - gate_proj
+        - up_proj
+        - down_proj
+        - in_proj_qkv
+        - in_proj_z
+        - in_proj_a
+        - in_proj_b
+        - out_proj
+  qwen_state:
+    num_tokens: 8
+    token_template: <|state_{}|>
+  action_model:
+    action_model_type: DiT-B
+    action_hidden_dim: 1024
+    hidden_size: 1024
+    add_pos_embed: true
+    max_seq_len: 1024
+    action_dim: 14
+    state_dim: 14
+    future_action_window_size: 49
+    action_horizon: 50
+    past_action_window_size: 0
+    noise_beta_alpha: 1.5
+    noise_beta_beta: 1.0
+    noise_s: 0.999
+    num_timestep_buckets: 1000
+    num_inference_timesteps: 4
+    rtc_training:
+      enabled: true
+      method: prefix
+      max_delay: 11
+      distribution: uniform
+      rtc_prob: 1.0
+      warmup_steps: 10000
+      ramp_steps: 50000
+      clean_time: 1.0
+      condition_dit_tokens: false
+    num_target_vision_tokens: 32
+    diffusion_model_cfg:
+      cross_attention_dim: auto
+      dropout: 0.2
+      final_dropout: true
+      interleave_self_attention: true
+      norm_type: ada_norm
+      num_layers: 16
+      output_dim: 1024
+      positional_embeddings: null
+  depth_teacher_aux:
+    enabled: true
+    mode: query
+    teacher_model: Ruicheng/moge-2-vits-normal
+    moge_repo_path: /home/mehul/work/vjepa/moge
+    input_size: 224
+    num_tokens: 256
+    num_task_tokens: 8
+    num_output_tokens: 256
+    geometry_token_template: <|geometry_{}|>
+    query_num_layers: 1
+    query_num_heads: 4
+    query_dim_head: 32
+    query_ff_mult: 1.0
+    query_smooth_l1_beta: 1.0
+    teacher_feature_source: neck
+    teacher_feature_level: 0
+    teacher_feature_dim: auto
+    frame_value_range: uint8
+    detach_vlm_steps: 0
+    detach_vlm_fraction: 0.0
+    use_fp16: true
+    allow_frozen_qwen: false
+    allow_zero_loss_scale: false
+  vj2_model:
+    source: torchhub
+    hub_repo_or_dir: /home/mehul/work/vjepa/vjepa2
+    hub_model_name: vjepa2_1_vit_base_384
+    hub_preprocessor_name: vjepa2_preprocessor
+    hub_checkpoint_url: https://dl.fbaipublicfiles.com/vjepa2/vjepa2_1_vitb_dist_vitG_384.pt
+    hub_checkpoint_key: ema_encoder
+    crop_size: 384
+    pretrained: true
+    freeze_encoder: true
+    num_video_views: 3
+    depth: 12
+    num_heads: 8
+    use_legacy_rope_bug: false
+    special_action_token: <|action_{}|>
+    num_action_tokens_per_timestep: 8
+    embodied_action_token: <|embodied_action|>
+    num_embodied_action_tokens_per_instruction: 32
+    num_frames: 8
+  reduce_in_full_precision: true
+
+datasets:
+  vla_data:
+    dataset_py: lerobot_datasets
+    data_root_dir: /home/mehul/work/reward_model_small/ogrealman_lerobot_v3_dataset_cleaned_v2_canonical_v3
+    data_mix: ogrealman_canonical_v3
+    lerobot_version: v3.0
+    action_type: delta_qpos
+    CoT_prompt: "Your task is {instruction}. Use the robot observations and state to produce the corresponding policy actions. {state}{e_actions}{actions}{geometry}"
+    append_task_id_to_prompt: false
+    task_id_prompt_separator: " | "
+    task_text_overrides:
+      0: reach into the bin, pickup the metal chain with both hands, place it on the jig and align the corners to fit into the recessed channel.
+    resolution_size: 224
+    video_resolution_size: 384
+    video_frame_stride: 10
+    video_target_shift_steps: 2
+    gpu_video_decode_on_rank: false
+    cpu_video_decode_drop_worker_images: true
+    runtime_timing_logging: true
+    per_device_batch_size: 10
+    num_workers: 5
+    prefetch_factor: 2
+    persistent_workers: false
+    multiprocessing_context: spawn
+    worker_torch_threads: 1
+    worker_cv2_threads: 1
+    video_backend: decord
+    video_backend_num_threads: 1
+    pin_memory: false
+    drop_last: true
+    load_all_data_for_training: true
+    with_state: true
+
+trainer:
+  epochs: 2
+  max_train_steps: auto
+  num_warmup_steps: auto
+  save_interval: 10000
+  eval_interval: 1000
+  save_best_only: false
+  best_metric_name: mae_score
+  best_metric_mode: min
+  learning_rate:
+    base: 3.0e-05
+    qwen_vl_interface: 2.0e-05
+    qwen_state_projector: 1.0e-04
+    action_model: 1.0e-04
+    vj_predictor: 1.0e-04
+    depth_teacher_aux_head: 1.0e-04
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 1.0e-06
+  freeze_modules: "vj_encoder"
+  loss_scale:
+    action: 1.0
+    wm: 0.1
+    wm_initial: 0.3
+    wm_warmup_steps: 2000
+    depth_teacher: 0.004
+  warmup_ratio: 0.01
+  logging_frequency: 50
+  progress_eta_window: 20
+  progress_eta_warmup_steps: 10
+  eval_before_train: false
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 1
+  repeated_diffusion_steps: 1
+  find_unused_parameters: true
+
+  optimizer:
+    name: AdamW
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 1.0e-04
+    fused: true
+
+  is_resume: false
+  resume_epoch: null
+  resume_step: null
+  enable_gradient_checkpointing: true
+  enable_mixed_precision_training: false
+  mixed_precision: no
+  channels_last: true
+  compile_qwen_model: false
+  compile_qwen_model_dynamic: false
+  compile_action_model: false
+  compile_action_model_dynamic: false
+  compile_vj_predictor: false
+  compile_vj_predictor_dynamic: false
+  compile_vj_encoder: false
+  compile_vj_encoder_dynamic: false
+  compile_full_model: false
+  compile_full_model_dynamic: false
+  compile_mode: default
+  compile_dynamic: false
+  save_plain_weights_in_checkpoints: false
+  drop_checkpoint_page_cache: true
+  trim_process_memory_after_checkpoint: true
+  checkpoint_max_to_keep: 3
+  profile_cuda_memory: false
+  profile_cuda_memory_log_step: 1
+  use_rabc: true
+  rabc_progress_key: rabc_progress_delta
+  rabc_fallback_progress_key: rabc_global_progress_delta
+  rabc_kappa: 0.01
+  rabc_epsilon: 1.0e-06
+  rabc_mistake_weight: 0.25

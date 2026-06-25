@@ -71,4 +71,7 @@ ROBOT_TYPE_TO_EMBODIMENT_TAG = {
     "oxe_rt1": EmbodimentTag.OXE_RT1,
     "demo_sim_franka_delta_joints": EmbodimentTag.FRANKA,
     "custom_robot_config": EmbodimentTag.NEW_EMBODIMENT,
+    "realman_bimanual": EmbodimentTag.NEW_EMBODIMENT,
+    "realman_bimanual_source": EmbodimentTag.NEW_EMBODIMENT,
+    "realman_bimanual_source_no_base": EmbodimentTag.NEW_EMBODIMENT,
 }

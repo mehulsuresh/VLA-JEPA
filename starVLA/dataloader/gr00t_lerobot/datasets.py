@@ -24,8 +24,10 @@ In this file, we define 3 types of datasets:
 See `scripts/load_dataset.py` for examples on how to use these datasets.
 """
 
+import copy
 import hashlib
 import json
+import os
 from collections import defaultdict
 from functools import lru_cache
 from pathlib import Path
@@ -62,6 +64,7 @@ LE_ROBOT_EPISODE_FILENAME = "meta/episodes.jsonl"
 LE_ROBOT_TASKS_FILENAME = "meta/tasks.jsonl"
 LE_ROBOT_INFO_FILENAME = "meta/info.json"
 LE_ROBOT_STATS_FILENAME = "meta/stats_gr00t.json"
+LE_ROBOT_RAW_STATS_FILENAME = "meta/stats.json"
 LE_ROBOT_DATA_FILENAME = "data/*/*.parquet"
 LE_ROBOT_STEPS_FILENAME = "meta/steps.pkl"
 LE_ROBOT3_TASKS_FILENAME = "meta/tasks.parquet"
@@ -331,7 +334,9 @@ class LeRobotSingleDataset(Dataset):
         # 1.1. State and action modalities
         simplified_modality_meta: dict[str, dict] = {}
         with open(modality_meta_path, "r") as f:
-            le_modality_meta = LeRobotModalityMetadata.model_validate(json.load(f))
+            le_modality_meta = LeRobotModalityMetadata.model_validate(
+                self._apply_modality_metadata_overrides(json.load(f))
+            )
         for modality in ["state", "action"]:
             simplified_modality_meta[modality] = {}
             le_state_action_meta: dict[str, LeRobotStateActionMetadata] = getattr(
@@ -396,6 +401,23 @@ class LeRobotSingleDataset(Dataset):
             le_statistics = calculate_dataset_statistics(parquet_files)
             with open(stats_path, "w") as f:
                 json.dump(le_statistics, f, indent=4)
+
+        missing_stat_keys = self._missing_lerobot_stat_keys(le_modality_meta, le_statistics)
+        if missing_stat_keys:
+            raw_stats_path = self.dataset_path / LE_ROBOT_RAW_STATS_FILENAME
+            if raw_stats_path.exists() and raw_stats_path != stats_path:
+                with open(raw_stats_path, "r") as f:
+                    raw_statistics = json.load(f)
+                raw_missing = self._missing_lerobot_stat_keys(le_modality_meta, raw_statistics)
+                if not raw_missing:
+                    le_statistics = raw_statistics
+                    missing_stat_keys = []
+        if missing_stat_keys:
+            raise KeyError(
+                f"Dataset statistics missing required columns {missing_stat_keys} for "
+                f"{self.dataset_name}. Checked {stats_path} and {self.dataset_path / LE_ROBOT_RAW_STATS_FILENAME}."
+            )
+
         dataset_statistics = {}
         for our_modality in ["state", "action"]:
             dataset_statistics[our_modality] = {}
@@ -405,6 +427,8 @@ class LeRobotSingleDataset(Dataset):
                 assert isinstance(state_action_meta, LeRobotStateActionMetadata)
                 le_modality = state_action_meta.original_key
                 for stat_name in le_statistics[le_modality]:
+                    if stat_name not in {"min", "max", "mean", "std", "q01", "q99"}:
+                        continue
                     indices = np.arange(
                         state_action_meta.start,
                         state_action_meta.end,
@@ -475,44 +499,40 @@ class LeRobotSingleDataset(Dataset):
         Returns:
             list[tuple[str, int]]: A list of (trajectory_id, base_index) tuples.
         """
-        # Create a hash key based on configuration to ensure cache validity
+        cache_metadata = self._get_steps_cache_metadata()
         config_key = self._get_steps_config_key()
-        
-        # Create a unique filename based on config_key
         steps_filename = f"steps_{config_key}.pkl"
-        # @BUG
-        # fast get static steps @fangjing --> don't use hash to dynamic sample
-        steps_filename =  "steps_data_index.pkl"
-        steps_filename = "steps_332420bad1ab.pkl"
-
         steps_path = self.dataset_path / "meta" / steps_filename
-        
-        # Try to load cached steps first
-        try:
-            if steps_path.exists():
+
+        if steps_path.exists():
+            try:
                 with open(steps_path, "rb") as f:
                     cached_data = pickle.load(f)
-                return cached_data["steps"]
-            else:
-                steps_filename = "steps_2d5a34b904d2.pkl"
-                steps_path = self.dataset_path / "meta" / steps_filename
-        
-                with open(steps_path, "rb") as f:
-                    cached_data = pickle.load(f)
-                return cached_data["steps"]
+                cached_steps = self._validate_steps_cache(
+                    cached_data,
+                    expected_config_key=config_key,
+                    expected_metadata=cache_metadata,
+                    cache_path=steps_path,
+                )
+                if cached_steps is not None:
+                    return cached_steps
+            except (pickle.PickleError, EOFError, OSError, KeyError, TypeError, ValueError) as e:
+                print(f"Ignoring invalid LeRobot step cache at {steps_path}: {e}")
+        else:
+            print(f"No LeRobot step cache found at {steps_path}; computing steps from scratch...")
 
-
-        except (FileNotFoundError, pickle.PickleError, KeyError) as e:
-            print(f"Failed to load cached steps: {e}")
-            print("Computing steps from scratch...")
-
-        # Compute steps using single process
-        all_steps = self._get_all_steps_single_process()
+        if not self.delete_pause_frame and not bool(
+            self._get_data_cfg_value("validate_language_for_step_index", False)
+        ):
+            all_steps = self._get_all_steps_from_trajectory_lengths()
+        else:
+            all_steps = self._get_all_steps_single_process()
         
         # Cache the computed steps with unique filename
         try:
             cache_data = {
                 "config_key": config_key,
+                "cache_metadata": cache_metadata,
                 "steps": all_steps,
                 "num_trajectories": len(self.trajectory_ids),
                 "total_steps": len(all_steps),
@@ -522,25 +542,119 @@ class LeRobotSingleDataset(Dataset):
             
             # Ensure the meta directory exists
             steps_path.parent.mkdir(parents=True, exist_ok=True)
-            
-            with open(steps_path, "wb") as f:
+
+            tmp_path = steps_path.with_name(f".{steps_path.name}.{os.getpid()}.tmp")
+            with open(tmp_path, "wb") as f:
                 pickle.dump(cache_data, f, protocol=pickle.HIGHEST_PROTOCOL)
+            tmp_path.replace(steps_path)
             print(f"Cached steps saved to {steps_path}")
         except Exception as e:
             print(f"Failed to cache steps: {e}")
         
         return all_steps
 
-    def _get_steps_config_key(self) -> str:
-        """Generate a configuration key for steps caching."""
-        config_dict = {
-            "delete_pause_frame": self.delete_pause_frame,
+    @staticmethod
+    def _normalize_cache_value(value):
+        if isinstance(value, Path):
+            return value.as_posix()
+        if isinstance(value, np.ndarray):
+            return value.tolist()
+        if isinstance(value, np.generic):
+            return value.item()
+        if isinstance(value, dict) or hasattr(value, "items"):
+            return {
+                str(key): LeRobotSingleDataset._normalize_cache_value(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, (list, tuple)):
+            return [LeRobotSingleDataset._normalize_cache_value(item) for item in value]
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value
+        return str(value)
+
+    def _get_steps_cache_metadata(self) -> dict:
+        data_cfg_cache_keys = (
+            "data_mix",
+            "action_type",
+            "append_task_id_to_prompt",
+            "modality_metadata_overrides",
+            "task_id_label_map",
+        )
+        data_cfg_values = {
+            key: self._normalize_cache_value(value)
+            for key in data_cfg_cache_keys
+            if (value := self._get_data_cfg_value(key, None)) is not None
+        }
+        trajectory_signature_payload = {
+            "trajectory_ids": self._normalize_cache_value(self.trajectory_ids),
+            "trajectory_lengths": self._normalize_cache_value(self.trajectory_lengths),
+        }
+        trajectory_signature = hashlib.md5(
+            json.dumps(trajectory_signature_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        return {
+            "cache_schema": 2,
             "dataset_name": self.dataset_name,
             "lerobot_version": self._lerobot_version,
+            "embodiment_tag": self.tag,
+            "delete_pause_frame": bool(self.delete_pause_frame),
+            "modality_keys": self._normalize_cache_value(self.modality_keys),
+            "data_cfg": data_cfg_values,
+            "num_trajectories": int(len(self.trajectory_ids)),
+            "total_frames": int(np.asarray(self.trajectory_lengths, dtype=np.int64).sum()),
+            "trajectory_signature": trajectory_signature,
         }
-        # Create a hash of the configuration
-        config_str = str(sorted(config_dict.items()))
-        return hashlib.md5(config_str.encode()).hexdigest()[:12]  #
+
+    def _get_steps_config_key(self) -> str:
+        """Generate a configuration key for steps caching."""
+        config_str = json.dumps(
+            self._get_steps_cache_metadata(),
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.md5(config_str.encode("utf-8")).hexdigest()[:12]
+
+    def _validate_steps_cache(
+        self,
+        cached_data: dict,
+        *,
+        expected_config_key: str,
+        expected_metadata: dict,
+        cache_path: Path,
+    ) -> list[tuple[int, int]] | None:
+        if not isinstance(cached_data, dict):
+            raise TypeError(f"Expected dict cache payload, got {type(cached_data).__name__}")
+        cached_config_key = cached_data.get("config_key")
+        cached_metadata = cached_data.get("cache_metadata")
+        if cached_config_key != expected_config_key or cached_metadata != expected_metadata:
+            print(
+                "Ignoring stale LeRobot step cache at "
+                f"{cache_path}: expected config_key={expected_config_key}, found {cached_config_key}"
+            )
+            return None
+        steps = cached_data["steps"]
+        if not isinstance(steps, list):
+            raise TypeError(f"Cached steps must be a list, got {type(steps).__name__}")
+        return steps
+
+
+    def _get_all_steps_from_trajectory_lengths(self) -> list[tuple[int, int]]:
+        """Build the dense step index without loading each episode parquet.
+
+        This is valid when pause-frame deletion is disabled. Language is still
+        retrieved when samples are read; this just avoids a slow first-run scan
+        through every trajectory to build the list of candidate base indices.
+        """
+        all_steps = [
+            (int(trajectory_id), int(base_index))
+            for trajectory_id, trajectory_length in zip(self.trajectory_ids, self.trajectory_lengths)
+            for base_index in range(int(trajectory_length))
+        ]
+        print(
+            "Built dense LeRobot step index from trajectory lengths: "
+            f"{len(all_steps)} steps from {len(self.trajectory_ids)} trajectories"
+        )
+        return all_steps
 
 
     def _get_all_steps_single_process(self) -> list[tuple[int, int]]:
@@ -733,8 +847,60 @@ class LeRobotSingleDataset(Dataset):
             modality_meta_path.exists()
         ), f"Please provide a {LE_ROBOT_MODALITY_FILENAME} file in {self.dataset_path}"
         with open(modality_meta_path, "r") as f:
-            modality_meta = LeRobotModalityMetadata.model_validate(json.load(f))
+            modality_meta = LeRobotModalityMetadata.model_validate(
+                self._apply_modality_metadata_overrides(json.load(f))
+            )
         return modality_meta
+
+    def _get_data_cfg_value(self, key: str, default=None):
+        if self.data_cfg is None:
+            return default
+        getter = getattr(self.data_cfg, "get", None)
+        if callable(getter):
+            return getter(key, default)
+        return getattr(self.data_cfg, key, default)
+
+    def _apply_modality_metadata_overrides(self, modality_meta: dict) -> dict:
+        """Allow run configs to remap logical state/action keys to preserved dataset columns."""
+        overrides = self._get_data_cfg_value("modality_metadata_overrides", None)
+        if not overrides:
+            return modality_meta
+
+        modality_meta = copy.deepcopy(modality_meta)
+        for modality in ("state", "action"):
+            modality_overrides = overrides.get(modality, None)
+            if not modality_overrides:
+                continue
+            modality_meta.setdefault(modality, {})
+            for subkey, raw_spec in modality_overrides.items():
+                spec = dict(raw_spec.items()) if hasattr(raw_spec, "items") else dict(raw_spec)
+                missing = {"original_key", "start", "end"} - set(spec.keys())
+                if missing:
+                    raise ValueError(
+                        f"modality_metadata_overrides.{modality}.{subkey} missing {sorted(missing)}"
+                    )
+
+                entry = copy.deepcopy(spec)
+                entry["original_key"] = str(entry["original_key"])
+                entry["start"] = int(entry["start"])
+                entry["end"] = int(entry["end"])
+                entry["absolute"] = bool(entry.get("absolute", modality == "state"))
+                entry["dtype"] = str(entry.get("dtype", "float32"))
+                modality_meta[modality][str(subkey)] = entry
+        return modality_meta
+
+    def _missing_lerobot_stat_keys(
+        self,
+        le_modality_meta: LeRobotModalityMetadata,
+        le_statistics: dict,
+    ) -> list[str]:
+        missing_keys = []
+        for modality in ("state", "action"):
+            for state_action_meta in getattr(le_modality_meta, modality).values():
+                le_key = state_action_meta.original_key
+                if le_key is not None and le_key not in le_statistics:
+                    missing_keys.append(le_key)
+        return sorted(set(missing_keys))
 
     def _get_lerobot_info_meta(self) -> dict:
         """Get the metadata for the LeRobot dataset."""
@@ -762,19 +928,40 @@ class LeRobotSingleDataset(Dataset):
             with open(tasks_path, "r") as f:
                 tasks = [json.loads(line) for line in f]
             df = pd.DataFrame(tasks)
-            return df.set_index("task_index")
+            return self._apply_task_text_overrides(df.set_index("task_index"))
 
         if self._lerobot_version == "v3.0":
             tasks_path = self.dataset_path / LE_ROBOT3_TASKS_FILENAME
             df = pd.read_parquet(tasks_path)
+            if "task" not in df.columns and df.index.name == "task":
+                df = df.reset_index()
             if "task_index" in df.columns:
-                return df.set_index("task_index")
+                return self._apply_task_text_overrides(df.set_index("task_index"))
             if "task" in df.columns:
                 df = df.reset_index().rename(columns={"index": "task_index"})
-                return df.set_index("task_index")
+                return self._apply_task_text_overrides(df.set_index("task_index"))
             raise ValueError(f"Unexpected LeRobot v3 task schema in {tasks_path}: {list(df.columns)}")
 
         raise ValueError(f"Unsupported LeRobot version: {self._lerobot_version}")
+
+    def _apply_task_text_overrides(self, tasks: pd.DataFrame) -> pd.DataFrame:
+        """Override placeholder task strings from the run config without mutating dataset files."""
+        if self.data_cfg is None:
+            return tasks
+
+        getter = getattr(self.data_cfg, "get", None)
+        overrides = getter("task_text_overrides", None) if callable(getter) else None
+        if not overrides:
+            return tasks
+
+        tasks = tasks.copy()
+        items = overrides.items() if hasattr(overrides, "items") else []
+        for task_index, task_text in items:
+            task_text = str(task_text).strip()
+            if not task_text:
+                continue
+            tasks.loc[int(task_index), "task"] = task_text
+        return tasks
 
     def _check_integrity(self):
         """Use the config to check if the keys are valid and detect silent data corruption."""
@@ -843,11 +1030,18 @@ class LeRobotSingleDataset(Dataset):
         # Get language and action data
         language = data[self.modality_keys["language"][0]][0]
         action = []
+        action_pad_masks = []
         for action_key in self.modality_keys["action"]:
             action.append(data[action_key])
+            pad_mask = data.get(f"{action_key}_is_pad")
+            if pad_mask is not None:
+                action_pad_masks.append(np.asarray(pad_mask, dtype=bool))
         action = np.concatenate(action, axis=1)
-        
-        return dict(action=action, image=images, language=language)
+
+        sample = dict(action=action, image=images, language=language)
+        if action_pad_masks:
+            sample["action_is_pad"] = np.logical_or.reduce(action_pad_masks)
+        return sample
 
     def get_step_data(
         self,
@@ -890,7 +1084,18 @@ class LeRobotSingleDataset(Dataset):
                 raise KeyError(f"Unknown modality `{modality}`. Available modalities: {list(self.modality_keys.keys())}")
             # Get the data corresponding to each key in the modality
             for key in self.modality_keys[modality]:
-                data[key] = self.get_data_by_modality(trajectory_id, modality, key, base_index)
+                if modality == "action":
+                    value, padding_mask = self.get_state_or_action(
+                        trajectory_id,
+                        modality,
+                        key,
+                        base_index,
+                        return_padding_mask=True,
+                    )
+                    data[key] = value
+                    data[f"{key}_is_pad"] = padding_mask
+                else:
+                    data[key] = self.get_data_by_modality(trajectory_id, modality, key, base_index)
         return data
 
     def get_trajectory_data(self, trajectory_id: int) -> pd.DataFrame:
@@ -903,10 +1108,15 @@ class LeRobotSingleDataset(Dataset):
                 episode_chunk=chunk_index, episode_index=trajectory_id
             )
             assert parquet_path.exists(), f"Parquet file not found at {parquet_path}"
-            return pd.read_parquet(parquet_path)
+            return self._set_current_trajectory_data(trajectory_id, pd.read_parquet(parquet_path))
         if self._lerobot_version == "v3.0":
             return self.get_trajectory_data_lerobot_v3(trajectory_id)
         raise ValueError(f"Unsupported LeRobot version: {self._lerobot_version}")
+
+    def _set_current_trajectory_data(self, trajectory_id: int, data: pd.DataFrame) -> pd.DataFrame:
+        self.curr_traj_id = trajectory_id
+        self.curr_traj_data = data
+        return data
 
     def get_trajectory_data_lerobot_v3(self, trajectory_id: int) -> pd.DataFrame:
         """Get a single trajectory from a shared LeRobot v3 parquet shard."""
@@ -921,7 +1131,8 @@ class LeRobotSingleDataset(Dataset):
         assert parquet_path.exists(), f"Parquet file not found at {parquet_path}"
         file_data = pd.read_parquet(parquet_path)
         # Reset to a dense 0..T-1 index so downstream step indexing stays positional.
-        return file_data.loc[file_data["episode_index"] == trajectory_id].reset_index(drop=True).copy()
+        trajectory_data = file_data.loc[file_data["episode_index"] == trajectory_id].reset_index(drop=True).copy()
+        return self._set_current_trajectory_data(trajectory_id, trajectory_data)
 
     def get_trajectory_index(self, trajectory_id: int) -> int:
         """Get the index of the trajectory in the dataset by the trajectory ID.
@@ -955,7 +1166,8 @@ class LeRobotSingleDataset(Dataset):
         step_indices: np.ndarray,
         max_length: int,
         padding_strategy: str = "first_last",
-    ) -> np.ndarray:
+        return_padding_mask: bool = False,
+    ) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
         """Retrieve the data from the dataset and pad it if necessary.
         Args:
             array (np.ndarray): The array to retrieve the data from.
@@ -963,37 +1175,30 @@ class LeRobotSingleDataset(Dataset):
             max_length (int): The maximum length of the data.
             padding_strategy (str): The padding strategy, either "first" or "last".
         """
+        step_indices = np.asarray(step_indices, dtype=np.int64)
+        if max_length <= 0:
+            raise ValueError(f"Cannot retrieve from an empty trajectory: {max_length=}")
+
         # Get the padding indices
         front_padding_indices = step_indices < 0
         end_padding_indices = step_indices >= max_length
         padding_positions = np.logical_or(front_padding_indices, end_padding_indices)
-        # Retrieve the data with the non-padding indices
-        # If there exists some padding, Given T step_indices, the shape of the retrieved data will be (T', ...) where T' < T
-        raw_data = array[step_indices[~padding_positions]]
-        assert isinstance(raw_data, np.ndarray), f"{type(raw_data)=}"
-        # This is the shape of the output, (T, ...)
-        if raw_data.ndim == 1:
-            expected_shape = (len(step_indices),)
-        else:
-            expected_shape = (len(step_indices), *array.shape[1:])
 
-        # Pad the data
-        output = np.zeros(expected_shape)
-        # Assign the non-padded data
-        output[~padding_positions] = raw_data
-        # If there exists some padding, pad the data
+        clamped_indices = np.clip(step_indices, 0, max_length - 1)
+        output = np.asarray(array[clamped_indices]).copy()
+
+        # If there exists some padding, apply the requested padding policy.
         if padding_positions.any():
             if padding_strategy == "first_last":
-                # Use first / last step data to pad
-                front_padding_data = array[0]
-                end_padding_data = array[-1]
-                output[front_padding_indices] = front_padding_data
-                output[end_padding_indices] = end_padding_data
+                # The clamped indices already repeat the nearest valid frame.
+                pass
             elif padding_strategy == "zero":
                 # Use zero padding
                 output[padding_positions] = 0
             else:
                 raise ValueError(f"Invalid padding strategy: {padding_strategy}")
+        if return_padding_mask:
+            return output, padding_positions.astype(bool, copy=False)
         return output
 
     def get_video_path(self, trajectory_id: int, key: str) -> Path:
@@ -1098,7 +1303,8 @@ class LeRobotSingleDataset(Dataset):
         modality: str,
         key: str,
         base_index: int,
-    ) -> np.ndarray:
+        return_padding_mask: bool = False,
+    ) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
         """Get the state or action data for a trajectory by a base index.
         If the step indices are out of range, pad with the data:
             if the data is stored in absolute format, pad with the first or last step data;
@@ -1146,8 +1352,12 @@ class LeRobotSingleDataset(Dataset):
             array=data_array,
             step_indices=step_indices,
             max_length=max_length,
-            # padding_strategy="first_last" if state_or_action_cfg.absolute else "zero",
-            padding_strategy="zero",           # HACK for realdata
+            padding_strategy=(
+                "first_last"
+                if modality == "action" or state_or_action_cfg.absolute
+                else "zero"
+            ),
+            return_padding_mask=return_padding_mask,
         )
 
     def get_language(
@@ -1981,11 +2191,17 @@ class LeRobotMixtureDataset(Dataset):
                 # Get language and action data
                 language = data[dataset.modality_keys["language"][0]][0]
                 action = []
+                action_pad_masks = []
                 for action_key in dataset.modality_keys["action"]:
                     action.append(data[action_key])
+                    pad_mask = data.get(f"{action_key}_is_pad")
+                    if pad_mask is not None:
+                        action_pad_masks.append(np.asarray(pad_mask, dtype=bool))
                 action = np.concatenate(action, axis=1).astype(np.float16)
 
                 return_dict = dict(action=action, lang=language)
+                if action_pad_masks:
+                    return_dict["action_is_pad"] = np.logical_or.reduce(action_pad_masks)
                 if build_worker_images:
                     return_dict["image"] = images
                 if self.gpu_video_decode_on_rank:

@@ -148,8 +148,13 @@ def _prepare_dataset_overlay(source_dataset_path: Path, output_json: Path) -> Pa
 
     source_meta = source_dataset_path / "meta"
     for src_file in source_meta.iterdir():
+        dst_file = overlay_meta / src_file.name
         if src_file.is_file():
-            shutil.copy2(src_file, overlay_meta / src_file.name)
+            shutil.copy2(src_file, dst_file)
+        elif src_file.is_dir():
+            if dst_file.exists():
+                shutil.rmtree(dst_file)
+            shutil.copytree(src_file, dst_file)
 
     modality_path = overlay_meta / "modality.json"
     if not modality_path.exists():
@@ -269,12 +274,23 @@ def _extract_targets_and_mask(batch: Any) -> tuple[np.ndarray, np.ndarray | None
     if isinstance(batch, dict):
         targets = _to_numpy(batch["action"])
         mask = _to_numpy(batch["action_mask"]) if "action_mask" in batch else None
+        if "action_is_pad" in batch:
+            pad_keep = (~_to_numpy(batch["action_is_pad"]).astype(bool)).astype(np.float32)
+            if pad_keep.ndim == 2:
+                pad_keep = pad_keep[..., None]
+            mask = pad_keep if mask is None else _to_numpy(mask).astype(np.float32) * pad_keep
         return targets, mask
 
     targets = np.stack([_to_numpy(sample["action"]) for sample in batch], axis=0)
     mask = None
     if batch and isinstance(batch[0], dict) and "action_mask" in batch[0]:
         mask = np.stack([_to_numpy(sample["action_mask"]) for sample in batch], axis=0)
+    if batch and isinstance(batch[0], dict) and "action_is_pad" in batch[0]:
+        pad_keep = ~np.stack([_to_numpy(sample["action_is_pad"]).astype(bool) for sample in batch], axis=0)
+        pad_keep = pad_keep.astype(np.float32)
+        if pad_keep.ndim == 2:
+            pad_keep = pad_keep[..., None]
+        mask = pad_keep if mask is None else mask.astype(np.float32) * pad_keep
     return targets, mask
 
 
@@ -332,6 +348,10 @@ def _validate_and_eval(args: argparse.Namespace) -> dict[str, Any]:
     abs_sum = 0.0
     sq_sum = 0.0
     count = 0
+    abs_by_horizon: np.ndarray | None = None
+    count_by_horizon: np.ndarray | None = None
+    abs_by_dim: np.ndarray | None = None
+    count_by_dim: np.ndarray | None = None
     samples = 0
     first_batch_shapes: dict[str, Any] = {}
     errors: list[str] = []
@@ -366,6 +386,18 @@ def _validate_and_eval(args: argparse.Namespace) -> dict[str, Any]:
                 count += int(diff.size)
                 samples += _batch_size(batch)
 
+                abs_full = np.abs(preds - targets)
+                mask_full = mask.astype(bool)
+                if abs_by_horizon is None:
+                    abs_by_horizon = np.zeros(abs_full.shape[1], dtype=np.float64)
+                    count_by_horizon = np.zeros(abs_full.shape[1], dtype=np.float64)
+                    abs_by_dim = np.zeros(abs_full.shape[2], dtype=np.float64)
+                    count_by_dim = np.zeros(abs_full.shape[2], dtype=np.float64)
+                abs_by_horizon += (abs_full * mask_full).sum(axis=(0, 2))
+                count_by_horizon += mask_full.sum(axis=(0, 2))
+                abs_by_dim += (abs_full * mask_full).sum(axis=(0, 1))
+                count_by_dim += mask_full.sum(axis=(0, 1))
+
                 if not first_batch_shapes:
                     first_batch_shapes = {
                         "target": list(targets.shape),
@@ -381,6 +413,22 @@ def _validate_and_eval(args: argparse.Namespace) -> dict[str, Any]:
     mae = abs_sum / count if count else math.nan
     rmse = math.sqrt(sq_sum / count) if count else math.nan
     norm_l2_per_element = math.sqrt(sq_sum) / count if count else math.nan
+    horizon_mae = None
+    dim_mae = None
+    if abs_by_horizon is not None and count_by_horizon is not None:
+        horizon_mae = np.divide(
+            abs_by_horizon,
+            count_by_horizon,
+            out=np.full_like(abs_by_horizon, np.nan, dtype=np.float64),
+            where=count_by_horizon > 0,
+        ).tolist()
+    if abs_by_dim is not None and count_by_dim is not None:
+        dim_mae = np.divide(
+            abs_by_dim,
+            count_by_dim,
+            out=np.full_like(abs_by_dim, np.nan, dtype=np.float64),
+            where=count_by_dim > 0,
+        ).tolist()
     return {
         "config_yaml": str(args.config_yaml),
         "checkpoint": str(args.checkpoint),
@@ -401,6 +449,8 @@ def _validate_and_eval(args: argparse.Namespace) -> dict[str, Any]:
             "mae_score": mae,
             "rmse": rmse,
             "norm_l2_per_element": norm_l2_per_element,
+            "mae_by_horizon": horizon_mae,
+            "mae_by_action_dim": dim_mae,
             "first_batch_shapes": first_batch_shapes,
             "errors": errors,
         },

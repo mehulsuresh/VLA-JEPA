@@ -201,7 +201,8 @@ def continuous_unnormalize(values: np.ndarray, stats: dict[str, Any], *, mode: s
         min_value = np.asarray(stats["min"], dtype=np.float32)
         max_value = np.asarray(stats["max"], dtype=np.float32)
         _ensure_last_dim(array, min_value.shape[-1], "Unnormalization input")
-        return ((array + 1.0) / 2.0 * (max_value - min_value) + min_value).astype(np.float32, copy=False)
+        clipped = np.clip(array, -1.0, 1.0)
+        return ((clipped + 1.0) / 2.0 * (max_value - min_value) + min_value).astype(np.float32, copy=False)
 
     if mode == "q99":
         q01 = np.asarray(stats["q01"], dtype=np.float32)

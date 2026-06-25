@@ -25,11 +25,13 @@ class WebsocketPolicyServer:
         host: str = "0.0.0.0",
         port: int = 8000,
         metadata: dict | None = None,
+        output_logger=None,
     ) -> None:
         self._policy = policy  #
         self._host = host
         self._port = port
         self._metadata = metadata or {}
+        self._output_logger = output_logger
         logging.getLogger("websockets.server").setLevel(logging.INFO)
 
     def serve_forever(self) -> None:
@@ -54,7 +56,7 @@ class WebsocketPolicyServer:
         while True:
             try:
                 msg = msgpack_numpy.unpackb(await websocket.recv())
-                ret = self._route_message(msg)  # route message
+                ret = self._route_message(msg, remote_address=websocket.remote_address)  # route message
                 await websocket.send(packer.pack(ret))
             except websockets.ConnectionClosed:
                 logging.info("Connection from %s closed", websocket.remote_address)
@@ -79,7 +81,7 @@ class WebsocketPolicyServer:
                 raise
 
     # route logic: recognize request from client
-    def _route_message(self, msg: dict) -> dict:
+    def _route_message(self, msg: dict, remote_address=None) -> dict:
         """
         Route rules (fault-tolerant):
         - Supports messages of form:
@@ -135,6 +137,16 @@ class WebsocketPolicyServer:
                 infer_payload = dict(payload)
                 infer_payload["batch_images"] = image_tools.to_pil_preserve(infer_payload["batch_images"])
                 output_dict = self._policy.predict_action(**infer_payload)
+                if self._output_logger is not None:
+                    try:
+                        self._output_logger(
+                            request_id=req_id,
+                            remote_address=remote_address,
+                            payload=infer_payload,
+                            output=output_dict,
+                        )
+                    except Exception:
+                        logging.exception("Policy output logging failed (request_id=%s)", req_id)
             except Exception as e:
                 logging.exception("Policy inference error (request_id=%s)", req_id)
                 return {
