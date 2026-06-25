@@ -458,8 +458,12 @@ def build_accelerator(cfg) -> Accelerator:
     mixed_precision = resolve_mixed_precision_mode(cfg)
     trackers = resolve_trackers(cfg)
     project_dir = os.path.join(cfg.run_root_dir, cfg.run_id)
+    trainer_cfg = cfg.get("trainer", {})
     ddp_kwargs = DistributedDataParallelKwargs(
-        find_unused_parameters=bool(cfg.get("trainer", {}).get("find_unused_parameters", True))
+        find_unused_parameters=bool(trainer_cfg.get("find_unused_parameters", True)),
+        gradient_as_bucket_view=bool(trainer_cfg.get("ddp_gradient_as_bucket_view", False)),
+        static_graph=bool(trainer_cfg.get("ddp_static_graph", False)),
+        bucket_cap_mb=int(trainer_cfg.get("ddp_bucket_cap_mb", 25)),
     )
     accelerator = (
         Accelerator(
@@ -1260,6 +1264,7 @@ class VLATrainer(TrainerUtils):
     def _init_checkpointing(self):
         """initialize checkpoint directory"""
         self.checkpoint_dir = os.path.join(self.config.output_dir, "checkpoints")
+        self.force_checkpoint_path = os.path.join(self.config.output_dir, "FORCE_CHECKPOINT")
         os.makedirs(self.checkpoint_dir, exist_ok=True)
 
         is_resume = getattr(self.config.trainer, "is_resume", False)
@@ -1271,6 +1276,20 @@ class VLATrainer(TrainerUtils):
         # resume training state
         if is_resume and resume_from_checkpoint:
             self._load_checkpoint(resume_from_checkpoint)
+
+    def _force_checkpoint_requested(self) -> bool:
+        if not bool(self.config.trainer.get("enable_force_checkpoint_file", True)):
+            return False
+        return os.path.exists(getattr(self, "force_checkpoint_path", ""))
+
+    def _clear_force_checkpoint_request(self):
+        if self.accelerator.is_main_process:
+            try:
+                if os.path.exists(self.force_checkpoint_path):
+                    os.remove(self.force_checkpoint_path)
+            except OSError as exc:
+                logger.warning(f"Unable to clear force checkpoint request `{self.force_checkpoint_path}`: {exc}")
+        distributed_wait(self.accelerator)
 
     def _load_checkpoint(self, checkpoint_path):
         """load checkpoint"""
@@ -1700,9 +1719,24 @@ class VLATrainer(TrainerUtils):
             step_metrics["model_time"] = t_end_model - t_start_model
 
             # save checkpoint
+            force_checkpoint_requested = self._force_checkpoint_requested()
             if self.completed_steps % self.config.trainer.save_interval == 0 and self.completed_steps > 0:
-                if self._should_save_checkpoint(step_metrics):
+                should_save_checkpoint = self._should_save_checkpoint(step_metrics)
+                if should_save_checkpoint or force_checkpoint_requested:
+                    if force_checkpoint_requested and self.accelerator.is_main_process:
+                        logger.info(
+                            f"Force checkpoint requested via `{self.force_checkpoint_path}` at step {self.completed_steps}"
+                        )
                     self._save_checkpoint()
+                if force_checkpoint_requested:
+                    self._clear_force_checkpoint_request()
+            elif force_checkpoint_requested and self.completed_steps > 0:
+                if self.accelerator.is_main_process:
+                    logger.info(
+                        f"Force checkpoint requested via `{self.force_checkpoint_path}` at step {self.completed_steps}"
+                    )
+                self._save_checkpoint()
+                self._clear_force_checkpoint_request()
 
             step_metrics["wall_step_time"] = time.perf_counter() - t_start_step
             if self.accelerator.sync_gradients and self.completed_steps > self.progress_eta_warmup_steps:

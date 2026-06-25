@@ -272,14 +272,17 @@ class VLA_JEPA(baseframework):
         tubelet_size = self._get_vjepa_attr("tubelet_size")
         image_size = self._get_vjepa_attr("image_size")
         hidden_size = self._get_vjepa_attr("hidden_size")
+        vj_predictor_embed_dim = self._resolve_vj_predictor_embed_dim(hidden_size)
+        vj_predictor_num_heads = self._resolve_vj_predictor_num_heads(vj_predictor_embed_dim)
 
         self.vj_predictor = VisionTransformerPredictorAC(
             num_frames=self.config.framework.vj2_model.num_frames // tubelet_size,
             img_size=((image_size, image_size)),
             tubelet_size=1,
             depth=self.config.framework.vj2_model.depth,
-            num_heads=self.config.framework.vj2_model.num_heads,
+            num_heads=vj_predictor_num_heads,
             embed_dim=hidden_size * self.vj_num_video_views,
+            predictor_embed_dim=vj_predictor_embed_dim,
             action_embed_dim=self.qwen_hidden_size,
             num_add_tokens=self.config.framework.vj2_model.num_action_tokens_per_timestep,
             use_activation_checkpointing=bool(
@@ -526,6 +529,38 @@ class VLA_JEPA(baseframework):
         if hasattr(self.vj_encoder, key):
             return getattr(self.vj_encoder, key)
         raise AttributeError(f"Unable to resolve `{key}` from V-JEPA encoder")
+
+    def _get_optional_vjepa_attr(self, key: str):
+        if hasattr(self.vj_encoder, "config") and hasattr(self.vj_encoder.config, key):
+            return getattr(self.vj_encoder.config, key)
+        return getattr(self.vj_encoder, key, None)
+
+    def _resolve_vj_predictor_embed_dim(self, encoder_hidden_size: int) -> int:
+        configured = self.config.framework.vj2_model.get("predictor_embed_dim", 1024)
+        if isinstance(configured, str) and configured.lower() == "auto":
+            return max(1024, int(encoder_hidden_size))
+        return int(configured)
+
+    def _resolve_vj_predictor_num_heads(self, predictor_embed_dim: int) -> int:
+        configured = self.config.framework.vj2_model.get("num_heads", 16)
+        if not (isinstance(configured, str) and configured.lower() == "auto"):
+            num_heads = int(configured)
+            if predictor_embed_dim % num_heads != 0:
+                raise ValueError(
+                    "framework.vj2_model.num_heads must divide the V-JEPA predictor dimension: "
+                    f"num_heads={num_heads}, predictor_embed_dim={predictor_embed_dim}."
+                )
+            return num_heads
+
+        for attr_name in ("num_heads", "num_attention_heads", "n_heads"):
+            encoder_heads = self._get_optional_vjepa_attr(attr_name)
+            if encoder_heads is not None and predictor_embed_dim % int(encoder_heads) == 0:
+                return int(encoder_heads)
+
+        for candidate in (16, 12, 8, 6, 4, 2, 1):
+            if predictor_embed_dim % candidate == 0:
+                return candidate
+        raise ValueError(f"Could not resolve V-JEPA predictor num_heads for dim {predictor_embed_dim}")
 
     def _get_qwen_device(self) -> torch.device:
         return next(self.qwen_vl_interface.model.parameters()).device

@@ -38,7 +38,14 @@ def _normalize_frame_value_range(value: Any) -> str:
     return str(value).lower()
 
 
-_MOGE2_VITL_NORMAL_NECK_DIMS = (1024, 256, 128, 64, 32)
+_MOGE2_NORMAL_NECK_DIMS_BY_MODEL = {
+    "moge-2-vits-normal": (384, 256, 128, 64, 32),
+    "moge-2-vitb-normal": (768, 256, 128, 64, 32),
+    "moge-2-vitl-normal": (1024, 256, 128, 64, 32),
+    "Ruicheng/moge-2-vits-normal": (384, 256, 128, 64, 32),
+    "Ruicheng/moge-2-vitb-normal": (768, 256, 128, 64, 32),
+    "Ruicheng/moge-2-vitl-normal": (1024, 256, 128, 64, 32),
+}
 
 
 class _GeometryFeedForward(nn.Module):
@@ -261,21 +268,33 @@ class MoGeGeometryTeacher:
             return None
         return int(configured_feature_dim)
 
+    @staticmethod
+    def _known_moge2_neck_dims(model_name: str) -> Optional[tuple[int, ...]]:
+        model_name = str(model_name).rstrip("/")
+        candidates = [model_name, Path(model_name).name]
+        if model_name.endswith(".pt") or model_name.endswith(".safetensors"):
+            candidates.append(Path(model_name).stem)
+        for candidate in candidates:
+            dims = _MOGE2_NORMAL_NECK_DIMS_BY_MODEL.get(candidate)
+            if dims is not None:
+                return dims
+        return None
+
     def _feature_dim_without_model(self) -> Optional[int]:
         configured_feature_dim = self._configured_feature_dim()
         if configured_feature_dim is not None:
             return configured_feature_dim
         model_name = str(_cfg_get(self.cfg, "teacher_model", "Ruicheng/moge-2-vitl-normal")).rstrip("/")
-        model_path_name = Path(model_name).name
-        feature_source = str(_cfg_get(self.cfg, "teacher_feature_source", "neck")).lower()
-        if model_name != "Ruicheng/moge-2-vitl-normal" and model_path_name != "moge-2-vitl-normal":
+        neck_dims = self._known_moge2_neck_dims(model_name)
+        if neck_dims is None:
             return None
+        feature_source = str(_cfg_get(self.cfg, "teacher_feature_source", "neck")).lower()
         if feature_source == "encoder":
-            return _MOGE2_VITL_NORMAL_NECK_DIMS[0]
+            return neck_dims[0]
         if feature_source == "neck":
             feature_level = int(_cfg_get(self.cfg, "teacher_feature_level", 0))
-            if 0 <= feature_level < len(_MOGE2_VITL_NORMAL_NECK_DIMS):
-                return _MOGE2_VITL_NORMAL_NECK_DIMS[feature_level]
+            if 0 <= feature_level < len(neck_dims):
+                return neck_dims[feature_level]
         return None
 
     def _feature_dim_from_model(self, model: nn.Module) -> int:
@@ -310,7 +329,7 @@ class MoGeGeometryTeacher:
                 raise RuntimeError(
                     "MoGe geometry teacher feature dimension is `auto`, but it cannot be inferred without "
                     "loading the teacher weights for this model. Set teacher_feature_dim explicitly, use "
-                    "Ruicheng/moge-2-vitl-normal, or enable eager_load_on_cpu."
+                    "a known Ruicheng/moge-2-vits/vitb/vitl-normal model, or enable eager_load_on_cpu."
                 )
             return feature_dim
         return self._feature_dim_from_model(self.model)

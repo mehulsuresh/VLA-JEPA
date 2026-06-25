@@ -62,6 +62,24 @@ def _pyav_frame_time_seconds(frame: av.VideoFrame, stream, frame_index: int) -> 
     return float(frame_index)
 
 
+def _pyav_seek_to_timestamp(
+    container: av.container.InputContainer,
+    stream,
+    timestamp_seconds: float,
+) -> bool:
+    if timestamp_seconds <= 0:
+        return False
+    try:
+        if stream.time_base is not None:
+            seek_offset = int(timestamp_seconds / float(stream.time_base))
+            container.seek(seek_offset, any_frame=False, backward=True, stream=stream)
+        else:
+            container.seek(int(timestamp_seconds * av.time_base), any_frame=False, backward=True)
+        return True
+    except Exception:
+        return False
+
+
 @lru_cache(maxsize=512)
 def _get_decord_frame_timestamps(
     video_path: str,
@@ -232,15 +250,50 @@ def get_frames_by_timestamps(
         try:
             stream = _configure_pyav_stream(container, video_backend_kwargs)
             fps = float(stream.average_rate) if stream.average_rate else 0.0
-            stop_after = float(np.max(requested_ts)) + (2.0 / fps if fps > 0 else 1.0)
-            frame_ts = []
-            frames = []
-            for frame_index, frame in enumerate(container.decode(stream)):
-                ts = _pyav_frame_time_seconds(frame, stream, frame_index)
-                frame_ts.append(ts)
-                frames.append(frame.to_ndarray(format="rgb24"))
-                if ts > stop_after:
-                    break
+            frame_margin = 2.0 / fps if fps > 0 else 1.0
+            seek_margin = float((video_backend_kwargs or {}).get("seek_margin_seconds", 1.0))
+            use_seek = bool((video_backend_kwargs or {}).get("seek", True))
+            start_at = max(0.0, float(np.min(requested_ts)) - max(frame_margin, seek_margin))
+            stop_after = float(np.max(requested_ts)) + frame_margin
+            duration_seconds = None
+            if stream.duration is not None and stream.time_base is not None:
+                duration_seconds = float(stream.duration * stream.time_base)
+            elif container.duration is not None:
+                duration_seconds = float(container.duration / av.time_base)
+
+            def collect_frames(min_ts: float):
+                frame_ts = []
+                frames = []
+                for frame_index, frame in enumerate(container.decode(stream)):
+                    ts = _pyav_frame_time_seconds(frame, stream, frame_index)
+                    if ts < min_ts:
+                        continue
+                    frame_ts.append(ts)
+                    frames.append(frame.to_ndarray(format="rgb24"))
+                    if ts > stop_after:
+                        break
+                return frame_ts, frames
+
+            seeked = False
+            if use_seek:
+                seeked = _pyav_seek_to_timestamp(container, stream, start_at)
+            frame_ts, frames = collect_frames(start_at)
+
+            if not frames and seeked:
+                # Preserve the old nearest-frame behavior for timestamps beyond
+                # the last decodable frame without scanning from timestamp 0.
+                container.close()
+                container = av.open(video_path)
+                stream = _configure_pyav_stream(container, video_backend_kwargs)
+                if duration_seconds is not None and start_at >= duration_seconds:
+                    end_start = max(
+                        0.0,
+                        duration_seconds - max(5.0, seek_margin, frame_margin * 20.0),
+                    )
+                    if _pyav_seek_to_timestamp(container, stream, end_start):
+                        frame_ts, frames = collect_frames(end_start)
+                if not frames:
+                    frame_ts, frames = collect_frames(0.0)
         finally:
             container.close()
 

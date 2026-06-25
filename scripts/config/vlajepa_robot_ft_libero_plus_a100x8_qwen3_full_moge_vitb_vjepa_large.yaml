@@ -1,0 +1,221 @@
+# A100x8 LIBERO-plus benchmark profile:
+# - Full Qwen3-VL fine-tuning; no LoRA adapter.
+# - No RABC, no RTC, no subtask-label prompt augmentation.
+# - MoGe teacher uses Ruicheng/moge-2-vitb-normal with feature_dim:auto.
+# - V-JEPA teacher uses vjepa2.1 ViT-L/384; predictor dim and heads can stay auto
+#   when swapping teacher size.
+run_id: robot_ft_libero_plus_a100x8_qwen3_full_moge_vitb_vjepa_large
+run_root_dir: /mnt/vla-jepa/checkpoints
+seed: 42
+trackers:
+  - tensorboard
+is_debug: false
+
+framework:
+  name: VLA_JEPA
+  qwenvl:
+    base_vlm: "Qwen/Qwen3-VL-2B-Instruct"
+    attn_implementation: flex_attention
+    device_map: null
+    vl_hidden_dim: auto
+    blockwise_attention:
+      enabled: true
+      compile_mask: false
+    image_processor:
+      min_pixels: 50176
+      max_pixels: 50176
+    lora:
+      enabled: false
+    strict_attn_implementation: true
+    strict_tensor_input_fast_path: true
+    strict_full_trainable: true
+  qwen_state:
+    num_tokens: 8
+    token_template: <|state_{}|>
+  action_model:
+    action_model_type: DiT-B
+    action_hidden_dim: 1024
+    hidden_size: 1024
+    add_pos_embed: true
+    max_seq_len: 1024
+    action_dim: 7
+    state_dim: 8
+    future_action_window_size: 6
+    action_horizon: 7
+    past_action_window_size: 0
+    noise_beta_alpha: 1.5
+    noise_beta_beta: 1.0
+    noise_s: 0.999
+    num_timestep_buckets: 1000
+    num_inference_timesteps: 4
+    rtc_training:
+      enabled: false
+      method: prefix
+      max_delay: 4
+      distribution: uniform
+      rtc_prob: 1.0
+      warmup_steps: 0
+      ramp_steps: 0
+      clean_time: 1.0
+      condition_dit_tokens: false
+    num_target_vision_tokens: 32
+    diffusion_model_cfg:
+      cross_attention_dim: auto
+      dropout: 0.2
+      final_dropout: true
+      interleave_self_attention: true
+      norm_type: ada_norm
+      num_layers: 16
+      output_dim: 1024
+      positional_embeddings: null
+  depth_teacher_aux:
+    enabled: true
+    mode: query
+    teacher_model: Ruicheng/moge-2-vitb-normal
+    moge_repo_path: /mnt/vla-jepa/src/MoGe
+    input_size: 224
+    num_tokens: 256
+    num_task_tokens: 8
+    num_output_tokens: 256
+    geometry_token_template: <|geometry_{}|>
+    query_num_layers: 1
+    query_num_heads: 4
+    query_dim_head: 32
+    query_ff_mult: 1.0
+    query_smooth_l1_beta: 1.0
+    teacher_feature_source: neck
+    teacher_feature_level: 0
+    teacher_feature_dim: auto
+    frame_value_range: uint8
+    detach_vlm_steps: 5
+    detach_vlm_fraction: 0.01
+    use_fp16: true
+    allow_frozen_qwen: false
+    allow_zero_loss_scale: false
+  vj2_model:
+    source: torchhub
+    hub_repo_or_dir: /mnt/vla-jepa/src/vjepa2
+    hub_model_name: vjepa2_1_vit_large_384
+    hub_preprocessor_name: vjepa2_preprocessor
+    hub_checkpoint_url: https://dl.fbaipublicfiles.com/vjepa2/vjepa2_1_vitl_dist_vitG_384.pt
+    hub_checkpoint_key: ema_encoder
+    crop_size: 384
+    pretrained: true
+    freeze_encoder: true
+    num_video_views: 2
+    depth: 12
+    predictor_embed_dim: auto
+    num_heads: auto
+    use_legacy_rope_bug: false
+    special_action_token: <|action_{}|>
+    num_action_tokens_per_timestep: 8
+    embodied_action_token: <|embodied_action|>
+    num_embodied_action_tokens_per_instruction: 32
+    num_frames: 8
+  reduce_in_full_precision: true
+
+datasets:
+  vla_data:
+    dataset_py: lerobot_datasets
+    data_root_dir: /mnt/vla-jepa/datasets/LeRobot
+    data_mix: libero_plus
+    lerobot_version: v3.0
+    action_type: delta_qpos
+    CoT_prompt: "Your task is {instruction}. Use the robot observations and state to produce the corresponding policy actions. {state}{e_actions}{actions}{geometry}"
+    resolution_size: 224
+    video_resolution_size: 384
+    video_frame_stride: 1
+    video_target_shift_steps: 0
+    gpu_video_decode_on_rank: false
+    cpu_video_decode_drop_worker_images: false
+    runtime_timing_logging: true
+    per_device_batch_size: 16
+    num_workers: 2
+    prefetch_factor: 1
+    dataloader_timeout_seconds: 0
+    persistent_workers: false
+    multiprocessing_context: spawn
+    worker_torch_threads: 1
+    worker_cv2_threads: 1
+    video_backend: pyav
+    video_backend_num_threads: 1
+    pin_memory: true
+    drop_last: true
+    delete_pause_frame: false
+    load_all_data_for_training: true
+    with_state: true
+    shuffle: true
+
+trainer:
+  epochs: 100
+  max_train_steps: 30000
+  num_warmup_steps: 3000
+  save_interval: 2500
+  eval_interval: 2500
+  checkpoint_max_to_keep: 3
+  save_best_only: false
+  best_metric_name: mae_score
+  best_metric_mode: min
+  learning_rate:
+    base: 2.0e-05
+    qwen_vl_interface: 1.0e-05
+    qwen_state_projector: 1.0e-04
+    action_model: 1.0e-04
+    vj_predictor: 1.0e-04
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 1.0e-06
+  freeze_modules: "vj_encoder"
+  loss_scale:
+    action: 1.0
+    wm: 0.1
+    wm_initial: 0.3
+    wm_warmup_steps: 2000
+    depth_teacher: 0.016
+  warmup_ratio: 0.0
+  logging_frequency: 10
+  progress_eta_window: 50
+  progress_eta_warmup_steps: 10
+  eval_before_train: false
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 1
+  repeated_diffusion_steps: 1
+  find_unused_parameters: false
+  ddp_gradient_as_bucket_view: true
+  ddp_static_graph: false
+  ddp_bucket_cap_mb: 100
+
+  optimizer:
+    name: AdamW
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 1.0e-04
+    fused: true
+
+  is_resume: false
+  resume_epoch: null
+  resume_step: null
+  enable_gradient_checkpointing: true
+  enable_mixed_precision_training: true
+  mixed_precision: bf16
+  channels_last: true
+  compile_qwen_model: false
+  compile_qwen_model_dynamic: false
+  compile_action_model: false
+  compile_action_model_dynamic: false
+  compile_vj_predictor: false
+  compile_vj_predictor_dynamic: false
+  compile_vj_encoder: false
+  compile_vj_encoder_dynamic: false
+  compile_full_model: false
+  compile_full_model_dynamic: false
+  compile_mode: default
+  compile_backend: inductor
+  compile_dynamic: false
+  strict_torch_compile: true
+  save_plain_weights_in_checkpoints: false
+  drop_checkpoint_page_cache: true
+  trim_process_memory_after_checkpoint: true
+  profile_cuda_memory: true
+  profile_cuda_memory_log_step: 10
+  use_rabc: false

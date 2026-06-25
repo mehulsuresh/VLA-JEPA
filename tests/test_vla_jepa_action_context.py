@@ -366,9 +366,15 @@ def test_vla_jepa_configs_declare_state_tokens_and_ordered_prompts():
         assert framework_cfg["name"] == "VLA_JEPA", path
         qwenvl_cfg = framework_cfg["qwenvl"]
         is_qwen35_lora_experiment = "qwen35_08b_lora" in path.name
+        is_qwen35_full_experiment = "qwen35_2b_full" in path.name
         if is_qwen35_lora_experiment:
             assert qwenvl_cfg["base_vlm"] == "Qwen/Qwen3.5-0.8B", path
             assert bool(qwenvl_cfg.get("lora", {}).get("enabled", False)), path
+            assert not bool(qwenvl_cfg.get("blockwise_attention", {}).get("enabled", False)), path
+            assert not bool(qwenvl_cfg.get("enable_fast_linear_attention", True)), path
+        elif is_qwen35_full_experiment:
+            assert qwenvl_cfg["base_vlm"] == "Qwen/Qwen3.5-2B", path
+            assert not bool(qwenvl_cfg.get("lora", {}).get("enabled", False)), path
             assert not bool(qwenvl_cfg.get("blockwise_attention", {}).get("enabled", False)), path
             assert not bool(qwenvl_cfg.get("enable_fast_linear_attention", True)), path
         else:
@@ -393,7 +399,13 @@ def test_vla_jepa_configs_declare_state_tokens_and_ordered_prompts():
         assert "temporal dynamics from frames" not in prompt, path
         assert prompt.index("{state}") < prompt.index("{e_actions}") < prompt.index("{actions}"), path
         if cfg["datasets"]["vla_data"].get("dataset_py") == "lerobot_datasets":
-            expected_backend = "decord" if is_qwen35_lora_experiment else "pyav"
+            expected_backend = (
+                "torchcodec"
+                if "libero_plus_qwen35_08b_lora_smoke" in path.name
+                else "decord"
+                if is_qwen35_lora_experiment
+                else "pyav"
+            )
             assert cfg["datasets"]["vla_data"].get("video_backend") == expected_backend, path
         if framework_cfg.get("depth_teacher_aux", {}).get("enabled", False):
             assert "{geometry}" in prompt, path

@@ -17,12 +17,20 @@ from starVLA.training.trainer_utils.trainer_tools import (
 )
 
 
-def test_known_moge_feature_dim_without_loading_weights_on_cpu():
-    dims = [1024, 256, 128, 64, 32]
+@pytest.mark.parametrize(
+    ("teacher_model", "dims"),
+    [
+        ("Ruicheng/moge-2-vits-normal", [384, 256, 128, 64, 32]),
+        ("Ruicheng/moge-2-vitb-normal", [768, 256, 128, 64, 32]),
+        ("Ruicheng/moge-2-vitl-normal", [1024, 256, 128, 64, 32]),
+        ("/models/moge-2-vitb-normal", [768, 256, 128, 64, 32]),
+    ],
+)
+def test_known_moge_feature_dim_without_loading_weights_on_cpu(teacher_model, dims):
     for level, expected_dim in enumerate(dims):
         teacher = MoGeGeometryTeacher(
             {
-                "teacher_model": "Ruicheng/moge-2-vitl-normal",
+                "teacher_model": teacher_model,
                 "teacher_feature_source": "neck",
                 "teacher_feature_level": level,
                 "teacher_feature_dim": "auto",
@@ -31,6 +39,19 @@ def test_known_moge_feature_dim_without_loading_weights_on_cpu():
         teacher.initialize(torch.device("cpu"))
         assert teacher.model is None
         assert teacher.feature_dim() == expected_dim
+
+
+def test_known_moge_encoder_dim_without_loading_weights_on_cpu():
+    teacher = MoGeGeometryTeacher(
+        {
+            "teacher_model": "Ruicheng/moge-2-vitb-normal",
+            "teacher_feature_source": "encoder",
+            "teacher_feature_dim": "auto",
+        }
+    )
+    teacher.initialize(torch.device("cpu"))
+    assert teacher.model is None
+    assert teacher.feature_dim() == 768
 
 
 def test_loss_finite_at_zero_init():
@@ -80,6 +101,39 @@ def test_query_geometry_head_shape():
     pred = head(context)
 
     assert pred.shape == (6, 16, 8)
+
+
+def test_vjepa_predictor_auto_config_resolves_from_teacher_size():
+    dummy = object.__new__(VLA_JEPA)
+    dummy.config = SimpleNamespace(
+        framework=SimpleNamespace(
+            vj2_model={
+                "predictor_embed_dim": "auto",
+                "num_heads": "auto",
+            }
+        )
+    )
+    dummy.vj_encoder = SimpleNamespace(num_heads=16)
+
+    predictor_dim = dummy._resolve_vj_predictor_embed_dim(1024)
+    assert predictor_dim == 1024
+    assert dummy._resolve_vj_predictor_num_heads(predictor_dim) == 16
+
+
+def test_vjepa_predictor_auto_heads_falls_back_to_valid_divisor():
+    dummy = object.__new__(VLA_JEPA)
+    dummy.config = SimpleNamespace(framework=SimpleNamespace(vj2_model={"num_heads": "auto"}))
+    dummy.vj_encoder = SimpleNamespace(num_heads=12)
+
+    assert dummy._resolve_vj_predictor_num_heads(1024) == 16
+
+
+def test_vjepa_predictor_rejects_invalid_explicit_heads():
+    dummy = object.__new__(VLA_JEPA)
+    dummy.config = SimpleNamespace(framework=SimpleNamespace(vj2_model={"num_heads": 12}))
+
+    with pytest.raises(ValueError, match="must divide"):
+        dummy._resolve_vj_predictor_num_heads(1024)
 
 
 def test_image_token_gather_alignment():

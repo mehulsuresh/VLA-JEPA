@@ -1751,22 +1751,26 @@ def generate_action_mask_for_used_keys(action_modalities: dict, used_action_keys
     
     return mask
 
-def get_used_modality_keys(modality_keys: dict) -> tuple[set, set]:
+def get_used_modality_keys(modality_keys: dict) -> tuple[list[str], list[str]]:
     """Extract used action and state keys from modality configuration."""
-    used_action_keys = set()
-    used_state_keys = set()
+    used_action_keys: list[str] = []
+    used_state_keys: list[str] = []
+    seen_action_keys: set[str] = set()
+    seen_state_keys: set[str] = set()
     
-    # Extract action keys (remove "action." prefix)
     for action_key in modality_keys.get("action", []):
         if action_key.startswith("action."):
             clean_key = action_key.replace("action.", "")
-            used_action_keys.add(clean_key)
+            if clean_key not in seen_action_keys:
+                used_action_keys.append(clean_key)
+                seen_action_keys.add(clean_key)
     
-    # Extract state keys (remove "state." prefix)  
     for state_key in modality_keys.get("state", []):
         if state_key.startswith("state."):
             clean_key = state_key.replace("state.", "")
-            used_state_keys.add(clean_key)
+            if clean_key not in seen_state_keys:
+                used_state_keys.append(clean_key)
+                seen_state_keys.add(clean_key)
     
     return used_action_keys, used_state_keys
 
@@ -2631,13 +2635,21 @@ class LeRobotMixtureDataset(Dataset):
         statistics_data = {}
         
         # Collect actually used keys from all datasets
-        all_used_action_keys = set()
-        all_used_state_keys = set()
+        all_used_action_keys = []
+        all_used_state_keys = []
+        seen_action_keys = set()
+        seen_state_keys = set()
         
         for dataset in self.datasets:
             used_action_keys, used_state_keys = get_used_modality_keys(dataset.modality_keys)
-            all_used_action_keys.update(used_action_keys)
-            all_used_state_keys.update(used_state_keys)
+            for key in used_action_keys:
+                if key not in seen_action_keys:
+                    all_used_action_keys.append(key)
+                    seen_action_keys.add(key)
+            for key in used_state_keys:
+                if key not in seen_state_keys:
+                    all_used_state_keys.append(key)
+                    seen_state_keys.add(key)
         
         # Organize statistics by tag
         for tag, merged_metadata in self.merged_metadata.items():
