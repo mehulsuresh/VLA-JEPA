@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# GCE startup/bootstrap script for Debian 12 A2 Ultra training nodes.
+# GCE startup/bootstrap script for Debian 12/13 A2 Ultra training nodes.
 # It installs host runtime tools, NVIDIA drivers, stripes local SSDs into one
 # ext4 RAID0 volume, and leaves a /data symlink for datasets, checkpoints,
 # logs, and temp files.
@@ -21,6 +21,7 @@ exec > >(tee -a "$LOG_FILE") 2>&1
 
 MOUNT_POINT="${MOUNT_POINT:-/mnt/disks/ssd-array}"
 DATA_LINK="${DATA_LINK:-/data}"
+VLA_JEPA_SCRATCH_LINK="${VLA_JEPA_SCRATCH_LINK:-/mnt/vla-jepa}"
 RAID_DEVICE="${RAID_DEVICE:-/dev/md0}"
 RAID_CHUNK="${RAID_CHUNK:-1024K}"
 LOCAL_SSD_GLOB="${LOCAL_SSD_GLOB:-/dev/disk/by-id/google-local-nvme-ssd-*}"
@@ -31,6 +32,8 @@ CUDA_INSTALLER_URL="${CUDA_INSTALLER_URL:-https://storage.googleapis.com/compute
 
 INSTALL_DOCKER="${INSTALL_DOCKER:-1}"
 INSTALL_NVIDIA_CONTAINER_TOOLKIT="${INSTALL_NVIDIA_CONTAINER_TOOLKIT:-1}"
+CONFIGURE_DOCKER_DATA_ROOT="${CONFIGURE_DOCKER_DATA_ROOT:-1}"
+DOCKER_DATA_ROOT="${DOCKER_DATA_ROOT:-${VLA_JEPA_SCRATCH_LINK}/docker}"
 INSTALL_GIT="${INSTALL_GIT:-1}"
 INSTALL_RIPGREP="${INSTALL_RIPGREP:-1}"
 DOCKER_USERS="${DOCKER_USERS:-}"
@@ -72,6 +75,9 @@ install_host_runtime_tools() {
   if [[ "$INSTALL_DOCKER" == "1" ]]; then
     packages+=(docker.io)
   fi
+  if [[ "$INSTALL_DOCKER" == "1" || "$INSTALL_GPU_DRIVER" == "1" ]]; then
+    packages+=(python3)
+  fi
   if [[ "$INSTALL_GIT" == "1" ]]; then
     packages+=(git)
   fi
@@ -81,6 +87,14 @@ install_host_runtime_tools() {
 
   if [[ "${#packages[@]}" -gt 0 ]]; then
     install_packages "${packages[@]}"
+  fi
+
+  # Debian 13/trixie ships the daemon and client as separate packages.
+  if [[ "$INSTALL_DOCKER" == "1" ]] && ! command -v docker >/dev/null 2>&1; then
+    apt_update_once
+    if ! apt-cache policy docker-cli | grep -q 'Candidate: (none)'; then
+      install_packages docker-cli
+    fi
   fi
 
   if [[ "$INSTALL_DOCKER" == "1" ]] && command -v docker >/dev/null 2>&1; then
@@ -212,6 +226,86 @@ export TORCH_HOME="${DATA_LINK}/.cache/torch"
 EOF
 
   log "Storage ready: $(df -hT "$MOUNT_POINT" | tail -1)"
+}
+
+setup_vla_jepa_scratch() {
+  if [[ ! -d "$MOUNT_POINT" ]]; then
+    log "${MOUNT_POINT} is not available; skipping VLA-JEPA scratch layout"
+    return 0
+  fi
+
+  local scratch_root="${MOUNT_POINT}/vla-jepa"
+  log "Setting up VLA-JEPA scratch layout at ${scratch_root}"
+  install -d -m 0777 \
+    "$scratch_root/src" \
+    "$scratch_root/datasets" \
+    "$scratch_root/checkpoints" \
+    "$scratch_root/logs" \
+    "$scratch_root/hf" \
+    "$scratch_root/cache" \
+    "$scratch_root/cache/pip" \
+    "$scratch_root/gcloud-config"
+  install -d -m 1777 "$scratch_root/tmp"
+
+  if [[ -L "$VLA_JEPA_SCRATCH_LINK" ]]; then
+    ln -sfn "$scratch_root" "$VLA_JEPA_SCRATCH_LINK"
+  elif [[ ! -e "$VLA_JEPA_SCRATCH_LINK" ]]; then
+    ln -s "$scratch_root" "$VLA_JEPA_SCRATCH_LINK"
+  elif [[ -d "$VLA_JEPA_SCRATCH_LINK" ]] && [[ -z "$(find "$VLA_JEPA_SCRATCH_LINK" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
+    rmdir "$VLA_JEPA_SCRATCH_LINK"
+    ln -s "$scratch_root" "$VLA_JEPA_SCRATCH_LINK"
+  else
+    log "${VLA_JEPA_SCRATCH_LINK} already exists and is not an empty directory or symlink; leaving it untouched"
+  fi
+
+  cat >/etc/profile.d/vla-jepa-scratch.sh <<EOF
+export VLA_JEPA_SCRATCH="${VLA_JEPA_SCRATCH_LINK}"
+export HF_HOME="${VLA_JEPA_SCRATCH_LINK}/hf"
+export PIP_CACHE_DIR="${VLA_JEPA_SCRATCH_LINK}/cache/pip"
+export TMPDIR="${VLA_JEPA_SCRATCH_LINK}/tmp"
+EOF
+
+  log "VLA-JEPA scratch ready: $(df -hT "$scratch_root" | tail -1)"
+}
+
+configure_docker_data_root() {
+  if [[ "$INSTALL_DOCKER" != "1" || "$CONFIGURE_DOCKER_DATA_ROOT" != "1" ]]; then
+    return 0
+  fi
+
+  if ! command -v docker >/dev/null 2>&1; then
+    log "Docker CLI is not installed; skipping Docker data-root configuration"
+    return 0
+  fi
+
+  mkdir -p "$DOCKER_DATA_ROOT" /etc/docker
+
+  local current_root="" current_root_real="" docker_data_root_real=""
+  current_root="$(docker info --format '{{.DockerRootDir}}' 2>/dev/null || true)"
+  docker_data_root_real="$(readlink -f "$DOCKER_DATA_ROOT" 2>/dev/null || printf '%s' "$DOCKER_DATA_ROOT")"
+  if [[ -n "$current_root" ]]; then
+    current_root_real="$(readlink -f "$current_root" 2>/dev/null || printf '%s' "$current_root")"
+  fi
+  if [[ -n "$current_root" && "$current_root_real" == "$docker_data_root_real" ]]; then
+    log "Docker data-root is already ${DOCKER_DATA_ROOT}"
+    return 0
+  fi
+
+  log "Configuring Docker data-root at ${DOCKER_DATA_ROOT}"
+  DOCKER_DATA_ROOT="$DOCKER_DATA_ROOT" python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+
+path = Path("/etc/docker/daemon.json")
+try:
+    data = json.loads(path.read_text()) if path.exists() else {}
+except json.JSONDecodeError:
+    data = {}
+data["data-root"] = os.environ["DOCKER_DATA_ROOT"]
+path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+PY
+  systemctl restart docker.service || systemctl start docker.service || true
 }
 
 gpu_driver_is_ready() {
@@ -352,6 +446,8 @@ main() {
   log "Starting training-node bootstrap"
   install_host_runtime_tools
   setup_local_ssd_raid
+  setup_vla_jepa_scratch
+  configure_docker_data_root
   install_gpu_driver
   configure_nvidia_runtime
   configure_docker_gpu_runtime

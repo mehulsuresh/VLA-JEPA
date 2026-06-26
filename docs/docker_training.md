@@ -42,6 +42,24 @@ If you explicitly want FlashAttention for an H100-only image:
 INSTALL_FLASH_ATTN=1 FLASH_ATTN_SPEC=flash-attn IMAGE=vla-jepa:h100-fa ./scripts/docker_build_training.sh
 ```
 
+## Fresh A2/A100 Node Bootstrap
+
+On a new GCP A2/A100 training VM, run the host bootstrap before cloning data or
+building images:
+
+```bash
+sudo DOCKER_USERS="$USER" \
+  /path/to/VLA-JEPA/deployment/gcp/startup-a2-training-node.sh
+```
+
+The bootstrap is idempotent and may request a reboot while installing the GPU
+driver. Re-run it after reboot. It stripes the local NVMe SSDs into
+`/mnt/disks/ssd-array`, creates `/data`, creates the VLA-JEPA scratch layout at
+`/mnt/vla-jepa`, installs Docker plus the NVIDIA container runtime, and moves
+Docker's `data-root` to `/mnt/vla-jepa/docker`. Keeping Docker on the SSD array
+matters because the default root disk on these instances is usually too small
+for CUDA/PyTorch image layers.
+
 ## Preflight
 
 Run this before a long training job:

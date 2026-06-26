@@ -118,8 +118,8 @@ datasets:
   vla_data:
     dataset_py: lerobot_datasets
     data_root_dir: /mnt/vla-jepa/datasets/LeRobot
-    data_mix: libero_plus
-    lerobot_version: v3.0
+    data_mix: libero_plus_4suite
+    lerobot_version: null
     action_type: delta_qpos
     CoT_prompt: "Your task is {instruction}. Use the robot observations and state to produce the corresponding policy actions. {state}{e_actions}{actions}{geometry}"
     resolution_size: 224

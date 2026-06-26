@@ -28,6 +28,8 @@ import copy
 import hashlib
 import json
 import os
+import sys
+import time
 from collections import defaultdict
 from functools import lru_cache
 from pathlib import Path
@@ -1813,6 +1815,7 @@ class LeRobotMixtureDataset(Dataset):
             balance_trajectory_weights (bool): If True, sample trajectories within a dataset weighted by their length; otherwise, use equal weighting.
             seed (int): Random seed for sampling.
         """
+        metadata_config = metadata_config or {}
         datasets: list[LeRobotSingleDataset] = []
         dataset_sampling_weights: list[float] = []
         for dataset, weight in data_mixture:
@@ -1838,6 +1841,26 @@ class LeRobotMixtureDataset(Dataset):
         self.video_target_shift_steps = max(int(video_target_shift_steps), 0)
         self.gpu_video_decode_on_rank = bool(gpu_video_decode_on_rank)
         self.cpu_video_decode_drop_worker_images = bool(cpu_video_decode_drop_worker_images)
+        timing_env = str(os.environ.get("STARVLA_DATASET_TIMING", "0")).lower()
+        self.dataset_timing_enabled = timing_env in {"1", "true", "yes", "on"} or bool(
+            metadata_config.get("dataset_timing_logging", False)
+        )
+        self.dataset_timing_every = max(
+            1,
+            int(
+                os.environ.get(
+                    "STARVLA_DATASET_TIMING_EVERY",
+                    metadata_config.get("dataset_timing_every", 200),
+                )
+            ),
+        )
+        self.dataset_timing_slow_threshold = float(
+            os.environ.get(
+                "STARVLA_DATASET_TIMING_SLOW_SECONDS",
+                metadata_config.get("dataset_timing_slow_seconds", 2.0),
+            )
+        )
+        self._dataset_timing_counter = 0
 
         # Set properties for sampling
 
@@ -1913,7 +1936,53 @@ class LeRobotMixtureDataset(Dataset):
     def __setstate__(self, state):
         state.setdefault("gpu_video_decode_on_rank", False)
         state.setdefault("cpu_video_decode_drop_worker_images", False)
+        state.setdefault("dataset_timing_enabled", False)
+        state.setdefault("dataset_timing_every", 200)
+        state.setdefault("dataset_timing_slow_threshold", 2.0)
+        state.setdefault("_dataset_timing_counter", 0)
         self.__dict__.update(state)
+
+    def _log_dataset_timing(
+        self,
+        *,
+        original_index: int,
+        final_index: int,
+        attempts: int,
+        dataset: LeRobotSingleDataset,
+        trajectory_name: int,
+        step: int,
+        timings: dict[str, float],
+    ) -> None:
+        if not self.dataset_timing_enabled:
+            return
+        self._dataset_timing_counter += 1
+        total_time = float(timings.get("total", 0.0))
+        should_log = (
+            self._dataset_timing_counter % self.dataset_timing_every == 0
+            or total_time >= self.dataset_timing_slow_threshold
+            or attempts > 1
+        )
+        if not should_log:
+            return
+
+        try:
+            worker_info = torch.utils.data.get_worker_info()
+            worker_id = worker_info.id if worker_info is not None else "main"
+        except Exception:
+            worker_id = "unknown"
+        timing_parts = " ".join(
+            f"{key}={float(value):.4f}s"
+            for key, value in sorted(timings.items())
+            if isinstance(value, (int, float, np.floating))
+        )
+        print(
+            "[dataset_timing] "
+            f"pid={os.getpid()} worker={worker_id} original_index={original_index} "
+            f"final_index={final_index} attempts={attempts} dataset={dataset.dataset_name} "
+            f"trajectory={trajectory_name} step={step} {timing_parts}",
+            file=sys.stderr,
+            flush=True,
+        )
 
     @property
     def dataset_lengths(self) -> np.ndarray:
@@ -2115,10 +2184,21 @@ class LeRobotMixtureDataset(Dataset):
         """
         max_retries = 10
         last_exception = None
+        original_index = index
         
         for attempt in range(max_retries):
             try:
+                attempt_start = time.perf_counter()
+                timings = {
+                    "sample_step": 0.0,
+                    "data_fetch_transform": 0.0,
+                    "video_or_spec": 0.0,
+                    "pack_action_state": 0.0,
+                    "labels": 0.0,
+                }
+                sample_start = time.perf_counter()
                 dataset, trajectory_name, step = self.sample_step(index)
+                timings["sample_step"] = time.perf_counter() - sample_start
                 compact_video_mode = self.video_target_shift_steps > 0
                 build_worker_images = not (
                     (not self.gpu_video_decode_on_rank)
@@ -2131,11 +2211,14 @@ class LeRobotMixtureDataset(Dataset):
                         modality for modality in ("state", "action", "language")
                         if modality in dataset.modality_keys
                     ]
+                    data_start = time.perf_counter()
                     data = apply_transforms_for_present_keys(
                         dataset.transforms,
                         dataset.get_step_data(trajectory_name, step, modalities=non_video_modalities),
                     )
+                    timings["data_fetch_transform"] += time.perf_counter() - data_start
                     images = []
+                    video_start = time.perf_counter()
                     if compact_video_mode:
                         video_horizon = len(dataset.delta_indices[dataset.modality_keys["video"][0]])
                         context_horizon = video_horizon - self.video_target_shift_steps
@@ -2157,16 +2240,20 @@ class LeRobotMixtureDataset(Dataset):
                             step,
                         )
                     videos = []
+                    timings["video_or_spec"] += time.perf_counter() - video_start
                 elif compact_video_mode:
                     non_video_modalities = [
                         modality for modality in ("state", "action", "language")
                         if modality in dataset.modality_keys
                     ]
+                    data_start = time.perf_counter()
                     data = apply_transforms_for_present_keys(
                         dataset.transforms,
                         dataset.get_step_data(trajectory_name, step, modalities=non_video_modalities),
                     )
+                    timings["data_fetch_transform"] += time.perf_counter() - data_start
                     video_horizon = len(dataset.delta_indices[dataset.modality_keys["video"][0]])
+                    video_start = time.perf_counter()
                     videos, images = self._build_shifted_video_views(
                         dataset,
                         trajectory_name,
@@ -2174,9 +2261,13 @@ class LeRobotMixtureDataset(Dataset):
                         video_horizon=video_horizon,
                         build_images=build_worker_images,
                     )
+                    timings["video_or_spec"] += time.perf_counter() - video_start
                 else:
+                    data_start = time.perf_counter()
                     data = dataset.transforms(dataset.get_step_data(trajectory_name, step))    # video T = 1, action T = horizon
+                    timings["data_fetch_transform"] += time.perf_counter() - data_start
                     videos, images = [], []
+                    video_start = time.perf_counter()
                     for video_key in dataset.modality_keys["video"]:
                         video = data[video_key] # Shape: (T, H, W, C)
                         video = self.resize_video_opencv(video, self.video_resolution_size)
@@ -2184,7 +2275,9 @@ class LeRobotMixtureDataset(Dataset):
                         if build_worker_images:
                             primary_image = Image.fromarray(video[0]).resize((self.resolution_size, self.resolution_size))
                             images.append(primary_image)
+                    timings["video_or_spec"] += time.perf_counter() - video_start
 
+                pack_start = time.perf_counter()
                 if not self.gpu_video_decode_on_rank:
                     if len(dataset.modality_keys["video"]) == 1:
                         videos = [videos[0], videos[0].copy()]  # Duplicate if only one video
@@ -2224,7 +2317,9 @@ class LeRobotMixtureDataset(Dataset):
                         state.append(data[state_key])
                     state = np.concatenate(state, axis=1).astype(np.float16)
                     return_dict["state"] = state[0:1]
+                timings["pack_action_state"] += time.perf_counter() - pack_start
 
+                label_start = time.perf_counter()
                 if dataset.curr_traj_data is not None and step < len(dataset.curr_traj_data):
                     label_row = dataset.curr_traj_data.iloc[step]
                     for label_key in (
@@ -2331,13 +2426,23 @@ class LeRobotMixtureDataset(Dataset):
                         return_dict["rabc_stage_progress"] = current_stage_progress
                         return_dict["rabc_future_stage_progress"] = future_stage_progress
                         return_dict["rabc_progress_delta"] = future_stage_progress - current_stage_progress
+                timings["labels"] += time.perf_counter() - label_start
                 #print(videos[0].shape) #[horizon, H, W, 3]
                 #print(action.shape) #[horizon, action_dim]
                 #print(images[0]) #PIL.Image
                 #print(len(images))# len(dataset.modality_keys["video"])
                 #print(language)
                 #exit()
-                
+                timings["total"] = time.perf_counter() - attempt_start
+                self._log_dataset_timing(
+                    original_index=original_index,
+                    final_index=index,
+                    attempts=attempt + 1,
+                    dataset=dataset,
+                    trajectory_name=trajectory_name,
+                    step=step,
+                    timings=timings,
+                )
                 return return_dict
                 
             except Exception as e:

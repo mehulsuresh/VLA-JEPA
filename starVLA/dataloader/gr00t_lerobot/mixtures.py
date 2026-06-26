@@ -24,6 +24,13 @@ DATASET_NAMED_MIXTURES = {
         ("libero_plus", 1.0, "libero_franka", "v3.0"),
     ],
 
+    "libero_plus_4suite": [
+        ("libero_plus_10", 1.0, "libero_franka"),
+        ("libero_plus_goal", 1.0, "libero_franka"),
+        ("libero_plus_object", 1.0, "libero_franka"),
+        ("libero_plus_spatial", 1.0, "libero_franka"),
+    ],
+
     "droid": [
         ("", 1.0, "libero_franka"),
     ],

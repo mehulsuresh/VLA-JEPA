@@ -1123,6 +1123,25 @@ class VLATrainer(TrainerUtils):
         self._rank_video_prefetcher: Optional[_RankVideoBatchPrefetcher] = None
         self._prefetch_model = None
         self._last_prefetch_timing: Optional[dict] = None
+        self._rank_timing_keys = (
+            ("data_time", "data"),
+            ("model_time", "model"),
+            ("wall_step_time", "wall"),
+            ("raw_batch_fetch_time", "fetch"),
+            ("video_tensor_to_cuda_time", "to_cuda"),
+            ("video_decode_time", "decode"),
+            ("video_postprocess_time", "post"),
+            ("qwen_tensor_build_time", "qwen"),
+            ("qwen_forward_time", "qfwd"),
+            ("depth_teacher_time", "depth"),
+            ("vj_encode_time", "vj"),
+            ("predictor_action_head_time", "head"),
+            ("forward_time", "fwd"),
+            ("backward_only_time", "back"),
+            ("grad_clip_time", "clip"),
+            ("optimizer_step_time", "opt"),
+            ("backward_optimizer_time", "bwd"),
+        )
 
     @staticmethod
     def _format_duration(seconds: Optional[float]) -> str:
@@ -1146,6 +1165,100 @@ class VLATrainer(TrainerUtils):
 
     def _runtime_timing_enabled(self) -> bool:
         return bool(self.config.datasets.vla_data.get("runtime_timing_logging", False))
+
+    def _detailed_timing_enabled(self) -> bool:
+        env_value = str(os.environ.get("STARVLA_DETAILED_TIMING", "0")).lower()
+        return bool(self.config.trainer.get("detailed_timing_logging", False)) or env_value in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+
+    def _detailed_timing_frequency(self) -> int:
+        env_value = os.environ.get("STARVLA_DETAILED_TIMING_FREQUENCY")
+        if env_value is not None:
+            try:
+                return max(1, int(env_value))
+            except ValueError:
+                pass
+        default_frequency = int(self.config.trainer.get("logging_frequency", 1) or 1)
+        return max(1, int(self.config.trainer.get("detailed_timing_frequency", default_frequency)))
+
+    def _collect_rank_timing_stats(self, step_metrics: dict) -> dict[str, dict[str, float]] | None:
+        if not self._detailed_timing_enabled():
+            return None
+
+        local_values = []
+        for metric_key, _ in self._rank_timing_keys:
+            metric_value = self._to_scalar(step_metrics.get(metric_key))
+            local_values.append(float("nan") if metric_value is None else float(metric_value))
+
+        timing_tensor = torch.tensor(local_values, device=self.accelerator.device, dtype=torch.float32)
+        if dist.is_available() and dist.is_initialized():
+            gathered = [torch.empty_like(timing_tensor) for _ in range(dist.get_world_size())]
+            dist.all_gather(gathered, timing_tensor)
+            timing_matrix = torch.stack(gathered, dim=0).detach().cpu().numpy()
+        else:
+            timing_matrix = timing_tensor.detach().cpu().numpy()[None, :]
+
+        stats: dict[str, dict[str, float]] = {}
+        for column_idx, (_, label) in enumerate(self._rank_timing_keys):
+            values = timing_matrix[:, column_idx]
+            valid_mask = np.isfinite(values)
+            if not valid_mask.any():
+                continue
+            valid_values = values[valid_mask]
+            valid_ranks = np.nonzero(valid_mask)[0]
+            max_pos = int(np.argmax(valid_values))
+            min_pos = int(np.argmin(valid_values))
+            stats[label] = {
+                "min": float(valid_values[min_pos]),
+                "mean": float(valid_values.mean()),
+                "max": float(valid_values[max_pos]),
+                "max_rank": int(valid_ranks[max_pos]),
+            }
+        return stats
+
+    def _log_rank_timing_stats(self, timing_stats: dict[str, dict[str, float]]) -> None:
+        if not timing_stats or not self.accelerator.is_main_process:
+            return
+        primary_labels = (
+            "wall",
+            "data",
+            "model",
+            "fwd",
+            "back",
+            "clip",
+            "opt",
+            "qfwd",
+            "vj",
+            "depth",
+            "head",
+        )
+        parts = []
+        slowest_label = None
+        slowest_max = -1.0
+        slowest_rank = 0
+        for label in primary_labels:
+            stats = timing_stats.get(label)
+            if not stats:
+                continue
+            parts.append(
+                f"{label}=max {stats['max']:.3f}s@r{stats['max_rank']} "
+                f"mean {stats['mean']:.3f}s min {stats['min']:.3f}s"
+            )
+            if stats["max"] > slowest_max:
+                slowest_label = label
+                slowest_max = stats["max"]
+                slowest_rank = int(stats["max_rank"])
+
+        if parts:
+            logger.info(
+                "[rank_timing] "
+                f"step={self.completed_steps} slowest={slowest_label}@r{slowest_rank}:{slowest_max:.3f}s | "
+                + " | ".join(parts)
+            )
 
     @staticmethod
     def _to_scalar(value):
@@ -1741,6 +1854,12 @@ class VLATrainer(TrainerUtils):
             step_metrics["wall_step_time"] = time.perf_counter() - t_start_step
             if self.accelerator.sync_gradients and self.completed_steps > self.progress_eta_warmup_steps:
                 self._recent_wall_step_times.append(step_metrics["wall_step_time"])
+            if (
+                self.accelerator.sync_gradients
+                and self.completed_steps > 0
+                and self.completed_steps % self._detailed_timing_frequency() == 0
+            ):
+                self._log_rank_timing_stats(self._collect_rank_timing_stats(step_metrics) or {})
 
             if self.accelerator.is_local_main_process:
                 eta_seconds = self._estimate_remaining_seconds()
