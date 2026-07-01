@@ -64,3 +64,10 @@ pytest
 # requests
 # tqdm
 # torchcodec
+
+# Optional Qwen3.5 fast linear-attention inference/training kernels.
+# No Python 3.13 wheels were available on the A100 CUDA 13 image when tested,
+# so install these through docker/Dockerfile.py313 with
+# INSTALL_FAST_LINEAR_ATTN=1 to compile for the target GPU architecture.
+# causal-conv1d
+# flash-linear-attention

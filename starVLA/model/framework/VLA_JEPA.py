@@ -13,6 +13,7 @@ import importlib
 import math
 from collections import OrderedDict
 from pathlib import Path
+from types import SimpleNamespace
 import time
 from typing import List, Optional, Sequence, Tuple
 import torch
@@ -69,6 +70,40 @@ def _clean_vjepa_backbone_key(state_dict):
         key = key.replace("backbone.", "")
         cleaned[key] = value
     return cleaned
+
+
+_KNOWN_TORCHHUB_VJEPA_METADATA = {
+    "vjepa2_1_vit_base_384": {"hidden_size": 768, "image_size": 384, "tubelet_size": 2, "num_heads": 12},
+    "vjepa2_1_vit_large_384": {"hidden_size": 1024, "image_size": 384, "tubelet_size": 2, "num_heads": 16},
+    "vjepa2_1_vit_giant_384": {"hidden_size": 1408, "image_size": 384, "tubelet_size": 2, "num_heads": 16},
+    "vjepa2_vit_large": {"hidden_size": 1024, "image_size": 256, "tubelet_size": 2, "num_heads": 16},
+    "vjepa2_vit_huge": {"hidden_size": 1280, "image_size": 256, "tubelet_size": 2, "num_heads": 16},
+    "vjepa2_vit_giant": {"hidden_size": 1408, "image_size": 256, "tubelet_size": 2, "num_heads": 16},
+    "vjepa2_vit_giant_384": {"hidden_size": 1408, "image_size": 384, "tubelet_size": 2, "num_heads": 16},
+}
+
+
+class _VJEPAMetadataEncoder(nn.Module):
+    """Metadata-only stand-in for eval paths that never call the V-JEPA teacher."""
+
+    def __init__(self, *, hidden_size: int, image_size: int, tubelet_size: int, num_heads: Optional[int] = None):
+        super().__init__()
+        self.config = SimpleNamespace(
+            hidden_size=int(hidden_size),
+            image_size=int(image_size),
+            tubelet_size=int(tubelet_size),
+            num_heads=int(num_heads) if num_heads is not None else None,
+            num_attention_heads=int(num_heads) if num_heads is not None else None,
+        )
+        self.embed_dim = int(hidden_size)
+        self.img_height = int(image_size)
+        self.img_width = int(image_size)
+        self.tubelet_size = int(tubelet_size)
+        self.num_heads = int(num_heads) if num_heads is not None else None
+        self.blocks = nn.ModuleList()
+
+    def forward(self, *args, **kwargs):
+        raise RuntimeError("The V-JEPA teacher encoder was skipped for inference-only policy loading.")
 
 
 @lru_cache(maxsize=64)
@@ -142,6 +177,11 @@ class VLA_JEPA(baseframework):
         """
         super().__init__()
         self.config = config
+        runtime_cfg = self.config.get("runtime", {}) if self.config is not None else {}
+        self.inference_only = bool(runtime_cfg.get("inference_only", False))
+        self.skip_training_backbones = bool(
+            runtime_cfg.get("skip_training_backbones", self.inference_only)
+        )
         self.qwen_vl_interface = get_vlm_model(config=self.config)
         self.qwen_hidden_size = int(self.qwen_vl_interface.model.config.hidden_size)
         self._validate_qwen_hidden_size_config()
@@ -155,9 +195,12 @@ class VLA_JEPA(baseframework):
                 raise ValueError(
                     "VLA_JEPA depth_teacher_aux is query-only. Set `framework.depth_teacher_aux.mode: query` "
                     "or disable the auxiliary path."
-                )
+            )
             self._depth_teacher = MoGeGeometryTeacher(self.depth_teacher_aux_cfg, logger=logger)
-            self._depth_teacher.initialize(self._get_qwen_device())
+            if self.skip_training_backbones:
+                logger.info("Skipping MoGe geometry teacher weight load for inference-only policy path")
+            else:
+                self._depth_teacher.initialize(self._get_qwen_device())
             teacher_feature_dim = self._depth_teacher.feature_dim()
             configured_feature_dim = self.depth_teacher_aux_cfg.get("teacher_feature_dim", "auto")
             if not (
@@ -417,6 +460,17 @@ class VLA_JEPA(baseframework):
         return patched
 
     def _load_vjepa_backbone(self, vj_cfg):
+        if self.skip_training_backbones:
+            metadata = self._infer_vjepa_metadata(vj_cfg)
+            logger.info(
+                "Skipping V-JEPA teacher encoder load for inference-only policy path "
+                "(hidden_size=%d, image_size=%d, tubelet_size=%d)",
+                metadata["hidden_size"],
+                metadata["image_size"],
+                metadata["tubelet_size"],
+            )
+            return _VJEPAMetadataEncoder(**metadata), None
+
         source = vj_cfg.get("source", "hf")
         if source == "hf":
             base_encoder = vj_cfg.base_encoder
@@ -518,6 +572,42 @@ class VLA_JEPA(baseframework):
             return encoder, processor
 
         raise ValueError(f"Unsupported V-JEPA source: {source}")
+
+    def _infer_vjepa_metadata(self, vj_cfg) -> dict:
+        def _cfg_int(*keys, default=None):
+            for key in keys:
+                value = vj_cfg.get(key, None)
+                if value is not None:
+                    return int(value)
+            return default
+
+        model_name = str(vj_cfg.get("hub_model_name", vj_cfg.get("base_encoder", ""))).rstrip("/")
+        model_name = Path(model_name).name if model_name else model_name
+        known = dict(_KNOWN_TORCHHUB_VJEPA_METADATA.get(model_name, {}))
+
+        hidden_size = _cfg_int("hidden_size", "embed_dim", default=known.get("hidden_size"))
+        image_size = _cfg_int(
+            "image_size",
+            "img_size",
+            "crop_size",
+            default=known.get("image_size"),
+        )
+        tubelet_size = _cfg_int("tubelet_size", default=known.get("tubelet_size", 2))
+        num_heads = _cfg_int("num_attention_heads", "encoder_num_heads", default=known.get("num_heads"))
+
+        if hidden_size is None or image_size is None or tubelet_size is None:
+            raise ValueError(
+                "Inference-only V-JEPA loading requires encoder metadata. Set "
+                "`framework.vj2_model.hidden_size`, `image_size`, and `tubelet_size`, or use a known "
+                f"V-JEPA torchhub model. Could not infer metadata for `{model_name}`."
+            )
+
+        return {
+            "hidden_size": int(hidden_size),
+            "image_size": int(image_size),
+            "tubelet_size": int(tubelet_size),
+            "num_heads": int(num_heads) if num_heads is not None else None,
+        }
 
     def _get_vjepa_attr(self, key: str):
         if hasattr(self.vj_encoder, "config") and hasattr(self.vj_encoder.config, key):
@@ -952,7 +1042,36 @@ class VLA_JEPA(baseframework):
         )
         return gathered.reshape(batch_size * num_views, per_view_tokens, last_hidden.shape[-1]), token_grid_hw
 
-    def _last_frames_for_depth_teacher(
+    def _current_observation_frame_index(self, total_frames: int) -> int:
+        shift = int(self.config.datasets.vla_data.get("video_target_shift_steps", 0))
+        return int(total_frames) - 1 if shift > 0 else 0
+
+    def _resolve_video_frame_index(self, raw_index, total_frames: int) -> int:
+        if raw_index is None:
+            raw_index = "current"
+        if isinstance(raw_index, str):
+            normalized = raw_index.strip().lower()
+            if normalized in {"auto", "current", "observation"}:
+                frame_index = self._current_observation_frame_index(total_frames)
+            elif normalized == "first":
+                frame_index = 0
+            elif normalized == "last":
+                frame_index = -1
+            else:
+                frame_index = int(normalized)
+        else:
+            frame_index = int(raw_index)
+
+        if frame_index < 0:
+            frame_index = int(total_frames) + frame_index
+        if frame_index < 0 or frame_index >= int(total_frames):
+            raise ValueError(
+                f"video frame index {raw_index!r} resolves to {frame_index}, "
+                f"but the training video clip has {total_frames} frames."
+            )
+        return frame_index
+
+    def _frames_for_depth_teacher(
         self,
         batch_videos: np.ndarray | torch.Tensor,
         *,
@@ -961,10 +1080,15 @@ class VLA_JEPA(baseframework):
         # The teacher follows the fixed V-JEPA view tensor. When Qwen sees a
         # different set of real views, qwen_selected_view_indices maps its image
         # tokens back onto these V-JEPA views before the auxiliary loss.
+        raw_index = self.depth_teacher_aux_cfg.get(
+            "teacher_frame_index",
+            self.depth_teacher_aux_cfg.get("target_frame_index", "observation"),
+        )
+        frame_index = self._resolve_video_frame_index(raw_index, int(batch_videos.shape[2]))
         if isinstance(batch_videos, np.ndarray):
-            frames = torch.from_numpy(np.ascontiguousarray(batch_videos[:, :, -1]))
+            frames = torch.from_numpy(np.ascontiguousarray(batch_videos[:, :, frame_index]))
         else:
-            frames = batch_videos[:, :, -1]
+            frames = batch_videos[:, :, frame_index]
         B, V, C, H, W = frames.shape
         frames = frames.reshape(B * V, C, H, W)
         return frames.to(device=device, dtype=torch.float32, non_blocking=True)
@@ -1014,7 +1138,7 @@ class VLA_JEPA(baseframework):
         prediction_context = torch.cat([image_tokens, geometry_tokens], dim=1)
         predictions = self.depth_teacher_aux_head(prediction_context)
 
-        teacher_frames = self._last_frames_for_depth_teacher(batch_videos, device=predictions.device)
+        teacher_frames = self._frames_for_depth_teacher(batch_videos, device=predictions.device)
         teacher_output = self._depth_teacher.infer_features(teacher_frames)
         loss, metrics = query_feature_distillation_loss(
             predictions,
@@ -1608,6 +1732,10 @@ class VLA_JEPA(baseframework):
             }
         return qwen_inputs
 
+    def _qwen_observation_frame_index(self, total_frames: int) -> int:
+        raw_index = self.config.datasets.vla_data.get("qwen_observation_frame_index", "current")
+        return self._resolve_video_frame_index(raw_index, total_frames)
+
     def _build_qwen_inputs_from_video_tensor(
         self,
         batch_videos: np.ndarray | torch.Tensor,
@@ -1620,10 +1748,11 @@ class VLA_JEPA(baseframework):
         return_timing: bool = False,
     ) -> dict[str, torch.Tensor] | tuple[dict[str, torch.Tensor], dict[str, float]]:
         qwen_device = self._get_qwen_device()
+        qwen_frame_index = self._qwen_observation_frame_index(int(batch_videos.shape[2]))
         if isinstance(batch_videos, np.ndarray):
-            frames = torch.from_numpy(np.ascontiguousarray(batch_videos[:, :, -1]))
+            frames = torch.from_numpy(np.ascontiguousarray(batch_videos[:, :, qwen_frame_index]))
         else:
-            frames = batch_videos[:, :, -1]
+            frames = batch_videos[:, :, qwen_frame_index]
 
         to_cuda_start = time.perf_counter()
         frames = frames.to(qwen_device, dtype=torch.float32, non_blocking=True)
@@ -2884,6 +3013,9 @@ class VLA_JEPA(baseframework):
         prev_actions = kwargs.get("prev_actions")
         prefix_len = int(kwargs.get("prefix_len", 0) or 0)
         rtc_config = kwargs.get("rtc_config")
+        num_inference_timesteps = kwargs.get("num_inference_timesteps", kwargs.get("num_ddim_steps"))
+        if num_inference_timesteps is not None:
+            num_inference_timesteps = int(num_inference_timesteps)
         if prev_actions is not None:
             if isinstance(prev_actions, torch.Tensor):
                 prev_actions = prev_actions.to(last_hidden.device, dtype=torch.float32, non_blocking=True)
@@ -2900,6 +3032,7 @@ class VLA_JEPA(baseframework):
                 prev_actions=prev_actions,
                 prefix_len=prefix_len,
                 rtc_config=rtc_config,
+                num_inference_timesteps=num_inference_timesteps,
             )
 
         normalized_actions = pred_actions.float().detach().cpu().numpy()

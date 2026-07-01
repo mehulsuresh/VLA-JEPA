@@ -84,14 +84,16 @@ def _infer_norm_mode_hints(policy) -> dict[str, Any]:
 
 
 def resolve_policy_checkpoint(checkpoint_path: str | Path) -> Path:
-    """Resolve a user-supplied checkpoint path to a loadable `.pt` artifact."""
+    """Resolve a user-supplied checkpoint path to a loadable model artifact."""
     raw_path = Path(checkpoint_path).expanduser().resolve()
+    supported_suffixes = {".pt", ".safetensors"}
 
     if raw_path.is_file():
-        if raw_path.suffix != ".pt":
+        if raw_path.suffix not in supported_suffixes:
             raise ValueError(
-                f"Expected a `.pt` policy artifact, but got `{raw_path}`. "
-                "Pass `final_model/`, the run root, or a `pytorch_model.pt` file."
+                f"Expected a `.pt` or `.safetensors` policy artifact, but got `{raw_path}`. "
+                "Pass `final_model/`, an interval checkpoint directory, the run root, "
+                "or a concrete model artifact."
             )
         return raw_path
 
@@ -100,7 +102,9 @@ def resolve_policy_checkpoint(checkpoint_path: str | Path) -> Path:
 
     candidates = [
         raw_path / "pytorch_model.pt",
+        raw_path / "model.safetensors",
         raw_path / "final_model" / "pytorch_model.pt",
+        raw_path / "final_model" / "model.safetensors",
     ]
 
     recursive_hits = sorted(
@@ -112,25 +116,23 @@ def resolve_policy_checkpoint(checkpoint_path: str | Path) -> Path:
         if hit not in candidates:
             candidates.append(hit)
 
-    for candidate in candidates:
-        if candidate.is_file():
-            return candidate
-
     safetensor_hits = sorted(
         path
         for path in raw_path.glob("**/model.safetensors")
         if len(path.relative_to(raw_path).parts) <= 3
     )
-    if safetensor_hits:
-        raise FileNotFoundError(
-            "Found only `model.safetensors` artifacts under "
-            f"`{raw_path}`. This deployment path expects a plain `pytorch_model.pt` "
-            "file such as `<run_root>/final_model/pytorch_model.pt`."
-        )
+    for hit in safetensor_hits:
+        if hit not in candidates:
+            candidates.append(hit)
+
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
 
     raise FileNotFoundError(
-        f"Could not resolve a `pytorch_model.pt` under `{raw_path}`. "
-        "Pass the run root, `final_model/`, or the concrete `.pt` file."
+        f"Could not resolve a `.pt` or `.safetensors` model artifact under `{raw_path}`. "
+        "Pass the run root, `final_model/`, an interval checkpoint directory, "
+        "or the concrete model artifact."
     )
 
 

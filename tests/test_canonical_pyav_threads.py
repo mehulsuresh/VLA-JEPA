@@ -501,6 +501,10 @@ def test_canonical_sample_context_clamps_action_rows_to_sidecar_length(monkeypat
     assert context["row_base"] == 5
     assert context["action_rows"][-1] == 9
     assert context["action_rows"].max() == 9
+    np.testing.assert_array_equal(
+        context["action_is_pad"],
+        np.asarray([False, False, False, False, False] + [True] * 45, dtype=bool),
+    )
 
 
 def test_canonical_getitems_retries_sidecar_tail_window(monkeypatch):

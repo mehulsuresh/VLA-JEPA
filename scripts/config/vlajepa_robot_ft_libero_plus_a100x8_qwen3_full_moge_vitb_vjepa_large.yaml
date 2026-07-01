@@ -47,7 +47,7 @@ framework:
     noise_beta_beta: 1.0
     noise_s: 0.999
     num_timestep_buckets: 1000
-    num_inference_timesteps: 4
+    num_inference_timesteps: 8
     rtc_training:
       enabled: false
       method: prefix
@@ -125,7 +125,8 @@ datasets:
     resolution_size: 224
     video_resolution_size: 384
     video_frame_stride: 1
-    video_target_shift_steps: 0
+    video_target_shift_steps: 2
+    qwen_observation_frame_index: current
     gpu_video_decode_on_rank: false
     cpu_video_decode_drop_worker_images: false
     runtime_timing_logging: true
@@ -147,8 +148,8 @@ datasets:
     shuffle: true
 
 trainer:
-  epochs: 100
-  max_train_steps: 30000
+  epochs: 3
+  max_train_steps: auto
   num_warmup_steps: 3000
   save_interval: 2500
   eval_interval: 2500
@@ -179,7 +180,7 @@ trainer:
   eval_before_train: false
   gradient_clipping: 1.0
   gradient_accumulation_steps: 1
-  repeated_diffusion_steps: 1
+  repeated_diffusion_steps: 8
   find_unused_parameters: false
   ddp_gradient_as_bucket_view: true
   ddp_static_graph: false

@@ -98,6 +98,10 @@ class PreprocessedSubtaskCollator:
                 np.asarray([sample["state"] for sample in batch], dtype=np.float32)
             ),
         }
+        if "action_is_pad" in batch[0]:
+            collated["action_is_pad"] = torch.from_numpy(
+                np.asarray([sample["action_is_pad"] for sample in batch], dtype=bool)
+            )
 
         if "video_compact" in batch[0]:
             compact_videos = np.stack([sample["video_compact"] for sample in batch]).transpose(0, 1, 2, 5, 3, 4)
@@ -400,9 +404,12 @@ class PreprocessedSubtaskVLADataset(Dataset):
             compact_video_views = [compact_video_views[0], compact_video_views[0].copy()]
 
         action_rows = []
+        action_is_pad = []
         for offset in range(self.action_horizon):
-            future_idx = min(row_idx + offset, len(frame_indices) - 1)
+            requested_idx = row_idx + offset
+            future_idx = min(requested_idx, len(frame_indices) - 1)
             action_rows.append(episode["action"][future_idx])
+            action_is_pad.append(requested_idx >= len(frame_indices))
         action = np.stack(action_rows, axis=0).astype(np.float32, copy=False)
         state = episode["state"][row_idx : row_idx + 1].astype(np.float32, copy=False)
 
@@ -439,6 +446,7 @@ class PreprocessedSubtaskVLADataset(Dataset):
             "lang": language,
             "video_compact": np.stack(compact_video_views, axis=0),
             "state": state,
+            "action_is_pad": np.asarray(action_is_pad, dtype=bool),
             "frame_index": current_frame_idx,
             "task_id": current_task,
             "future_task_id": future_task,

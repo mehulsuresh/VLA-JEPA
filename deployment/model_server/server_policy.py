@@ -531,14 +531,20 @@ def main(args) -> None:
     resolved_ckpt_path = resolve_policy_checkpoint(args.ckpt_path)
     logging.info("Loading policy checkpoint from `%s`", resolved_ckpt_path)
 
-    vla = baseframework.from_pretrained(str(resolved_ckpt_path))  # TODO should auto detect framework from model path
-
     if torch.cuda.is_available():
-        device = torch.device(f"cuda:{int(args.cuda)}")
+        device_index = int(args.cuda)
+        torch.cuda.set_device(device_index)
+        device = torch.device(f"cuda:{device_index}")
     else:
         device = torch.device("cpu")
         if args.use_bf16:
             logging.warning("Ignoring --use_bf16 because CUDA is not available")
+
+    vla = baseframework.from_pretrained(
+        str(resolved_ckpt_path),
+        inference_only=not args.load_training_backbones,
+        skip_training_backbones=not args.load_training_backbones,
+    )  # TODO should auto detect framework from model path
 
     if args.use_bf16 and device.type == "cuda":
         vla = vla.to(torch.bfloat16)
@@ -620,6 +626,12 @@ def build_argparser():
     parser.add_argument("--port", type=int, default=10093)
     parser.add_argument("--use_bf16", action="store_true")
     parser.add_argument("--cuda", type=int, default=0)
+    parser.add_argument(
+        "--load_training_backbones",
+        action="store_true",
+        default=env_flag_enabled("POLICY_LOAD_TRAINING_BACKBONES"),
+        help="Load train-only V-JEPA/MoGe backbones. Disabled by default for policy serving/eval.",
+    )
     parser.add_argument(
         "--policy_output_log_path",
         type=str,

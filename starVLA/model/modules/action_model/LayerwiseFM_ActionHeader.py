@@ -404,6 +404,7 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         prev_actions: torch.Tensor = None,
         prefix_len: int = 0,
         rtc_config: dict = None,
+        num_inference_timesteps: int | None = None,
     ) -> torch.Tensor:
         # Set initial actions as the sampled noise.
         batch_size = vl_embs_list[0].shape[0]
@@ -414,7 +415,9 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
             device=device,
         )
 
-        num_steps = self.num_inference_timesteps
+        num_steps = int(num_inference_timesteps or self.num_inference_timesteps)
+        if num_steps <= 0:
+            raise ValueError(f"num_inference_timesteps must be positive, got {num_steps}.")
         dt = 1.0 / num_steps
 
         state_features = self.state_encoder(state) if state is not None else None

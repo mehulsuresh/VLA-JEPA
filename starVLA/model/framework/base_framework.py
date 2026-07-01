@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Dict, List
 from transformers import AutoConfig, AutoModel, PretrainedConfig, PreTrainedModel
 import numpy as np
+from omegaconf import OmegaConf
 from starVLA.model.tools import auto_get_trainable_modules
 
 from starVLA.model.framework.share_tools import read_mode_config
@@ -29,6 +30,20 @@ from starVLA.model.framework.share_tools import dict_to_namespace
 from starVLA.model.framework.__init__ import build_framework
 
 logger = initialize_overwatch(__name__)
+
+
+def _load_checkpoint_state_dict(pretrained_checkpoint: Path):
+    if pretrained_checkpoint.suffix == ".safetensors":
+        try:
+            from safetensors.torch import load_file as load_safetensors_file
+        except ImportError as exc:
+            raise ImportError(
+                "Loading `.safetensors` checkpoints requires the `safetensors` package."
+            ) from exc
+
+        return load_safetensors_file(str(pretrained_checkpoint), device="cpu")
+
+    return torch.load(pretrained_checkpoint, map_location="cpu")
 
 
 # PreTrainedModel, AutoModel, PretrainedConfig,  are so good, find sometime to study them
@@ -70,7 +85,7 @@ class baseframework(PreTrainedModel):
             5. Attach normalization stats for later un-normalization
 
         Args:
-            pretrained_checkpoint: Path to .pt file inside run/checkpoints directory.
+            pretrained_checkpoint: Path to a .pt or .safetensors model artifact.
             **kwargs: Extra constructor overrides passed to subclass.
 
         Returns:
@@ -80,23 +95,66 @@ class baseframework(PreTrainedModel):
             RuntimeError: If state_dict key mismatch occurs under strict=True.
             FileNotFoundError: If underlying files are missing (surfaced earlier).
         """
+        inference_only = bool(kwargs.pop("inference_only", False))
+        skip_training_backbones = bool(kwargs.pop("skip_training_backbones", inference_only))
+        strict = kwargs.pop("strict", None)
+
         pretrained_checkpoint = Path(pretrained_checkpoint)
         model_config, norm_stats = read_mode_config(pretrained_checkpoint)  # read config and norm_stats
 
         config = dict_to_namespace(model_config)
         model_config = config
         model_config.trainer.pretrained_checkpoint = None
+        if inference_only or skip_training_backbones:
+            model_config = OmegaConf.merge(
+                model_config,
+                {
+                    "runtime": {
+                        "inference_only": inference_only,
+                        "skip_training_backbones": skip_training_backbones,
+                    }
+                },
+            )
         # FrameworkModel = cls(config=model_config, **kwargs) # TODO find cls by config
         FrameworkModel = build_framework(cfg=model_config)
         # set for action un-norm
         FrameworkModel.norm_stats = norm_stats
         # Load from Checkpoint (Custom --> should load both *projector* and *llm* weights)
-        model_state_dict = torch.load(pretrained_checkpoint, map_location="cpu")
+        model_state_dict = _load_checkpoint_state_dict(pretrained_checkpoint)
         # logger.info(f"Loading model weights from `{pretrained_checkpoint}`")
         model_keys = set(FrameworkModel.state_dict().keys())
         checkpoint_keys = set(model_state_dict.keys())
+        load_strict = (not inference_only and not skip_training_backbones) if strict is None else bool(strict)
         try:
-            FrameworkModel.load_state_dict(model_state_dict, strict=True)
+            incompatible = FrameworkModel.load_state_dict(model_state_dict, strict=load_strict)
+            if not load_strict:
+                allowed_missing_prefixes = ()
+                allowed_missing_keys = {"qwen_vl_interface.model.lm_head.weight"}
+                allowed_unexpected_prefixes = ("vj_encoder.",)
+                missing_keys = list(getattr(incompatible, "missing_keys", []))
+                unexpected_keys = list(getattr(incompatible, "unexpected_keys", []))
+                disallowed_missing = [
+                    key
+                    for key in missing_keys
+                    if key not in allowed_missing_keys and not key.startswith(allowed_missing_prefixes)
+                ]
+                disallowed_unexpected = [
+                    key for key in unexpected_keys if not key.startswith(allowed_unexpected_prefixes)
+                ]
+                if disallowed_missing or disallowed_unexpected:
+                    if disallowed_missing:
+                        logger.warning(f"Missing keys in state_dict: {disallowed_missing}")
+                    if disallowed_unexpected:
+                        logger.warning(f"Unexpected keys in state_dict: {disallowed_unexpected}")
+                    raise RuntimeError(
+                        "Inference-only checkpoint load saw non-teacher state_dict mismatches. "
+                        "Refusing to continue because policy weights may be incomplete."
+                    )
+                if unexpected_keys:
+                    logger.info(
+                        "Ignored %d V-JEPA teacher encoder checkpoint keys during inference-only load",
+                        len(unexpected_keys),
+                    )
         except RuntimeError as e:
             # must keep all keys matched
             common_keys = model_keys.intersection(checkpoint_keys)

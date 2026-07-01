@@ -54,6 +54,7 @@ def test_preprocessed_dataset_accepts_missing_rabc_labels(tmp_path):
     assert np.isnan(sample["rabc_global_progress_delta"])
     assert np.isnan(sample["rabc_progress_delta"])
     assert sample["action"].shape == (2, 2)
+    assert sample["action_is_pad"].tolist() == [False, False]
     assert sample["state"].shape == (1, 3)
     assert sample["video_compact"].shape == (2, 3, 4, 4, 3)
 
@@ -132,3 +133,34 @@ def test_preprocessed_dataset_appends_task_id_label_to_prompt(tmp_path):
     assert sample["task_id"] == 2
     assert sample["task_id_label"] == "reach hand inside"
     assert sample["lang"] == "Complete the task successfully. | reach hand inside"
+
+
+def test_preprocessed_dataset_marks_clamped_tail_actions_as_pad(tmp_path):
+    _write_episode(tmp_path)
+
+    dataset = PreprocessedSubtaskVLADataset(
+        tmp_path,
+        action_horizon=4,
+        video_horizon=3,
+        video_target_shift_steps=1,
+        resolution_size=4,
+        video_resolution_size=4,
+        current_cameras=["observation.images.cam_high"],
+        frame_cache_size=0,
+    )
+
+    sample = dataset[2]
+
+    np.testing.assert_allclose(
+        sample["action"],
+        np.asarray(
+            [
+                [2.0, 2.1],
+                [2.0, 2.1],
+                [2.0, 2.1],
+                [2.0, 2.1],
+            ],
+            dtype=np.float32,
+        ),
+    )
+    assert sample["action_is_pad"].tolist() == [False, True, True, True]

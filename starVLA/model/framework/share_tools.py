@@ -39,6 +39,19 @@ overwatch = initialize_overwatch(__name__)
 from types import SimpleNamespace
 
 
+_SUPPORTED_CHECKPOINT_SUFFIXES = {".pt", ".safetensors"}
+
+
+def _find_checkpoint_run_dir(checkpoint_pt: Path, config_name: str) -> Path:
+    for candidate in checkpoint_pt.parents:
+        if (candidate / config_name).exists() and (candidate / "dataset_statistics.json").exists():
+            return candidate
+    raise AssertionError(
+        f"Could not find run directory containing `{config_name}` and "
+        f"`dataset_statistics.json` above `{checkpoint_pt}`"
+    )
+
+
 class NamespaceWithGet(SimpleNamespace):
     def get(self, key, default=None):
         """
@@ -225,9 +238,8 @@ def read_model_config(pretrained_checkpoint):
     if os.path.isfile(pretrained_checkpoint):
         overwatch.info(f"Loading from local checkpoint path `{(checkpoint_pt := Path(pretrained_checkpoint))}`")
 
-        # [Validate] Checkpoint Path should look like `.../<RUN_ID>/checkpoints/<CHECKPOINT_PATH>.pt`
-        assert checkpoint_pt.suffix == ".pt"
-        run_dir = checkpoint_pt.parents[1]
+        assert checkpoint_pt.suffix in _SUPPORTED_CHECKPOINT_SUFFIXES
+        run_dir = _find_checkpoint_run_dir(checkpoint_pt, "config.json")
 
         # Get paths for `config.json`, `dataset_statistics.json` and pretrained checkpoint
         config_json, dataset_statistics_json = run_dir / "config.json", run_dir / "dataset_statistics.json"
@@ -263,9 +275,8 @@ def read_mode_config(pretrained_checkpoint):
     if os.path.isfile(pretrained_checkpoint):
         overwatch.info(f"Loading from local checkpoint path `{(checkpoint_pt := Path(pretrained_checkpoint))}`")
 
-        # [Validate] Checkpoint Path should look like `.../<RUN_ID>/checkpoints/<CHECKPOINT_PATH>.pt`
-        assert checkpoint_pt.suffix == ".pt"
-        run_dir = checkpoint_pt.parents[1]
+        assert checkpoint_pt.suffix in _SUPPORTED_CHECKPOINT_SUFFIXES
+        run_dir = _find_checkpoint_run_dir(checkpoint_pt, "config.yaml")
 
         # Get paths for `config.json`, `dataset_statistics.json` and pretrained checkpoint
         config_yaml, dataset_statistics_json = run_dir / "config.yaml", run_dir / "dataset_statistics.json"

@@ -1,0 +1,26 @@
+# Minimal protocol smoke test. This is not a meaningful success-rate eval.
+server:
+  url: "ws://127.0.0.1:8000"
+  timeout: 120
+
+output_dir: "${oc.env:VLA_JEPA_EVAL_OUTPUT,/home/mehul/work/vjepa/eval_videos/harness_libero_plus_tiny}"
+
+benchmarks:
+  - benchmark: "vla_eval.benchmarks.libero_plus.benchmark:LIBEROPlusBenchmark"
+    subname: libero_plus_protocol_tiny
+    episodes_per_task: 1
+    max_tasks: 1
+    max_steps: 20
+    paced: false
+    params:
+      suite: libero_spatial
+      seed: 7
+      num_steps_wait: 10
+      send_wrist_image: true
+      send_state: true
+      quat_no_antipodal: true
+    recording:
+      record_video: false
+      record_step: false
+      video_fps: 10
+      filename_stem: "{suite}_task{task_id:04d}_ep{episode_idx:04d}_{status}"

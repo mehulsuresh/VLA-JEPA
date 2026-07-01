@@ -1,0 +1,25 @@
+# Tiny LIBERO-Plus smoke eval. Keeps videos on so failures can be inspected.
+server:
+  url: "ws://127.0.0.1:8000"
+  timeout: 120
+
+output_dir: "${oc.env:VLA_JEPA_EVAL_OUTPUT,/home/mehul/work/vjepa/eval_videos/harness_libero_plus_smoke}"
+
+benchmarks:
+  - benchmark: "vla_eval.benchmarks.libero_plus.benchmark:LIBEROPlusBenchmark"
+    subname: libero_plus_spatial_smoke
+    episodes_per_task: 1
+    max_tasks: 8
+    paced: false
+    params:
+      suite: libero_spatial
+      seed: 7
+      num_steps_wait: 10
+      send_wrist_image: true
+      send_state: true
+      quat_no_antipodal: true
+    recording:
+      record_video: true
+      record_step: false
+      video_fps: 10
+      filename_stem: "{suite}_task{task_id:04d}_ep{episode_idx:04d}_{status}"

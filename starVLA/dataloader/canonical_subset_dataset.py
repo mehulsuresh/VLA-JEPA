@@ -2272,11 +2272,17 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
                 f"episode_index={window.episode_index} base_index={window.base_index} "
                 f"row_base={row_base} available_rows={available_rows}"
             )
+        action_episode_indices = window.base_index + self._action_offsets
+        action_is_pad = np.logical_or(
+            action_episode_indices < 0,
+            action_episode_indices >= episode.length,
+        )
         action_rows = episode.local_start + np.clip(
-            window.base_index + self._action_offsets,
+            action_episode_indices,
             0,
             episode.length - 1,
         )
+        action_is_pad = np.logical_or(action_is_pad, action_rows >= available_rows)
         action_rows = np.clip(action_rows, 0, available_rows - 1)
         compact_offsets = self._compact_offsets()
         qwen_frame_offset = self._qwen_frame_offset()
@@ -2314,6 +2320,7 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
             "episode": episode,
             "row_base": row_base,
             "action_rows": action_rows,
+            "action_is_pad": action_is_pad.astype(bool, copy=False),
             "video_frames": video_frames,
             "qwen_frame_positions": qwen_frame_positions,
         }
@@ -2328,6 +2335,10 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
         episode = context["episode"]
         row_base = context["row_base"]
         action_rows = context["action_rows"]
+        action_is_pad = np.asarray(
+            context.get("action_is_pad", np.zeros(len(action_rows), dtype=bool)),
+            dtype=bool,
+        )
         window = context.get("window")
         base_index = int(window.base_index) if window is not None else int(row_base - episode.local_start)
         video_cache: dict[str, np.ndarray] = {}
@@ -2372,6 +2383,7 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
             "state": shard_data.state[row_base : row_base + 1].astype(np.float32),
             "action": shard_data.action[action_rows].astype(np.float32),
             "action_mask": shard_data.action_mask[action_rows].astype(bool),
+            "action_is_pad": action_is_pad,
             "lang": self._language_with_subtask(episode.task, subtask_label),
             "dataset_id": shard.dataset_id,
             "episode_index": int(shard_data.episode_index[row_base]),

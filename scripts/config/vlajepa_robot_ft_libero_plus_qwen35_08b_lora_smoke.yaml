@@ -139,6 +139,7 @@ datasets:
     video_resolution_size: 384
     video_frame_stride: 1
     video_target_shift_steps: 0
+    qwen_observation_frame_index: current
     gpu_video_decode_on_rank: false
     cpu_video_decode_drop_worker_images: false
     runtime_timing_logging: true

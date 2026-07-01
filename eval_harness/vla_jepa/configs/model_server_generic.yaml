@@ -1,0 +1,27 @@
+# Generic VLA-JEPA harness server config.
+#
+# Use this as the starting point for non-LIBERO benchmarks. The checkpoint
+# must still be trained for the benchmark's action/state/camera convention.
+script: "eval_harness/vla_jepa/model_server.py"
+args:
+  checkpoint: ""
+  unnorm_key: null
+  action_norm_mode: auto
+  benchmark_profile: raw
+  action_dim: null
+  image_keys: null
+  include_unlisted_images: true
+  state_keys: ["states", "state"]
+  state_dim: null
+  state_fallback_zeros: false
+  preserve_masked_action_dims: false
+  binarize_gripper: false
+  chunk_size: null
+  max_batch_size: 8
+  max_wait_time: 0.05
+  action_ensemble: newest
+  num_ddim_steps: null
+  use_bf16: true
+  cuda: 0
+  send_wrist_image: false
+  send_state: false

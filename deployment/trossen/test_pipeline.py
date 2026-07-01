@@ -32,6 +32,22 @@ class CheckpointResolutionTest(unittest.TestCase):
             ckpt_file.write_bytes(b"test")
             self.assertEqual(resolve_policy_checkpoint(run_root), ckpt_file.resolve())
 
+    def test_resolve_nested_safetensors_checkpoint_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ckpt_dir = Path(tmpdir) / "checkpoints" / "steps_2500"
+            ckpt_file = ckpt_dir / "model.safetensors"
+            ckpt_file.parent.mkdir(parents=True)
+            ckpt_file.write_bytes(b"test")
+            self.assertEqual(resolve_policy_checkpoint(ckpt_dir), ckpt_file.resolve())
+
+    def test_resolve_run_root_safetensors_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            run_root = Path(tmpdir)
+            ckpt_file = run_root / "checkpoints" / "steps_2500" / "model.safetensors"
+            ckpt_file.parent.mkdir(parents=True)
+            ckpt_file.write_bytes(b"test")
+            self.assertEqual(resolve_policy_checkpoint(run_root), ckpt_file.resolve())
+
 
 class TrossenPipelineTest(unittest.TestCase):
     def test_build_policy_payload_shapes(self) -> None:

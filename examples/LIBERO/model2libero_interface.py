@@ -6,6 +6,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from deployment.model_server.tools.websocket_policy_client import WebsocketClientPolicy
+from deployment.model_server.checkpoint_utils import resolve_policy_checkpoint
 
 from examples.SimplerEnv.eval_files.adaptive_ensemble import AdaptiveEnsembler
 from typing import Dict
@@ -13,6 +14,13 @@ import numpy as np
 from pathlib import Path
 
 from starVLA.model.tools import read_mode_config
+
+
+def _resolve_stats_checkpoint(policy_ckpt_path) -> Path:
+    path = Path(policy_ckpt_path)
+    if path.is_file():
+        return path
+    return resolve_policy_checkpoint(path)
 
 
 class M1Inference:
@@ -28,6 +36,7 @@ class M1Inference:
         use_ddim: bool = True,
         num_ddim_steps: int = 10,
         adaptive_ensemble_alpha = 0.1,
+        action_execution_mode: str = "chunk",
         host="0.0.0.0",
         port=10095,
     ) -> None:
@@ -44,7 +53,17 @@ class M1Inference:
         self.horizon = horizon #0
         self.action_ensemble = action_ensemble
         self.adaptive_ensemble_alpha = adaptive_ensemble_alpha
-        self.action_ensemble_horizon = action_ensemble_horizon
+        self.action_execution_mode = action_execution_mode
+        self.action_norm_stats = self.get_action_stats(self.unnorm_key, policy_ckpt_path=policy_ckpt_path)
+        self.action_chunk_size = self.get_action_chunk_size(policy_ckpt_path=policy_ckpt_path)
+        if self.action_execution_mode not in {"chunk", "receding"}:
+            raise ValueError(
+                f"Unsupported action_execution_mode={self.action_execution_mode!r}. "
+                "Expected 'chunk' or 'receding'."
+            )
+        self.action_ensemble_horizon = (
+            self.action_chunk_size if action_ensemble_horizon is None else action_ensemble_horizon
+        )
         self.sticky_action_is_on = False
         self.gripper_action_repeat = 0
         self.sticky_gripper_action = 0.0
@@ -57,9 +76,6 @@ class M1Inference:
         else:
             self.action_ensembler = None
         self.num_image_history = 0
-
-        self.action_norm_stats = self.get_action_stats(self.unnorm_key, policy_ckpt_path=policy_ckpt_path)
-        self.action_chunk_size = self.get_action_chunk_size(policy_ckpt_path=policy_ckpt_path)
         
 
     def _add_image_to_history(self, image: np.ndarray) -> None:
@@ -111,23 +127,39 @@ class M1Inference:
         }
 
         if state is not None:
-            vla_input["state"] = [state]  # add batch dim
+            state_array = np.asarray(state, dtype=np.float32).reshape(-1)
+            vla_input["state"] = [state_array]  # add batch dim
         
-        action_chunk_size = self.action_chunk_size
-        if step % action_chunk_size == 0:
+        if self.action_execution_mode == "chunk":
+            action_chunk_size = self.action_chunk_size
+            if step % action_chunk_size == 0:
+                response = self.client.infer(vla_input)
+                normalized_actions = response["data"]["normalized_actions"] # B, chunk, D
+                normalized_actions = normalized_actions[0]
+                self.raw_actions = self.unnormalize_actions(
+                    normalized_actions=normalized_actions,
+                    action_norm_stats=self.action_norm_stats,
+                )
+
+            raw_actions = self.raw_actions[step % action_chunk_size][None]
+        else:
             response = self.client.infer(vla_input)
-            # unnormalize the action
-            # import ipdb; ipdb.set_trace()
-            normalized_actions = response["data"]["normalized_actions"] # B, chunk, D        
-            normalized_actions = normalized_actions[0]    
-            self.raw_actions = self.unnormalize_actions(normalized_actions=normalized_actions, action_norm_stats=self.action_norm_stats)
-        
-        raw_actions = self.raw_actions[step % action_chunk_size][None]    
+            normalized_actions = response["data"]["normalized_actions"] # B, chunk, D
+            normalized_actions = normalized_actions[0]
+            raw_action_chunk = self.unnormalize_actions(
+                normalized_actions=normalized_actions,
+                action_norm_stats=self.action_norm_stats,
+            )
+            if self.action_ensemble:
+                raw_actions = self.action_ensembler.ensemble_action(raw_action_chunk)[None]
+            else:
+                raw_actions = raw_action_chunk[:1]
 
         raw_action = {
             "world_vector": np.array(raw_actions[0, :3]),
             "rotation_delta": np.array(raw_actions[0, 3:6]),
-            "open_gripper": np.array(raw_actions[0, 6:7]),  # range [0, 1]; 1 = open; 0 = close
+            # LIBERO / robosuite gripper command convention: -1 opens, +1 closes.
+            "open_gripper": np.array(raw_actions[0, 6:7]),
         }
 
         return {"raw_action": raw_action, "raw_actions": raw_actions[:7]}
@@ -137,7 +169,8 @@ class M1Inference:
         mask = action_norm_stats.get("mask", np.ones_like(action_norm_stats["min"], dtype=bool))
         action_high, action_low = np.array(action_norm_stats["max"]), np.array(action_norm_stats["min"])
         normalized_actions = np.clip(normalized_actions, -1, 1)
-        normalized_actions[:, 6] = np.where(normalized_actions[:, 6] < 0.5, 0, 1) 
+        if normalized_actions.shape[1] > 6 and not bool(mask[6]):
+            normalized_actions[:, 6] = np.where(normalized_actions[:, 6] > 0.0, 1.0, -1.0)
         actions = np.where(
             mask,
             0.5 * (normalized_actions + 1) * (action_high - action_low) + action_low,
@@ -151,7 +184,7 @@ class M1Inference:
         """
         Duplicate stats accessor (retained for backward compatibility).
         """
-        policy_ckpt_path = Path(policy_ckpt_path)
+        policy_ckpt_path = _resolve_stats_checkpoint(policy_ckpt_path)
         model_config, norm_stats = read_mode_config(policy_ckpt_path)  # read config and norm_stats
 
         unnorm_key = M1Inference._check_unnorm_key(norm_stats, unnorm_key)
@@ -159,6 +192,7 @@ class M1Inference:
 
     @staticmethod
     def get_action_chunk_size(policy_ckpt_path):
+        policy_ckpt_path = _resolve_stats_checkpoint(policy_ckpt_path)
         model_config, _ = read_mode_config(policy_ckpt_path)  # read config and norm_stats
         # import ipdb; ipdb.set_trace()
         return model_config['framework']['action_model']['future_action_window_size'] + 1

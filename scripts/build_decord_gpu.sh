@@ -72,7 +72,7 @@ index 62bc7ee..957a90d 100644
 @@ -17,7 +17,7 @@ namespace decord {
  namespace cuda {
  using namespace runtime;
- 
+
 -CUThreadedDecoder::CUThreadedDecoder(int device_id, AVCodecParameters *codecpar, AVInputFormat *iformat)
 +CUThreadedDecoder::CUThreadedDecoder(int device_id, AVCodecParameters *codecpar, const AVInputFormat *iformat)
      : device_id_(device_id), stream_({device_id, false}), device_{}, ctx_{}, parser_{}, decoder_{},
@@ -81,7 +81,7 @@ index 62bc7ee..957a90d 100644
 @@ -70,7 +70,7 @@ CUThreadedDecoder::CUThreadedDecoder(int device_id, AVCodecParameters *codecpar,
      }
  }
- 
+
 -void CUThreadedDecoder::InitBitStreamFilter(AVCodecParameters *codecpar, AVInputFormat *iformat) {
 +void CUThreadedDecoder::InitBitStreamFilter(AVCodecParameters *codecpar, const AVInputFormat *iformat) {
      const char* bsf_name = nullptr;
@@ -93,7 +93,7 @@ index d7e6fcd..61958a1 100644
 +++ b/src/video/nvcodec/cuda_threaded_decoder.h
 @@ -46,7 +46,7 @@ class CUThreadedDecoder final : public ThreadedDecoderInterface {
      using FrameOrderQueuePtr = std::unique_ptr<FrameOrderQueue>;
- 
+
      public:
 -        CUThreadedDecoder(int device_id, AVCodecParameters *codecpar, AVInputFormat *iformat);
 +        CUThreadedDecoder(int device_id, AVCodecParameters *codecpar, const AVInputFormat *iformat);
@@ -106,7 +106,7 @@ index d7e6fcd..61958a1 100644
          void CheckErrorStatus();
 -        void InitBitStreamFilter(AVCodecParameters *codecpar, AVInputFormat *iformat);
 +        void InitBitStreamFilter(AVCodecParameters *codecpar, const AVInputFormat *iformat);
- 
+
          int device_id_;
          CUStream stream_;
 diff --git a/src/video/video_reader.cc b/src/video/video_reader.cc
@@ -114,7 +114,7 @@ index af4858d..99c9635 100644
 --- a/src/video/video_reader.cc
 +++ b/src/video/video_reader.cc
 @@ -145,7 +145,7 @@ VideoReader::~VideoReader(){
- 
+
  void VideoReader::SetVideoStream(int stream_nb) {
      if (!fmt_ctx_) return;
 -    AVCodec *dec;

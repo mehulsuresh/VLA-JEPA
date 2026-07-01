@@ -153,6 +153,19 @@ from omegaconf import OmegaConf
 # Initialize Overwatch =>> Wraps `logging.Logger`
 overwatch = initialize_overwatch(__name__)
 
+
+_SUPPORTED_CHECKPOINT_SUFFIXES = {".pt", ".safetensors"}
+
+
+def _find_checkpoint_run_dir(checkpoint_pt: Path) -> Path:
+    for candidate in checkpoint_pt.parents:
+        if (candidate / "config.yaml").exists() and (candidate / "dataset_statistics.json").exists():
+            return candidate
+    raise AssertionError(
+        f"Could not find run directory containing `config.yaml` and "
+        f"`dataset_statistics.json` above `{checkpoint_pt}`"
+    )
+
 def read_mode_config(pretrained_checkpoint):
     """
     Same as read_model_config (legacy duplicate kept for backward compatibility).
@@ -168,9 +181,8 @@ def read_mode_config(pretrained_checkpoint):
     if os.path.isfile(pretrained_checkpoint):
         overwatch.info(f"Loading from local checkpoint path `{(checkpoint_pt := Path(pretrained_checkpoint))}`")
 
-        # [Validate] Checkpoint Path should look like `.../<RUN_ID>/checkpoints/<CHECKPOINT_PATH>.pt`
-        assert checkpoint_pt.suffix == ".pt"
-        run_dir = checkpoint_pt.parents[1]
+        assert checkpoint_pt.suffix in _SUPPORTED_CHECKPOINT_SUFFIXES
+        run_dir = _find_checkpoint_run_dir(checkpoint_pt)
 
         # Get paths for `config.json`, `dataset_statistics.json` and pretrained checkpoint
         config_yaml, dataset_statistics_json = run_dir / "config.yaml", run_dir / "dataset_statistics.json"
@@ -193,4 +205,3 @@ def read_mode_config(pretrained_checkpoint):
         overwatch.error(f"❌ Pretrained checkpoint `{pretrained_checkpoint}` does not exist.")
         raise FileNotFoundError(f"Pretrained checkpoint `{pretrained_checkpoint}` does not exist.")
     return global_cfg, norm_stats
-
