@@ -191,6 +191,7 @@ trainer:
   epochs: 1
   max_train_steps: auto
   num_warmup_steps: 10000
+  step_scheduler_with_optimizer: false
   save_interval: 10000
   eval_interval: 10000
   checkpoint_max_to_keep: 3

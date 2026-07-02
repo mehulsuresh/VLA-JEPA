@@ -459,6 +459,7 @@ def build_accelerator(cfg) -> Accelerator:
     trackers = resolve_trackers(cfg)
     project_dir = os.path.join(cfg.run_root_dir, cfg.run_id)
     trainer_cfg = cfg.get("trainer", {})
+    step_scheduler_with_optimizer = bool(trainer_cfg.get("step_scheduler_with_optimizer", False))
     ddp_kwargs = DistributedDataParallelKwargs(
         find_unused_parameters=bool(trainer_cfg.get("find_unused_parameters", True)),
         gradient_as_bucket_view=bool(trainer_cfg.get("ddp_gradient_as_bucket_view", False)),
@@ -471,6 +472,7 @@ def build_accelerator(cfg) -> Accelerator:
             mixed_precision=mixed_precision,
             log_with=trackers or None,
             project_dir=project_dir,
+            step_scheduler_with_optimizer=step_scheduler_with_optimizer,
             kwargs_handlers=[ddp_kwargs],
         )
         if use_deepspeed
@@ -478,6 +480,7 @@ def build_accelerator(cfg) -> Accelerator:
             mixed_precision=mixed_precision,
             log_with=trackers or None,
             project_dir=project_dir,
+            step_scheduler_with_optimizer=step_scheduler_with_optimizer,
             kwargs_handlers=[ddp_kwargs],
         )
     )
@@ -495,6 +498,12 @@ def build_accelerator(cfg) -> Accelerator:
             cfg,
             "trainer._accelerate_num_processes",
             int(accelerator.num_processes),
+            force_add=True,
+        )
+        OmegaConf.update(
+            cfg,
+            "trainer._accelerate_step_scheduler_with_optimizer",
+            step_scheduler_with_optimizer,
             force_add=True,
         )
     except Exception as exc:
