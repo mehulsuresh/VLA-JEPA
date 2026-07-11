@@ -146,10 +146,13 @@ The remaining ordered work is:
 3. Launch production only after the user explicitly approves that review.
 
 The current VM service account has only the `devstorage.read_only` OAuth scope.
-Bucket IAM alone cannot make GCS writes succeed. The production backup path is
-therefore still a blocker until user authentication, a suitable service-account
-credential, or non-ephemeral checkpoint storage is tested end to end. Do not
-stop this local-SSD instance merely to change scopes.
+The workstation account `mehul@yonduai.com` successfully uploaded, read, and
+deleted a unique preflight object under
+`gs://robotics-datasets-yonduai/gcloud/vla-jepa/checkpoints/`, proving bucket
+IAM is sufficient. The production backup path remains blocked only until that
+user (or another renewable writer credential) is authenticated in the VM's
+mounted gcloud config and tested end to end. Do not stop this local-SSD
+instance merely to change scopes.
 
 ## Known Production Inputs
 
@@ -618,6 +621,24 @@ gcloud compute instances describe columbus-8xa100 \
 printf 'checkpoint preflight\n' | \
   gcloud storage cp - gs://<approved-bucket>/<approved-prefix>/preflight.txt
 gcloud storage rm gs://<approved-bucket>/<approved-prefix>/preflight.txt
+```
+
+On this prepared node, authenticate the already verified user credential into
+the config directory shared with the training container:
+
+```bash
+ssh -t columbus-8xa100.us-east5-a.yondu-general-workspace \
+  'CLOUDSDK_CONFIG=/mnt/vla-jepa/gcloud-config \
+   gcloud auth login --no-launch-browser'
+```
+
+Follow the printed bootstrap flow, then require this command to print
+`mehul@yonduai.com` rather than the compute service account:
+
+```bash
+ssh columbus-8xa100.us-east5-a.yondu-general-workspace \
+  'CLOUDSDK_CONFIG=/mnt/vla-jepa/gcloud-config \
+   gcloud auth list --filter=status:ACTIVE --format="value(account)"'
 ```
 
 An instance created with only `devstorage.read_only` cannot upload even if its
