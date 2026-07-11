@@ -65,10 +65,10 @@ GPUs                          8x A100-SXM4-80GB, full NVLink mesh
 Host CPUs / RAM / swap        96 / approximately 1.3 TiB / none
 Scratch                       approximately 2.9 TiB RAID0 at /mnt/disks/ssd-array
 Docker data root              /mnt/vla-jepa/docker
-Base source commit            e8f7be46e1a9cc51050b7d7468f3c0d25d479181
+Verified training commit      4d263d2ab41df3895d2e46b83a86bc44bbe043bf
 V-JEPA2 helper commit         204698b45b3712590f06245fbfba32d3be539812
 MoGe helper commit            07444410f1e33f402353b99d6ccd26bd31e469e8
-Last fully baked image ID     sha256:3c6ef562174145bf0ce26baa14b5056c384ab3895b11b9ad38b5b3ad6d773777
+Last fully baked image ID     sha256:c8e2b35b316de4cd80747e5b7d6eb5fb17ae5c9a5f964ff7ce4e8f1d03705f67
 Image Python / Torch / CUDA   3.13.14 / 2.13.0+cu130 / 13.0
 FlashAttention               2.8.3.post1, compiled only for SM80
 ```
@@ -90,40 +90,54 @@ Completed smoke evidence:
 | 8 GPUs, batch 14/rank | Rejected; step 1 passed, step 2 OOM in action-head SDPA | `/mnt/vla-jepa/logs/magna_a100x8_b14_smoke.log` |
 | 8 GPUs, batch 12/rank, eight steps | Passed; observed memory later reached approximately 78.3 GiB | `/mnt/vla-jepa/logs/magna_a100x8_b12_smoke.log` |
 | 8 GPUs, batch 13/rank | Rejected; step 1 passed, step 2 exhausted rank 7 at 81,158 MiB | `/mnt/vla-jepa/logs/magna_a100x8_b13_smoke.log` and `.exit` |
+| 8 GPUs, batch 12/rank, 30 steps | Passed; steady throughput and loader test | `/mnt/vla-jepa/logs/magna_a100x8_b12_final_smoke_d3821a1_20260711_050611.log` |
+| 8 GPUs, batch 12/rank, two-step clean exit | Passed; no resource-tracker warning or new semaphore names | `/mnt/vla-jepa/logs/magna_a100x8_shutdown_smoke_4d263d2_20260711_051742.log` |
 
 Batch 12 is the measured upper bound: both batch 13 and batch 14 passed their
 first step before later sample/token variation exhausted memory. Retain enough
 headroom for real sample variation; do not retry a rejected batch merely
 because its first step fit.
 
-The local worktree contains newer loader and trainer fixes that were not yet
-baked into the image above when this snapshot was written:
+The verified commit and image contain:
 
 - bounded Arrow-table caching and exact episode slicing for LeRobot v3 shards;
 - PyAV nearest-frame conversion, which preserved decoded frame selection while
   reducing a representative decode call from 0.1470 s to 0.0812 s;
 - correct epoch propagation through Accelerate's `DataLoaderShard`, removing a
-  false sampler warning.
+  false sampler warning;
+- idempotent DataLoader teardown without calling Python 3.13's private
+  `resource_tracker._stop()` while semaphore finalizers are still live.
 
-Local `pytest tests -q` passed with `127 passed, 1 skipped` after those changes.
-The cloud image/source must be resynchronized, tested, and rebuilt before it is
-called final. Use `pytest tests -q`; bare `pytest -q` also collects optional
-simulation packages that are not part of this training image.
+Local `pytest tests -q` passed with `130 passed, 2 skipped`; the final cloud
+source/image test passed with `131 passed, 1 skipped`. Use `pytest tests -q`;
+bare `pytest -q` also collects optional simulation packages that are not part
+of this training image.
+
+The 30-step smoke outlasted the per-rank prefetch queue. Over its final 20
+steps it averaged 3.6284 seconds per optimizer step, 26.48 global samples/s,
+and 0.00062 seconds of visible data wait. Four workers per rank are therefore
+enough; adding workers cannot improve a model-bound step while it does increase
+startup time and host memory. The fullest GPUs reached 78,294 MiB in
+`nvidia-smi`, leaving 2,883 MiB; PyTorch reported a 75.19 GiB peak allocation.
+There were no OOM, NCCL, NaN/Inf, decode, worker-exit, or worker-respawn events.
+
+At 76,644 total optimizer steps, the measured compute-only duration is about
+77.25 hours (3.22 days). Checkpoint serialization/upload and startup add to
+that estimate and must be included in the user-facing launch review.
+
+The private resource-tracker shutdown hack was proven to cause the noisy
+`sem_unlink` tracebacks. The fixed eight-rank exit test had no such warning and
+left the POSIX semaphore-name count unchanged at 240. Those 240 stale names
+predate the fixed test and include artifacts from force-stopped OOM probes.
+They occupy negligible space; remove them only while no training/container or
+other multiprocessing job is active.
 
 The remaining ordered work is:
 
-1. Synchronize the complete local worktree and source manifest to the cloud.
-2. Set batch 12 in the YAML and recompute steps per epoch.
-3. Run local and cloud tests, then rebuild the image from cached layers and
-   record its new immutable ID.
-4. Run a 20-30-step, eight-GPU smoke. This must outlast the approximately eight
-   prefetched batches per rank before judging sustained loader throughput.
-5. Inspect TensorBoard losses, action-mask keep/all-zero ratios, steady data and
-   model times, all-rank memory, worker/thread counts, and process cleanup.
-6. Prove checkpoint upload, listing, and download through the production backup
+1. Prove checkpoint upload, listing, and download through the production backup
    destination.
-7. Present the complete setting/throughput/ETA review to the user. Production
-   training still requires explicit user approval after that review.
+2. Present the complete setting/throughput/ETA review to the user.
+3. Launch production only after the user explicitly approves that review.
 
 The current VM service account has only the `devstorage.read_only` OAuth scope.
 Bucket IAM alone cannot make GCS writes succeed. The production backup path is
@@ -302,6 +316,36 @@ cloud clone explicitly; `--files-from` cannot represent deletions.
 The `-A` forwards the local SSH agent only for this connection; it does not
 copy a GitHub key or token to the VM. Confirm `ssh-add -l` and
 `ssh -T git@github.com` succeed locally before cloning.
+
+If the private cloud clone cannot fetch because no forwarded GitHub credential
+is available, keep credentials off the VM and transfer the missing Git objects
+as a bundle after pushing locally. First require a clean cloud worktree and
+record its current commit:
+
+```bash
+HOST=columbus-8xa100.us-east5-a.yondu-general-workspace
+CLOUD_BASE="$(ssh "$HOST" \
+  'git -C /mnt/vla-jepa/src/VLA-JEPA rev-parse HEAD')"
+test -z "$(ssh "$HOST" \
+  'git -C /mnt/vla-jepa/src/VLA-JEPA status --porcelain')"
+
+git push origin main
+git bundle create /tmp/vla-jepa-sync.bundle main "^${CLOUD_BASE}"
+git bundle verify /tmp/vla-jepa-sync.bundle
+scp /tmp/vla-jepa-sync.bundle "$HOST:/mnt/vla-jepa/logs/"
+
+ssh "$HOST" '
+  cd /mnt/vla-jepa/src/VLA-JEPA
+  git fetch /mnt/vla-jepa/logs/vla-jepa-sync.bundle refs/heads/main
+  git reset --hard FETCH_HEAD
+  git status --short
+  git rev-parse HEAD
+'
+```
+
+Use `reset --hard` only for this verified disposable cloud replica, after the
+local commit is on GitHub and the cloud status check is empty. Confirm local
+`HEAD`, local `origin/main`, and cloud `HEAD` are identical afterward.
 
 Record exactly what was deployed:
 
