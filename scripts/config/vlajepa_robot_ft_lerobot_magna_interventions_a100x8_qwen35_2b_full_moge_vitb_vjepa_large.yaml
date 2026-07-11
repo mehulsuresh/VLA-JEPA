@@ -1,6 +1,6 @@
 # A100x8 Magna intervention profile:
 # - Full Qwen3.5-2B fine-tuning; no LoRA adapter.
-# - 19D Realman source-action view with base velocity removed.
+# - 18D Realman source-action view with base velocity and lift command removed.
 # - Resolved subtask labels are appended to prompts 30% of the time.
 # - valid_state builds a sustained-invalid-prefix action loss mask; RABC is off.
 run_id: robot_ft_lerobot_magna_interventions_a100x8_qwen35_2b_full_moge_vitb_vjepa_large
@@ -35,7 +35,7 @@ framework:
     hidden_size: 1024
     add_pos_embed: true
     max_seq_len: 1024
-    action_dim: 19
+    action_dim: 18
     state_dim: 19
     future_action_window_size: 49
     action_horizon: 50
@@ -115,7 +115,7 @@ datasets:
   vla_data:
     dataset_py: lerobot_datasets
     data_root_dir: /mnt/vla-jepa/datasets/magna_training_data_with_interventions
-    data_mix: magna_source_no_base_interventions_v3
+    data_mix: magna_source_no_base_no_lift_interventions_v3
     lerobot_version: v3.0
     action_type: absolute_qpos
     CoT_prompt: "Your task is {instruction}. Use the robot observations and state to produce the corresponding policy actions. {state}{e_actions}{actions}{geometry}"
@@ -143,10 +143,10 @@ datasets:
           end: 16
           absolute: true
           dtype: float32
-        source_head_lift:
+        source_head:
           original_key: source.action
           start: 19
-          end: 22
+          end: 21
           absolute: true
           dtype: float32
     resolution_size: 224

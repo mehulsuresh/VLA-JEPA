@@ -74,4 +74,5 @@ ROBOT_TYPE_TO_EMBODIMENT_TAG = {
     "realman_bimanual": EmbodimentTag.NEW_EMBODIMENT,
     "realman_bimanual_source": EmbodimentTag.NEW_EMBODIMENT,
     "realman_bimanual_source_no_base": EmbodimentTag.NEW_EMBODIMENT,
+    "realman_bimanual_source_no_base_no_lift": EmbodimentTag.NEW_EMBODIMENT,
 }

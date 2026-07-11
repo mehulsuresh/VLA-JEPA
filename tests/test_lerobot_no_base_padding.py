@@ -9,6 +9,7 @@ import pandas as pd
 from starVLA.dataloader.gr00t_lerobot.data_config import (
     ROBOT_TYPE_CONFIG_MAP,
     RealmanBimanualSourceNoBaseDataConfig,
+    RealmanBimanualSourceNoBaseNoLiftDataConfig,
 )
 from starVLA.dataloader.gr00t_lerobot.datasets import LeRobotMixtureDataset, LeRobotSingleDataset
 from starVLA.dataloader.gr00t_lerobot.mixtures import DATASET_NAMED_MIXTURES
@@ -78,6 +79,37 @@ def test_realman_source_no_base_config_slices_source_actions():
     assert action_norm_modes == {
         "action.source_controls": "min_max",
         "action.source_head_lift": "min_max",
+    }
+
+
+def test_realman_source_no_base_no_lift_config_omits_lift_action():
+    assert (
+        ROBOT_TYPE_CONFIG_MAP["realman_bimanual_source_no_base_no_lift"]
+        is RealmanBimanualSourceNoBaseNoLiftDataConfig
+    )
+    assert DATASET_NAMED_MIXTURES["magna_source_no_base_no_lift_interventions_v3"] == [
+        ("", 1.0, "realman_bimanual_source_no_base_no_lift", "v3.0")
+    ]
+
+    data_config = RealmanBimanualSourceNoBaseNoLiftDataConfig(
+        observation_indices=[0],
+        action_indices=[0, 1, 2],
+    )
+
+    assert data_config.action_keys == ["action.source_controls", "action.source_head"]
+    action_norm_modes = {}
+    for transform in data_config.transform().transforms:
+        if isinstance(transform, StateActionTransform):
+            action_norm_modes.update(
+                {
+                    key: mode
+                    for key, mode in transform.normalization_modes.items()
+                    if key.startswith("action.")
+                }
+            )
+    assert action_norm_modes == {
+        "action.source_controls": "min_max",
+        "action.source_head": "min_max",
     }
 
 

@@ -26,21 +26,21 @@ def test_magna_production_config_contract():
     assert cfg.framework.qwenvl.strict_full_trainable is True
 
     action_cfg = cfg.framework.action_model
-    assert action_cfg.action_dim == 19
+    assert action_cfg.action_dim == 18
     assert action_cfg.state_dim == 19
     assert action_cfg.action_horizon == 50
     assert action_cfg.future_action_window_size == 49
     assert action_cfg.rtc_training.enabled is True
 
     data_cfg = cfg.datasets.vla_data
-    assert data_cfg.data_mix == "magna_source_no_base_interventions_v3"
+    assert data_cfg.data_mix == "magna_source_no_base_no_lift_interventions_v3"
     assert data_cfg.action_type == "absolute_qpos"
     assert data_cfg.modality_metadata_overrides.state.source.original_key == (
         "source.observation.state"
     )
     assert (data_cfg.modality_metadata_overrides.state.source.start, data_cfg.modality_metadata_overrides.state.source.end) == (0, 19)
     assert (data_cfg.modality_metadata_overrides.action.source_controls.start, data_cfg.modality_metadata_overrides.action.source_controls.end) == (0, 16)
-    assert (data_cfg.modality_metadata_overrides.action.source_head_lift.start, data_cfg.modality_metadata_overrides.action.source_head_lift.end) == (19, 22)
+    assert (data_cfg.modality_metadata_overrides.action.source_head.start, data_cfg.modality_metadata_overrides.action.source_head.end) == (19, 21)
     assert data_cfg.task_id_prompt_source_column == "subtask_index"
     assert "__unlabeled__" in data_cfg.subtask_prompt_ignored_labels
     assert data_cfg.use_action_validity_prefix_mask is True
@@ -61,8 +61,8 @@ def test_magna_production_config_contract():
 
 
 def test_magna_mixture_and_launcher_route_to_production_config():
-    assert DATASET_NAMED_MIXTURES["magna_source_no_base_interventions_v3"] == [
-        ("", 1.0, "realman_bimanual_source_no_base", "v3.0")
+    assert DATASET_NAMED_MIXTURES["magna_source_no_base_no_lift_interventions_v3"] == [
+        ("", 1.0, "realman_bimanual_source_no_base_no_lift", "v3.0")
     ]
 
     launcher = LAUNCHER_PATH.read_text(encoding="utf-8")

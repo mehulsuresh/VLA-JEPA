@@ -32,6 +32,7 @@ from deployment.realman.pipeline import (
     action_summary,
     build_policy_payload,
     expand_policy_action_to_robot_action,
+    extract_state_vector,
     json_safe,
     load_observation_npz,
     split_action_chunk,
@@ -164,7 +165,11 @@ def _infer_once(
             f"Policy returned action dim {policy_action_chunk.shape[-1]}, "
             f"expected one of {REALMAN_POLICY_ACTION_DIMS}."
         )
-    action_chunk = expand_policy_action_to_robot_action(policy_action_chunk)
+    current_lift_height_mm = float(extract_state_vector(observation)[-1])
+    action_chunk = expand_policy_action_to_robot_action(
+        policy_action_chunk,
+        lift_height_mm=current_lift_height_mm,
+    )
     return normalized_chunk, action_chunk, latency_ms, response
 
 

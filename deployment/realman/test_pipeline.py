@@ -5,6 +5,7 @@ import numpy as np
 from deployment.realman.pipeline import (
     REALMAN_ACTION_DIM,
     REALMAN_POLICY_ACTION_DIM_NO_BASE,
+    REALMAN_POLICY_ACTION_DIM_NO_BASE_NO_LIFT,
     REALMAN_STATE_DIM,
     build_policy_payload,
     expand_policy_action_to_robot_action,
@@ -78,6 +79,23 @@ class RealmanPipelineTest(unittest.TestCase):
         np.testing.assert_allclose(expanded[16:19], np.zeros((3,), dtype=np.float32))
         np.testing.assert_allclose(expanded[19:22], policy_action[16:19])
 
+    def test_expand_no_base_no_lift_policy_action_preserves_measured_lift(self):
+        policy_action = np.arange(REALMAN_POLICY_ACTION_DIM_NO_BASE_NO_LIFT, dtype=np.float32)
+
+        expanded = expand_policy_action_to_robot_action(policy_action, lift_height_mm=321.0)
+
+        self.assertEqual(expanded.shape, (REALMAN_ACTION_DIM,))
+        np.testing.assert_allclose(expanded[:16], policy_action[:16])
+        np.testing.assert_allclose(expanded[16:19], np.zeros((3,), dtype=np.float32))
+        np.testing.assert_allclose(expanded[19:21], policy_action[16:18])
+        self.assertEqual(expanded[21], 321.0)
+
+    def test_expand_no_base_no_lift_policy_action_requires_measured_lift(self):
+        policy_action = np.zeros((REALMAN_POLICY_ACTION_DIM_NO_BASE_NO_LIFT,), dtype=np.float32)
+
+        with self.assertRaisesRegex(ValueError, "requires the current measured lift_height_mm"):
+            expand_policy_action_to_robot_action(policy_action)
+
     def test_vr_teleop_observation_adds_trained_source_state(self):
         state = np.arange(REALMAN_STATE_DIM + 2, dtype=np.float32)
         observation = {"observation.state": state}
@@ -104,6 +122,16 @@ class RealmanPipelineTest(unittest.TestCase):
         rebuilt = vector_from_action_payload(policy_action)
 
         np.testing.assert_allclose(rebuilt, expand_policy_action_to_robot_action(policy_action))
+
+    def test_vr_teleop_action_payload_expands_no_lift_vector_from_measured_state(self):
+        policy_action = np.arange(REALMAN_POLICY_ACTION_DIM_NO_BASE_NO_LIFT, dtype=np.float32)
+
+        rebuilt = vector_from_action_payload(policy_action, lift_height_mm=275.0)
+
+        np.testing.assert_allclose(
+            rebuilt,
+            expand_policy_action_to_robot_action(policy_action, lift_height_mm=275.0),
+        )
 
 
 if __name__ == "__main__":

@@ -183,7 +183,8 @@ The verified dataset snapshot has 2,452,692 frames, 1,638 episodes, 93 video
 files, 34.07 hours at 20 FPS, and three H.264 camera streams (`head`,
 `wrist_left`, and `wrist_right`). `source.action` is 22D and
 `source.observation.state` is 19D. Training deliberately omits source action
-dimensions 16:19 (base velocity), producing a 19D action target. The main
+dimensions 16:19 (base velocity) and 21 (lift height), producing an 18D action
+target while retaining measured lift height in the state input. The main
 parquet shards already contain the integrated `subtask_index`, `valid_state`,
 `valid_state_source`, and `task_id` columns. The `edits/` directory is
 annotation provenance; the production loader does not need it as an overlay.
@@ -525,7 +526,7 @@ Then run these gates in order:
 
 1. Run `pytest tests -q` in the final image or the established project
    environment. Do not use a bare host Python without project dependencies.
-2. A direct dataset sample: verify action `[50, 19]`, state `[1, 19]`, three
+2. A direct dataset sample: verify action `[50, 18]`, state `[1, 19]`, three
    video views, an action mask, finite tensors, and a resolved prompt.
 3. A two-step single-GPU forward/backward smoke.
 4. A short 8-GPU production-shape smoke long enough to pass model/cache warmup.
@@ -561,7 +562,7 @@ ssh "$HOST" '
 Before launch, review and record at least:
 
 - model backbones, frozen/trainable modules, and total/trainable parameters;
-- 19D no-base action/state mapping and absolute-action semantics;
+- 18D no-base/no-lift action mapping, 19D state input, and absolute-action semantics;
 - action horizon, video frames/stride/target shift, and camera order;
 - intervention-mask semantics and observed keep/all-zero ratios;
 - prompt/subtask-label probability;

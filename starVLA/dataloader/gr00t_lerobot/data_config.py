@@ -905,14 +905,21 @@ class RealmanBimanualSourceNoBaseDataConfig(RealmanBimanualSourceDataConfig):
             StateActionToTensor(apply_to=self.action_keys),
             StateActionTransform(
                 apply_to=self.action_keys,
-                normalization_modes={
-                    "action.source_controls": "min_max",
-                    "action.source_head_lift": "min_max",
-                },
+                normalization_modes={key: "min_max" for key in self.action_keys},
             ),
         ]
 
         return ComposedModalityTransform(transforms=transforms)
+
+
+###########################################################################################
+
+
+class RealmanBimanualSourceNoBaseNoLiftDataConfig(RealmanBimanualSourceNoBaseDataConfig):
+    action_keys = [
+        "action.source_controls",
+        "action.source_head",
+    ]
 
 
 ###########################################################################################
@@ -927,6 +934,7 @@ ROBOT_TYPE_CONFIG_MAP = {
     "realman_bimanual": RealmanBimanualDataConfig,
     "realman_bimanual_source": RealmanBimanualSourceDataConfig,
     "realman_bimanual_source_no_base": RealmanBimanualSourceNoBaseDataConfig,
+    "realman_bimanual_source_no_base_no_lift": RealmanBimanualSourceNoBaseNoLiftDataConfig,
     #"oxe_droid": OxeDroidDataConfig(),
     "oxe_bridge": OxeBridgeDataConfig,
     "oxe_rt1": OxeRT1DataConfig,

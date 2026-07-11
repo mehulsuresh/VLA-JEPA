@@ -8,6 +8,9 @@ _CAMERA_ORDER_HINTS = {
     "trossen_subtask_combined": ["cam_high", "cam_left_wrist", "cam_right_wrist"],
     "ogrealman_source_v3": ["head", "wrist_left", "wrist_right"],
     "ogrealman_source_no_base_v3": ["head", "wrist_left", "wrist_right"],
+    "ogrealman_source_no_base_human_labelled_cloud_v3": ["head", "wrist_left", "wrist_right"],
+    "magna_source_no_base_interventions_v3": ["head", "wrist_left", "wrist_right"],
+    "magna_source_no_base_no_lift_interventions_v3": ["head", "wrist_left", "wrist_right"],
     "ogrealman_canonical_v3": ["head", "wrist_left", "wrist_right"],
 }
 

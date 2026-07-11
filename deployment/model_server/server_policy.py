@@ -69,25 +69,44 @@ _REALMAN_STATE_NAMES = [
 ]
 
 _REALMAN_POLICY_ACTION_NAMES_NO_BASE = _REALMAN_ACTION_NAMES[:16] + _REALMAN_ACTION_NAMES[19:22]
-_REALMAN_POLICY_ACTION_DIMS = (len(_REALMAN_ACTION_NAMES), len(_REALMAN_POLICY_ACTION_NAMES_NO_BASE))
-_REALMAN_DATA_MIXES = {"ogrealman_source_v3", "ogrealman_source_no_base_v3", "ogrealman_canonical_v3"}
+_REALMAN_POLICY_ACTION_NAMES_NO_BASE_NO_LIFT = _REALMAN_ACTION_NAMES[:16] + _REALMAN_ACTION_NAMES[19:21]
+_REALMAN_POLICY_ACTION_DIMS = (
+    len(_REALMAN_ACTION_NAMES),
+    len(_REALMAN_POLICY_ACTION_NAMES_NO_BASE),
+    len(_REALMAN_POLICY_ACTION_NAMES_NO_BASE_NO_LIFT),
+)
+_REALMAN_DATA_MIXES = {
+    "ogrealman_source_v3",
+    "ogrealman_source_no_base_v3",
+    "ogrealman_source_no_base_human_labelled_cloud_v3",
+    "magna_source_no_base_interventions_v3",
+    "magna_source_no_base_no_lift_interventions_v3",
+    "ogrealman_canonical_v3",
+}
 
 
 def _is_realman_data_mix(metadata: dict[str, Any]) -> bool:
-    return metadata.get("data_mix") in _REALMAN_DATA_MIXES
+    robot_type = str(metadata.get("robot_type") or "")
+    return metadata.get("data_mix") in _REALMAN_DATA_MIXES or robot_type.startswith("realman_bimanual")
 
 
 def _expand_realman_policy_actions(actions: np.ndarray) -> np.ndarray:
     array = np.asarray(actions, dtype=np.float32)
     if array.shape[-1] == len(_REALMAN_ACTION_NAMES):
         return array
-    if array.shape[-1] != len(_REALMAN_POLICY_ACTION_NAMES_NO_BASE):
+    if array.shape[-1] not in {
+        len(_REALMAN_POLICY_ACTION_NAMES_NO_BASE),
+        len(_REALMAN_POLICY_ACTION_NAMES_NO_BASE_NO_LIFT),
+    }:
         raise ValueError(
             f"Expected Realman policy action dim in {_REALMAN_POLICY_ACTION_DIMS}, got {array.shape[-1]}."
         )
     expanded = np.zeros((*array.shape[:-1], len(_REALMAN_ACTION_NAMES)), dtype=np.float32)
     expanded[..., :16] = array[..., :16]
-    expanded[..., 19:22] = array[..., 16:19]
+    if array.shape[-1] == len(_REALMAN_POLICY_ACTION_NAMES_NO_BASE):
+        expanded[..., 19:22] = array[..., 16:19]
+    else:
+        expanded[..., 19:21] = array[..., 16:18]
     return expanded
 
 
@@ -168,6 +187,8 @@ class PolicyOutputJsonlLogger:
         self._lock = threading.Lock()
         if _is_realman_data_mix(metadata) and int(metadata.get("action_dim") or 0) == len(_REALMAN_POLICY_ACTION_NAMES_NO_BASE):
             self.action_names = _REALMAN_POLICY_ACTION_NAMES_NO_BASE
+        elif _is_realman_data_mix(metadata) and int(metadata.get("action_dim") or 0) == len(_REALMAN_POLICY_ACTION_NAMES_NO_BASE_NO_LIFT):
+            self.action_names = _REALMAN_POLICY_ACTION_NAMES_NO_BASE_NO_LIFT
         elif _is_realman_data_mix(metadata) and int(metadata.get("action_dim") or 0) == len(_REALMAN_ACTION_NAMES):
             self.action_names = _REALMAN_ACTION_NAMES
         else:
@@ -339,6 +360,7 @@ class PolicyOutputJsonlLogger:
         }
         if flat_dim in _REALMAN_POLICY_ACTION_DIMS and self.action_names is not None:
             robot_actions = _expand_realman_policy_actions(array)
+            lift_is_policy_controlled = flat_dim != len(_REALMAN_POLICY_ACTION_NAMES_NO_BASE_NO_LIFT)
             left_l2 = np.linalg.norm(robot_actions[..., 0:7], axis=-1)
             right_l2 = np.linalg.norm(robot_actions[..., 8:15], axis=-1)
             base_l2 = np.linalg.norm(robot_actions[..., 16:19], axis=-1)
@@ -348,7 +370,8 @@ class PolicyOutputJsonlLogger:
                 "right_arm_l2": right_l2.tolist(),
                 "base_l2": base_l2.tolist(),
                 "head_l2": head_l2.tolist(),
-                "lift_height_mm": robot_actions[..., 21].tolist(),
+                "lift_is_policy_controlled": lift_is_policy_controlled,
+                "lift_height_mm": robot_actions[..., 21].tolist() if lift_is_policy_controlled else None,
                 "near_zero_fraction": {
                     "arms_l2_lt_0_05": float(((left_l2 + right_l2) < 0.05).mean()),
                     "arms_l2_lt_0_25": float(((left_l2 + right_l2) < 0.25).mean()),
@@ -463,6 +486,7 @@ class ActionGuardRetryPolicy:
         )
         if actions.shape[-1] not in _REALMAN_POLICY_ACTION_DIMS:
             return True, {"shape": list(actions.shape), "skipped": "unsupported_realman_action_dim"}, []
+        policy_controls_lift = actions.shape[-1] != len(_REALMAN_POLICY_ACTION_NAMES_NO_BASE_NO_LIFT)
         actions = _expand_realman_policy_actions(actions)
         if not np.isfinite(actions).all():
             return False, {"shape": list(actions.shape)}, ["unnormalized actions contain non-finite values"]
@@ -482,7 +506,7 @@ class ActionGuardRetryPolicy:
         tail_mean = arms_l2[:, tail_start:].mean(axis=1)
         late_mean = arms_l2[:, late_start:].mean(axis=1)
         last_mean = arms_l2[:, -last_n:].mean(axis=1)
-        tail_lift_mean = lift[:, tail_start:].mean(axis=1)
+        tail_lift_mean = lift[:, tail_start:].mean(axis=1) if policy_controls_lift else None
 
         metrics = {
             "shape": list(actions.shape),
@@ -494,7 +518,8 @@ class ActionGuardRetryPolicy:
             "tail_arms_mean_min": float(tail_mean.min()),
             "late_arms_mean_min": float(late_mean.min()),
             "last_arms_mean_min": float(last_mean.min()),
-            "tail_lift_mean_min": float(tail_lift_mean.min()),
+            "lift_is_policy_controlled": policy_controls_lift,
+            "tail_lift_mean_min": float(tail_lift_mean.min()) if tail_lift_mean is not None else None,
             "normalized_abs_max": float(np.abs(normalized_actions).max()),
         }
 
@@ -514,7 +539,11 @@ class ActionGuardRetryPolicy:
             reasons.append(
                 f"last arms mean {metrics['last_arms_mean_min']:.3f} < {self.min_last_arms_mean:.3f}"
             )
-        if self.min_tail_lift_mean >= 0 and metrics["tail_lift_mean_min"] < self.min_tail_lift_mean:
+        if (
+            policy_controls_lift
+            and self.min_tail_lift_mean >= 0
+            and metrics["tail_lift_mean_min"] < self.min_tail_lift_mean
+        ):
             reasons.append(
                 f"tail lift mean {metrics['tail_lift_mean_min']:.3f} < {self.min_tail_lift_mean:.3f}"
             )

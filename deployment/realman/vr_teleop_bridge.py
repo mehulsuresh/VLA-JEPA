@@ -86,7 +86,11 @@ def model_compatible_observation(
     return output
 
 
-def vector_from_action_payload(action: Any) -> np.ndarray:
+def vector_from_action_payload(
+    action: Any,
+    *,
+    lift_height_mm: float | None = None,
+) -> np.ndarray:
     if isinstance(action, dict):
         if "vector" in action:
             vector = action["vector"]
@@ -106,7 +110,10 @@ def vector_from_action_payload(action: Any) -> np.ndarray:
     else:
         vector = action
 
-    arr = expand_policy_action_to_robot_action(np.asarray(vector, dtype=np.float32).reshape(-1)).reshape(-1)
+    arr = expand_policy_action_to_robot_action(
+        np.asarray(vector, dtype=np.float32).reshape(-1),
+        lift_height_mm=lift_height_mm,
+    ).reshape(-1)
     if arr.size != REALMAN_ACTION_DIM:
         raise ValueError(f"Realman policy action has dim {arr.size}, expected {REALMAN_ACTION_DIM}.")
     return np.ascontiguousarray(arr)
@@ -128,6 +135,7 @@ class RealmanVrTeleopPolicyRobot:
         self.args = args or SimpleNamespace()
         self.log = logging.getLogger("realman-vr-teleop-policy")
         self.teleop_root: Path | None = None
+        self._last_lift_height_mm: float | None = None
         self.teleop_args: SimpleNamespace | None = None
         self.session: Any | None = None
         self.robot: Any | None = None
@@ -232,13 +240,19 @@ class RealmanVrTeleopPolicyRobot:
     def capture_observation(self) -> dict[str, Any]:
         if self.robot is None:
             raise RuntimeError("RealmanVrTeleopPolicyRobot is not connected")
-        observation = self.robot.capture_observation()
-        return model_compatible_observation(observation)
+        observation = model_compatible_observation(self.robot.capture_observation())
+        self._last_lift_height_mm = float(
+            np.asarray(observation["source.observation.state"], dtype=np.float32).reshape(-1)[-1]
+        )
+        return observation
 
     def send_action(self, action: Any) -> np.ndarray:
         if self.robot is None:
             raise RuntimeError("RealmanVrTeleopPolicyRobot is not connected")
-        vector = vector_from_action_payload(action)
+        vector = vector_from_action_payload(
+            action,
+            lift_height_mm=self._last_lift_height_mm,
+        )
         returned = self.robot.send_action(vector)
         return np.asarray(returned, dtype=np.float32)
 

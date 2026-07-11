@@ -67,7 +67,13 @@ REALMAN_ACTION_DIM = len(REALMAN_ACTION_NAMES)
 REALMAN_STATE_DIM = len(REALMAN_STATE_NAMES)
 REALMAN_POLICY_ACTION_NAMES_NO_BASE = REALMAN_ACTION_NAMES[:16] + REALMAN_ACTION_NAMES[19:22]
 REALMAN_POLICY_ACTION_DIM_NO_BASE = len(REALMAN_POLICY_ACTION_NAMES_NO_BASE)
-REALMAN_POLICY_ACTION_DIMS = (REALMAN_ACTION_DIM, REALMAN_POLICY_ACTION_DIM_NO_BASE)
+REALMAN_POLICY_ACTION_NAMES_NO_BASE_NO_LIFT = REALMAN_ACTION_NAMES[:16] + REALMAN_ACTION_NAMES[19:21]
+REALMAN_POLICY_ACTION_DIM_NO_BASE_NO_LIFT = len(REALMAN_POLICY_ACTION_NAMES_NO_BASE_NO_LIFT)
+REALMAN_POLICY_ACTION_DIMS = (
+    REALMAN_ACTION_DIM,
+    REALMAN_POLICY_ACTION_DIM_NO_BASE,
+    REALMAN_POLICY_ACTION_DIM_NO_BASE_NO_LIFT,
+)
 
 _IMAGE_KEY_ALIASES = {
     "head": (
@@ -236,19 +242,40 @@ def validate_realman_server_metadata(
     return warnings
 
 
-def expand_policy_action_to_robot_action(action: np.ndarray) -> np.ndarray:
+def expand_policy_action_to_robot_action(
+    action: np.ndarray,
+    *,
+    lift_height_mm: float | np.ndarray | None = None,
+) -> np.ndarray:
     array = np.asarray(action, dtype=np.float32)
     if array.shape[-1] == REALMAN_ACTION_DIM:
         return np.ascontiguousarray(array)
-    if array.shape[-1] != REALMAN_POLICY_ACTION_DIM_NO_BASE:
+    if array.shape[-1] not in {
+        REALMAN_POLICY_ACTION_DIM_NO_BASE,
+        REALMAN_POLICY_ACTION_DIM_NO_BASE_NO_LIFT,
+    }:
         raise ValueError(
             f"Realman policy action dim is {array.shape[-1]}, expected "
-            f"{REALMAN_POLICY_ACTION_DIM_NO_BASE} no-base or {REALMAN_ACTION_DIM} legacy."
+            f"one of {REALMAN_POLICY_ACTION_DIMS}."
         )
 
     expanded = np.zeros((*array.shape[:-1], REALMAN_ACTION_DIM), dtype=np.float32)
     expanded[..., :16] = array[..., :16]
-    expanded[..., 19:22] = array[..., 16:19]
+    if array.shape[-1] == REALMAN_POLICY_ACTION_DIM_NO_BASE:
+        expanded[..., 19:22] = array[..., 16:19]
+    else:
+        if lift_height_mm is None:
+            raise ValueError(
+                "An 18D no-base/no-lift policy action requires the current measured "
+                "lift_height_mm when expanding to the robot's 22D command."
+            )
+        expanded[..., 19:21] = array[..., 16:18]
+        try:
+            expanded[..., 21] = np.asarray(lift_height_mm, dtype=np.float32)
+        except ValueError as exc:
+            raise ValueError(
+                f"lift_height_mm cannot broadcast to action shape {array.shape[:-1]}."
+            ) from exc
     return np.ascontiguousarray(expanded)
 
 
