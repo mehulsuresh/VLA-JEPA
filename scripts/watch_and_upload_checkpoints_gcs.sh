@@ -12,8 +12,16 @@ GCS_DEST="${2%/}"
 POLL_SECONDS="${POLL_SECONDS:-60}"
 STABLE_SECONDS="${STABLE_SECONDS:-180}"
 UPLOAD_FAILURE_BACKOFF_SECONDS="${UPLOAD_FAILURE_BACKOFF_SECONDS:-900}"
+LOG_SYNC_SECONDS="${LOG_SYNC_SECONDS:-900}"
+RUN_ONCE="${RUN_ONCE:-0}"
 STATE_DIR="${STATE_DIR:-${RUN_DIR}/.upload_state}"
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-${RUN_DIR}/checkpoints}"
+FINAL_MODEL_DIR="${FINAL_MODEL_DIR:-${RUN_DIR}/final_model}"
+TENSORBOARD_DIR="${TENSORBOARD_DIR:-${RUN_DIR}/starvla}"
+
+if [[ -z "${CLOUDSDK_CONFIG:-}" && -d /mnt/vla-jepa/gcloud-config ]]; then
+  export CLOUDSDK_CONFIG=/mnt/vla-jepa/gcloud-config
+fi
 
 mkdir -p "${STATE_DIR}"
 
@@ -89,21 +97,90 @@ upload_checkpoint_dir() {
   fi
 }
 
-log "Watching ${CHECKPOINT_DIR}"
-log "Destination ${GCS_DEST}"
+upload_runtime_logs() {
+  local marker="${STATE_DIR}/uploaded_runtime_logs"
+  local upload_log="${STATE_DIR}/runtime_logs_upload.log"
+  local now
+  local last_sync=0
 
-while true; do
+  if [[ ! -d "${TENSORBOARD_DIR}" && ! -f "${RUN_DIR}/summary.jsonl" ]]; then
+    return 0
+  fi
+  if [[ -e "${marker}" ]]; then
+    last_sync="$(stat -c '%Y' "${marker}" 2>/dev/null || printf '0')"
+  fi
+  now="$(date +%s)"
+  if (( now - last_sync < LOG_SYNC_SECONDS )); then
+    return 0
+  fi
+
+  : > "${upload_log}"
+  if [[ -d "${TENSORBOARD_DIR}" ]]; then
+    log "Synchronizing TensorBoard logs -> ${GCS_DEST}/logs/starvla"
+    if ! gcloud storage rsync --recursive "${TENSORBOARD_DIR}" "${GCS_DEST}/logs/starvla" >>"${upload_log}" 2>&1; then
+      log "TensorBoard log upload failed; will retry (details: ${upload_log})"
+      return 1
+    fi
+  fi
+  if [[ -f "${RUN_DIR}/summary.jsonl" ]]; then
+    if ! gcloud storage cp "${RUN_DIR}/summary.jsonl" "${GCS_DEST}/metadata/summary.jsonl" >>"${upload_log}" 2>&1; then
+      log "Training summary upload failed; will retry (details: ${upload_log})"
+      return 1
+    fi
+  fi
+  date -Is > "${marker}"
+}
+
+upload_final_model() {
+  local marker="${STATE_DIR}/uploaded_final_model"
+  local upload_log="${STATE_DIR}/final_model_upload.log"
+
+  if [[ -e "${marker}" || ! -d "${FINAL_MODEL_DIR}" ]]; then
+    return 0
+  fi
+  if ! is_stable_dir "${FINAL_MODEL_DIR}"; then
+    return 0
+  fi
+
+  log "Uploading final model -> ${GCS_DEST}/final_model"
+  if gcloud storage rsync --recursive "${FINAL_MODEL_DIR}" "${GCS_DEST}/final_model" >"${upload_log}" 2>&1; then
+    date -Is > "${marker}"
+    log "Uploaded final model"
+  else
+    log "Final model upload failed; will retry in ${UPLOAD_FAILURE_BACKOFF_SECONDS}s (details: ${upload_log})"
+    return 1
+  fi
+}
+
+run_upload_cycle() {
   if ! upload_metadata; then
-    sleep "${UPLOAD_FAILURE_BACKOFF_SECONDS}"
-    continue
+    return 1
   fi
   if [[ -d "${CHECKPOINT_DIR}" ]]; then
     while IFS= read -r -d '' ckpt_dir; do
       if ! upload_checkpoint_dir "${ckpt_dir}"; then
-        sleep "${UPLOAD_FAILURE_BACKOFF_SECONDS}"
-        break
+        return 1
       fi
-    done < <(find "${CHECKPOINT_DIR}" -mindepth 1 -maxdepth 1 -type d -print0 | sort -z)
+    done < <(find "${CHECKPOINT_DIR}" -mindepth 1 -maxdepth 1 -type d -print0 | sort -zV)
+  fi
+  if ! upload_final_model; then
+    return 1
+  fi
+  upload_runtime_logs
+}
+
+log "Watching ${CHECKPOINT_DIR}"
+log "Destination ${GCS_DEST}"
+
+if [[ "${RUN_ONCE}" == "1" ]]; then
+  run_upload_cycle
+  exit $?
+fi
+
+while true; do
+  if ! run_upload_cycle; then
+    sleep "${UPLOAD_FAILURE_BACKOFF_SECONDS}"
+    continue
   fi
   sleep "${POLL_SECONDS}"
 done

@@ -649,14 +649,17 @@ running VM, or attach a non-ephemeral checkpoint disk. Do not stop an already
 prepared local-SSD node merely to change scopes; stopping discards local SSD.
 
 ```bash
-POLL_SECONDS=60 STABLE_SECONDS=180 \
+CLOUDSDK_CONFIG=/mnt/vla-jepa/gcloud-config \
+POLL_SECONDS=60 STABLE_SECONDS=180 LOG_SYNC_SECONDS=900 \
   ./scripts/watch_and_upload_checkpoints_gcs.sh \
   /mnt/vla-jepa/checkpoints/<run-id> \
   gs://<approved-bucket>/<approved-prefix>/<run-id>
 ```
 
-Confirm at least one smoke checkpoint can be listed and downloaded from the
-approved destination before relying on the uploader for production.
+The watcher uploads stable periodic checkpoints, refreshes TensorBoard and
+`summary.jsonl` logs, and uploads `final_model` once it is stable. Confirm at
+least one smoke checkpoint can be listed and downloaded from the approved
+destination before relying on the uploader for production.
 
 For each status handoff, report: run id, source manifest, config path/hash,
 current step/epoch, current and rolling step time, samples/s, ETA, latest losses,
