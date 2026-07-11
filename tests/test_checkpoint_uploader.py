@@ -1,4 +1,5 @@
 import os
+import shlex
 import subprocess
 from pathlib import Path
 
@@ -7,14 +8,27 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 UPLOADER = REPO_ROOT / "scripts/watch_and_upload_checkpoints_gcs.sh"
 
 
-def _write_fake_gcloud(bin_dir: Path, calls_path: Path) -> None:
+def _write_fake_gcloud(
+    bin_dir: Path,
+    calls_path: Path,
+    checkpoint_listing: tuple[str, ...] = (),
+) -> None:
     gcloud = bin_dir / "gcloud"
-    gcloud.write_text(
-        "#!/usr/bin/env bash\n"
-        "set -euo pipefail\n"
-        f"printf '%s\\n' \"$*\" >> {calls_path!s}\n",
-        encoding="utf-8",
-    )
+    script = [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        f"printf '%s\\n' \"$*\" >> {shlex.quote(str(calls_path))}",
+    ]
+    if checkpoint_listing:
+        quoted_listing = " ".join(shlex.quote(path) for path in checkpoint_listing)
+        script.extend(
+            [
+                'if [[ "${1:-}" == "storage" && "${2:-}" == "ls" ]]; then',
+                f"  printf '%s\\n' {quoted_listing}",
+                "fi",
+            ]
+        )
+    gcloud.write_text("\n".join(script) + "\n", encoding="utf-8")
     gcloud.chmod(0o755)
 
 
@@ -148,3 +162,43 @@ def test_uploader_supports_read_only_container_owned_run_directory(tmp_path):
     assert (state_dir / "uploaded_metadata").exists()
     assert (state_dir / "uploaded_steps_1").exists()
     assert (state_dir / "metadata/config.yaml").exists()
+
+
+def test_uploader_prunes_only_oldest_remote_step_checkpoint(tmp_path):
+    run_dir = tmp_path / "run"
+    checkpoint = run_dir / "checkpoints/steps_40"
+    checkpoint.mkdir(parents=True)
+    (checkpoint / "model.safetensors").write_bytes(b"checkpoint")
+
+    remote_root = "gs://test-bucket/test-run/checkpoints"
+    checkpoint_listing = tuple(
+        f"{remote_root}/steps_{step}/" for step in (2, 10, 20, 40)
+    )
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    calls_path = tmp_path / "gcloud_calls.txt"
+    _write_fake_gcloud(bin_dir, calls_path, checkpoint_listing)
+
+    env = os.environ.copy()
+    env.update(
+        {
+            "PATH": f"{bin_dir}:{env['PATH']}",
+            "RUN_ONCE": "1",
+            "STABLE_SECONDS": "0",
+            "REMOTE_CHECKPOINT_MAX_TO_KEEP": "3",
+            "CLOUDSDK_CONFIG": str(tmp_path / "gcloud-config"),
+        }
+    )
+    subprocess.run(
+        ["bash", str(UPLOADER), str(run_dir), "gs://test-bucket/test-run"],
+        check=True,
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+
+    calls = calls_path.read_text(encoding="utf-8")
+    assert f"storage rm --recursive {remote_root}/steps_2/" in calls
+    assert f"storage rm --recursive {remote_root}/steps_10/" not in calls
+    assert f"storage rm --recursive {remote_root}/steps_20/" not in calls
+    assert f"storage rm --recursive {remote_root}/steps_40/" not in calls

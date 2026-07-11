@@ -662,15 +662,21 @@ prepared local-SSD node merely to change scopes; stopping discards local SSD.
 ```bash
 CLOUDSDK_CONFIG=/mnt/vla-jepa/gcloud-config \
 POLL_SECONDS=60 STABLE_SECONDS=180 LOG_SYNC_SECONDS=900 \
+REMOTE_CHECKPOINT_MAX_TO_KEEP=3 \
   ./scripts/watch_and_upload_checkpoints_gcs.sh \
   /mnt/vla-jepa/checkpoints/<run-id> \
   gs://<approved-bucket>/<approved-prefix>/<run-id>
 ```
 
 The watcher uploads stable periodic checkpoints, refreshes TensorBoard and
-`summary.jsonl` logs, and uploads `final_model` once it is stable. Confirm at
-least one smoke checkpoint can be listed and downloaded from the approved
-destination before relying on the uploader for production.
+`summary.jsonl` logs, and uploads `final_model` once it is stable. For this run,
+it retains the latest three `steps_N` prefixes in GCS; final-model, log, and
+metadata paths are never included in that pruning. The bucket's seven-day soft
+delete policy preserves a deleted checkpoint temporarily before reclaiming its
+storage. A live four-prefix GCS probe verified that retention three deletes
+only the oldest `steps_N` prefix. Confirm at least one smoke checkpoint can be
+listed and downloaded from the approved destination before relying on the
+uploader for production.
 
 For each status handoff, report: run id, source manifest, config path/hash,
 current step/epoch, current and rolling step time, samples/s, ETA, latest losses,

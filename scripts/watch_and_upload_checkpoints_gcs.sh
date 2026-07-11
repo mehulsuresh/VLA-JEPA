@@ -14,9 +14,15 @@ STABLE_SECONDS="${STABLE_SECONDS:-180}"
 UPLOAD_FAILURE_BACKOFF_SECONDS="${UPLOAD_FAILURE_BACKOFF_SECONDS:-900}"
 LOG_SYNC_SECONDS="${LOG_SYNC_SECONDS:-900}"
 RUN_ONCE="${RUN_ONCE:-0}"
+REMOTE_CHECKPOINT_MAX_TO_KEEP="${REMOTE_CHECKPOINT_MAX_TO_KEEP:-0}"
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-${RUN_DIR}/checkpoints}"
 FINAL_MODEL_DIR="${FINAL_MODEL_DIR:-${RUN_DIR}/final_model}"
 TENSORBOARD_DIR="${TENSORBOARD_DIR:-${RUN_DIR}/starvla}"
+
+if [[ ! "${REMOTE_CHECKPOINT_MAX_TO_KEEP}" =~ ^[0-9]+$ ]]; then
+  echo "REMOTE_CHECKPOINT_MAX_TO_KEEP must be a non-negative integer" >&2
+  exit 2
+fi
 
 if [[ -z "${STATE_DIR:-}" ]]; then
   run_state_name="$(basename "${RUN_DIR}" | tr '/ ' '__' | tr -cd 'A-Za-z0-9._=-')"
@@ -115,6 +121,53 @@ upload_checkpoint_dir() {
   fi
 }
 
+prune_remote_checkpoints() {
+  if (( REMOTE_CHECKPOINT_MAX_TO_KEEP <= 0 )); then
+    return 0
+  fi
+
+  local list_log="${STATE_DIR}/remote_checkpoint_list.log"
+  local prune_log="${STATE_DIR}/remote_checkpoint_prune.log"
+  local remote_listing
+  if ! remote_listing="$(gcloud storage ls "${GCS_DEST}/checkpoints/" 2>"${list_log}")"; then
+    if grep -Eqi 'matched no objects|not found|does not exist' "${list_log}"; then
+      return 0
+    fi
+    log "Unable to list remote checkpoints (details: ${list_log})"
+    return 1
+  fi
+
+  local -a remote_checkpoints=()
+  local checkpoint_name
+  local listing_path
+  mapfile -t remote_checkpoints < <(
+    while IFS= read -r listing_path; do
+      listing_path="${listing_path%/}"
+      checkpoint_name="${listing_path##*/}"
+      if [[ "${checkpoint_name}" =~ ^steps_([0-9]+)$ ]]; then
+        printf '%020d\t%s/\n' "${BASH_REMATCH[1]}" "${listing_path}"
+      fi
+    done <<< "${remote_listing}" | sort -n
+  )
+
+  local prune_count=$(( ${#remote_checkpoints[@]} - REMOTE_CHECKPOINT_MAX_TO_KEEP ))
+  if (( prune_count <= 0 )); then
+    return 0
+  fi
+
+  : > "${prune_log}"
+  local index
+  local remote_path
+  for (( index = 0; index < prune_count; index++ )); do
+    remote_path="${remote_checkpoints[index]#*$'\t'}"
+    log "Pruning old remote checkpoint ${remote_path}"
+    if ! gcloud storage rm --recursive "${remote_path}" >>"${prune_log}" 2>&1; then
+      log "Unable to prune remote checkpoint ${remote_path} (details: ${prune_log})"
+      return 1
+    fi
+  done
+}
+
 upload_runtime_logs() {
   local marker="${STATE_DIR}/uploaded_runtime_logs"
   local upload_log="${STATE_DIR}/runtime_logs_upload.log"
@@ -186,6 +239,9 @@ run_upload_cycle() {
         return 1
       fi
     done < <(find "${CHECKPOINT_DIR}" -mindepth 1 -maxdepth 1 -type d -print0 | sort -zV)
+  fi
+  if ! prune_remote_checkpoints; then
+    return 1
   fi
   if ! upload_final_model; then
     return 1
