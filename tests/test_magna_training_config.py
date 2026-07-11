@@ -14,6 +14,7 @@ LAUNCHER_PATH = (
     REPO_ROOT
     / "scripts/vlajepa_robot_ft_lerobot_magna_interventions_a100x8_qwen35_2b_full_moge_vitb_vjepa_large.sh"
 )
+DOCKER_RUN_PATH = REPO_ROOT / "scripts/docker_run_training.sh"
 
 
 def test_magna_production_config_contract():
@@ -67,3 +68,10 @@ def test_magna_mixture_and_launcher_route_to_production_config():
     launcher = LAUNCHER_PATH.read_text(encoding="utf-8")
     assert CONFIG_PATH.name in launcher
     assert "vlajepa_robot_ft_libero_plus_a100x8_qwen3_full_moge_vitb_vjepa_large.sh" in launcher
+
+
+def test_docker_launcher_forwards_generic_and_realman_data_roots():
+    docker_run = DOCKER_RUN_PATH.read_text(encoding="utf-8")
+
+    assert "  DATA_ROOT_DIR\n" in docker_run
+    assert "  REALMAN_DATA_ROOT\n" in docker_run
