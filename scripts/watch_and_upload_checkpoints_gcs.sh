@@ -98,6 +98,12 @@ upload_checkpoint_dir() {
   if ! is_stable_dir "${ckpt_dir}"; then
     return 0
   fi
+  local unreadable_file
+  unreadable_file="$(find "${ckpt_dir}" -type f ! -readable -print -quit 2>/dev/null || true)"
+  if [[ -n "${unreadable_file}" ]]; then
+    log "Checkpoint ${ckpt_name} is not host-readable: ${unreadable_file}"
+    return 1
+  fi
 
   log "Uploading checkpoint ${ckpt_name} -> ${GCS_DEST}/checkpoints/${ckpt_name}"
   if gcloud storage rsync --recursive "${ckpt_dir}" "${GCS_DEST}/checkpoints/${ckpt_name}" >"${upload_log}" 2>&1; then
@@ -152,6 +158,12 @@ upload_final_model() {
   fi
   if ! is_stable_dir "${FINAL_MODEL_DIR}"; then
     return 0
+  fi
+  local unreadable_file
+  unreadable_file="$(find "${FINAL_MODEL_DIR}" -type f ! -readable -print -quit 2>/dev/null || true)"
+  if [[ -n "${unreadable_file}" ]]; then
+    log "Final model is not host-readable: ${unreadable_file}"
+    return 1
   fi
 
   log "Uploading final model -> ${GCS_DEST}/final_model"

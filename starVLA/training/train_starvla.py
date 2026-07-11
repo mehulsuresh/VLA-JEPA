@@ -940,6 +940,25 @@ def _drop_file_cache_best_effort(path: str) -> None:
         logger.warning(f"Unable to release checkpoint file cache for `{path}`: {exc}")
 
 
+def _make_artifact_tree_host_readable(path: str) -> None:
+    """Allow a host-side uploader to read artifacts written by root in Docker."""
+    directory_read_mode = 0o055
+    file_read_mode = 0o044
+
+    for root, dirnames, filenames in os.walk(path):
+        for dirname in dirnames:
+            directory_path = os.path.join(root, dirname)
+            current_mode = os.stat(directory_path).st_mode
+            os.chmod(directory_path, current_mode | directory_read_mode)
+        for filename in filenames:
+            file_path = os.path.join(root, filename)
+            current_mode = os.stat(file_path).st_mode
+            os.chmod(file_path, current_mode | file_read_mode)
+
+    current_mode = os.stat(path).st_mode
+    os.chmod(path, current_mode | directory_read_mode)
+
+
 def _trim_process_memory_best_effort() -> None:
     gc.collect()
 
@@ -1472,6 +1491,7 @@ class VLATrainer(TrainerUtils):
         checkpoint_path = os.path.join(self.checkpoint_dir, f"steps_{self.completed_steps}")
         os.makedirs(checkpoint_path, exist_ok=True)
         self.accelerator.save_state(checkpoint_path)
+        distributed_wait(self.accelerator)
         if self.accelerator.is_main_process:
             if bool(self.config.trainer.get("save_plain_weights_in_checkpoints", False)):
                 # Optional convenience artifact. Disabled by default because gathering and
@@ -1495,6 +1515,8 @@ class VLATrainer(TrainerUtils):
             }
             with open(os.path.join(self.config.output_dir, "summary.jsonl"), "a") as f:
                 f.write(json.dumps(summary_data) + "\n")
+
+            _make_artifact_tree_host_readable(checkpoint_path)
 
             if bool(self.config.trainer.get("drop_checkpoint_page_cache", True)):
                 _drop_file_cache_best_effort(checkpoint_path)
@@ -2342,6 +2364,7 @@ class VLATrainer(TrainerUtils):
                 final_checkpoint = os.path.join(self.config.output_dir, "final_model")
                 os.makedirs(final_checkpoint, exist_ok=True)
                 torch.save(state_dict, os.path.join(final_checkpoint, "pytorch_model.pt"))
+                _make_artifact_tree_host_readable(final_checkpoint)
                 if bool(self.config.trainer.get("drop_checkpoint_page_cache", True)):
                     _drop_file_cache_best_effort(final_checkpoint)
                 logger.info(f"Training complete. Final model saved at {final_checkpoint}")
