@@ -92,6 +92,7 @@ Completed smoke evidence:
 | 8 GPUs, batch 13/rank | Rejected; step 1 passed, step 2 exhausted rank 7 at 81,158 MiB | `/mnt/vla-jepa/logs/magna_a100x8_b13_smoke.log` and `.exit` |
 | 8 GPUs, batch 12/rank, 30 steps | Passed; steady throughput and loader test | `/mnt/vla-jepa/logs/magna_a100x8_b12_final_smoke_d3821a1_20260711_050611.log` |
 | 8 GPUs, batch 12/rank, two-step clean exit | Passed; no resource-tracker warning or new semaphore names | `/mnt/vla-jepa/logs/magna_a100x8_shutdown_smoke_4d263d2_20260711_051742.log` |
+| Full-state checkpoint and resume | Passed; saved step 1 and resumed all eight ranks through step 2 | `/mnt/vla-jepa/logs/magna_a100x8_checkpoint_smoke_4d263d2_20260711_052718.log` and `.resume.log` |
 
 Batch 12 is the measured upper bound: both batch 13 and batch 14 passed their
 first step before later sample/token variation exhausted memory. Retain enough
@@ -122,8 +123,13 @@ startup time and host memory. The fullest GPUs reached 78,294 MiB in
 There were no OOM, NCCL, NaN/Inf, decode, worker-exit, or worker-respawn events.
 
 At 76,644 total optimizer steps, the measured compute-only duration is about
-77.25 hours (3.22 days). Checkpoint serialization/upload and startup add to
-that estimate and must be included in the user-facing launch review.
+77.25 hours (3.22 days). A production-format resumable checkpoint is 18.53 GB:
+11.53 GB of optimizer state plus 7.00 GB of model weights. Saving it added
+about 30.6 seconds. At a 2,500-step interval this is approximately 0.34% local
+serialization overhead, and retaining three checkpoints uses about 55.6 GB.
+The same artifact was loaded with `resume_load_optimizer_state: true`; all
+eight ranks restored full state, began at step 1, completed step 2, and exited
+cleanly. Network upload time and initial startup still add to the ETA.
 
 The private resource-tracker shutdown hack was proven to cause the noisy
 `sem_unlink` tracebacks. The fixed eight-rank exit test had no such warning and
@@ -566,6 +572,30 @@ tmux new-session -d -s magna_train \
 tmux new-session -d -s magna_tensorboard \
   'cd /mnt/vla-jepa/src/VLA-JEPA && IMAGE=vla-jepa:py313-cu130-a100 ./scripts/docker_run_training.sh tensorboard --logdir /mnt/vla-jepa/checkpoints --host 0.0.0.0 --port 6006'
 ```
+
+Resume with the original run id and a complete `steps_N` directory. Do not
+point `resume_from_checkpoint` at the run root or at `model.safetensors` alone:
+
+```bash
+cd /mnt/vla-jepa/src/VLA-JEPA
+export RUN_ID=<original-run-id>
+export CHECKPOINT_ROOT=/mnt/vla-jepa/checkpoints
+export DATA_ROOT_DIR=/mnt/vla-jepa/datasets/magna_training_data_with_interventions
+export RESUME_CHECKPOINT="${CHECKPOINT_ROOT}/${RUN_ID}/checkpoints/steps_<N>"
+
+IMAGE=vla-jepa:py313-cu130-a100 \
+VLA_JEPA_SCRATCH=/mnt/vla-jepa \
+DATA_ROOT="${DATA_ROOT_DIR}" \
+MAX_TRAIN_STEPS=76644 \
+./scripts/docker_run_training.sh \
+  ./scripts/vlajepa_robot_ft_lerobot_magna_interventions_a100x8_qwen35_2b_full_moge_vitb_vjepa_large.sh \
+    --trainer.is_resume true \
+    --trainer.resume_from_checkpoint "${RESUME_CHECKPOINT}"
+```
+
+Require the log to say `Resumed from checkpoint (full_state)` and verify the
+progress bar starts at step `N`. The checkpoint smoke proved this path with
+`steps_1`, then completed step 2 on all eight ranks.
 
 View TensorBoard through an SSH tunnel rather than exposing port 6006:
 
