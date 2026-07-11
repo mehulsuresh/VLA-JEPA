@@ -842,33 +842,10 @@ def _shutdown_dataloader_workers(dataloader) -> None:
     if dataloader is None:
         return
     _shutdown_dataloader_iterator(getattr(dataloader, "_iterator", None))
-
-
-def _shutdown_multiprocessing_resource_tracker_best_effort() -> None:
-    """
-    PyTorch DataLoader shutdown is sometimes not enough to reap Python's
-    multiprocessing resource_tracker process after interrupts on this machine.
-    Stop the per-process tracker explicitly once training teardown is complete.
-    """
     try:
-        import multiprocessing.resource_tracker as resource_tracker
-    except Exception:
-        return
-
-    tracker = getattr(resource_tracker, "_resource_tracker", None)
-    stop = getattr(tracker, "_stop", None)
-    tracker_pid = getattr(tracker, "_pid", None)
-    if tracker is None or not callable(stop) or tracker_pid is None:
-        return
-
-    try:
-        stop()
-    except ChildProcessError:
+        dataloader._iterator = None
+    except (AttributeError, TypeError):
         pass
-    except OSError:
-        pass
-    except Exception as exc:
-        logger.warning(f"Failed to stop multiprocessing resource tracker: {exc}")
 
 
 class _RankVideoBatchPrefetcher:
@@ -1130,6 +1107,7 @@ class VLATrainer(TrainerUtils):
         self.progress_eta_warmup_steps = max(int(self.config.trainer.get("progress_eta_warmup_steps", 3)), 0)
         self._recent_wall_step_times = deque(maxlen=self.progress_eta_window)
         self._rank_video_prefetcher: Optional[_RankVideoBatchPrefetcher] = None
+        self._data_runtime_shutdown = False
         self._prefetch_model = None
         self._last_prefetch_timing: Optional[dict] = None
         self._rank_timing_keys = (
@@ -2376,6 +2354,9 @@ class VLATrainer(TrainerUtils):
         finish_trackers(self.accelerator)
 
     def _shutdown_data_runtime(self):
+        if self._data_runtime_shutdown:
+            return
+        self._data_runtime_shutdown = True
         if self._rank_video_prefetcher is not None:
             try:
                 self._rank_video_prefetcher.close()
@@ -2388,7 +2369,6 @@ class VLATrainer(TrainerUtils):
             setattr(self, attr_name, None)
         _shutdown_dataloader_workers(getattr(self, "vla_train_dataloader", None))
         gc.collect()
-        _shutdown_multiprocessing_resource_tracker_best_effort()
 
 
 def main(cfg) -> None:
@@ -2450,7 +2430,6 @@ def main(cfg) -> None:
                 _shutdown_dataloader_workers(vla_train_dataloader)
             except Exception as exc:
                 logger.warning(f"Fallback dataloader shutdown failed: {exc}")
-            _shutdown_multiprocessing_resource_tracker_best_effort()
         if dist.is_initialized():
             if not interrupted:
                 try:
