@@ -66,9 +66,10 @@ Host CPUs / RAM / swap        96 / approximately 1.3 TiB / none
 Scratch                       approximately 2.9 TiB RAID0 at /mnt/disks/ssd-array
 Docker data root              /mnt/vla-jepa/docker
 Verified training commit      4d263d2ab41df3895d2e46b83a86bc44bbe043bf
+Image source commit           0de4919aa579727bfc778e8335eb5b9aa8eef9c2
 V-JEPA2 helper commit         204698b45b3712590f06245fbfba32d3be539812
 MoGe helper commit            07444410f1e33f402353b99d6ccd26bd31e469e8
-Last fully baked image ID     sha256:c8e2b35b316de4cd80747e5b7d6eb5fb17ae5c9a5f964ff7ce4e8f1d03705f67
+Last fully baked image ID     sha256:76903dc91c649e101a9aa16ec29405974cf5bfee29b3e7067f883eabe5f8d67a
 Image Python / Torch / CUDA   3.13.14 / 2.13.0+cu130 / 13.0
 FlashAttention               2.8.3.post1, compiled only for SM80
 ```
