@@ -51,7 +51,7 @@ Follow these invariants:
 - Leave a final handoff with the exact commit, local diff manifest, image ID,
   dataset checksum result, commands, log paths, run id, and remaining blocker.
 
-### Current Handoff Snapshot (2026-07-10 PDT)
+### Current Handoff Snapshot (2026-07-11 PDT)
 
 This snapshot records what the previous agent actually completed. It is not a
 substitute for checking exit markers and live processes with the command above.
@@ -65,11 +65,12 @@ GPUs                          8x A100-SXM4-80GB, full NVLink mesh
 Host CPUs / RAM / swap        96 / approximately 1.3 TiB / none
 Scratch                       approximately 2.9 TiB RAID0 at /mnt/disks/ssd-array
 Docker data root              /mnt/vla-jepa/docker
-Verified training commit      4d263d2ab41df3895d2e46b83a86bc44bbe043bf
-Image source commit           0de4919aa579727bfc778e8335eb5b9aa8eef9c2
+Runtime code commit           f94d28d (full hash recorded in the cloud manifest)
+8-GPU smoke commit            4d263d2ab41df3895d2e46b83a86bc44bbe043bf
+Image source commit           f94d28d (full hash recorded in the cloud manifest)
 V-JEPA2 helper commit         204698b45b3712590f06245fbfba32d3be539812
 MoGe helper commit            07444410f1e33f402353b99d6ccd26bd31e469e8
-Last fully baked image ID     sha256:76903dc91c649e101a9aa16ec29405974cf5bfee29b3e7067f883eabe5f8d67a
+Last fully baked image ID     sha256:6078bcc8b360fef8571f8b6ceede2a03ccff251fdbaa71c7c420509aae5e852a
 Image Python / Torch / CUDA   3.13.14 / 2.13.0+cu130 / 13.0
 FlashAttention               2.8.3.post1, compiled only for SM80
 ```
@@ -110,8 +111,8 @@ The verified commit and image contain:
 - idempotent DataLoader teardown without calling Python 3.13's private
   `resource_tracker._stop()` while semaphore finalizers are still live.
 
-Local `pytest tests -q` passed with `130 passed, 2 skipped`; the final cloud
-source/image test passed with `131 passed, 1 skipped`. Use `pytest tests -q`;
+Local `pytest tests -q` passed with `135 passed, 1 skipped`; the final baked
+cloud image passed with `134 passed, 2 skipped`. Use `pytest tests -q`;
 bare `pytest -q` also collects optional simulation packages that are not part
 of this training image.
 
@@ -139,21 +140,30 @@ predate the fixed test and include artifacts from force-stopped OOM probes.
 They occupy negligible space; remove them only while no training/container or
 other multiprocessing job is active.
 
-The remaining ordered work is:
+The final backup preflight used the production uploader and destination prefix:
 
-1. Prove checkpoint upload, listing, and download through the production backup
-   destination.
-2. Present the complete setting/throughput/ETA review to the user.
-3. Launch production only after the user explicitly approves that review.
+```text
+gs://robotics-datasets-yonduai/gcloud/vla-jepa/checkpoints/preflight/magna_a100x8_checkpoint_smoke_4d263d2_20260711_052718
+```
 
-The current VM service account has only the `devstorage.read_only` OAuth scope.
-The workstation account `mehul@yonduai.com` successfully uploaded, read, and
-deleted a unique preflight object under
-`gs://robotics-datasets-yonduai/gcloud/vla-jepa/checkpoints/`, proving bucket
-IAM is sufficient. The production backup path remains blocked only until that
-user (or another renewable writer credential) is authenticated in the VM's
-mounted gcloud config and tested end to end. Do not stop this local-SSD
-instance merely to change scopes.
+It uploaded checkpoint metadata, TensorBoard logs, and all 12 resumable-state
+files. A clean restore downloaded `18,526,901,498` checkpoint bytes at about
+`882 MiB/s`; every restored file matched the source SHA-256. Docker's
+`model.safetensors` was initially mode `0600`, so commits `c96dc31` and
+`f94d28d` moved uploader bookkeeping outside root-owned run directories and
+made completed checkpoints/final models host-readable. The uploader now also
+rejects unreadable artifacts before beginning a partial transfer.
+
+The VM service account still has only the `devstorage.read_only` OAuth scope,
+but `mehul@yonduai.com` is authenticated in the mounted
+`/mnt/vla-jepa/gcloud-config`. VM-side write/read/delete and the complete
+checkpoint round trip passed against the approved bucket. Do not stop this
+local-SSD instance merely to change its service-account scopes.
+
+The only remaining ordered work is:
+
+1. Present the complete setting/throughput/ETA review to the user.
+2. Launch production only after the user explicitly approves that review.
 
 ## Known Production Inputs
 
