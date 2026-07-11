@@ -203,10 +203,11 @@ The verified commit and image contain:
   `resource_tracker._stop()` while semaphore finalizers are still live.
 
 The current local audit passed `pytest tests -q` with `147 passed, 1 skipped`.
-The final baked cloud image previously passed with `140 passed, 2 skipped`
-before the new operational-runner tests were added. Use `pytest tests -q`;
-bare `pytest -q` also collects optional simulation packages that are not part
-of this training image. Rerun the current suite in every newly built image.
+The synchronized cloud checkout passed the same suite inside the final baked
+image, with GPU access disabled, at `146 passed, 2 skipped`. Use
+`pytest tests -q`; bare `pytest -q` also collects optional simulation packages
+that are not part of this training image. Rerun the current suite in every newly
+built image.
 
 The 30-step smoke outlasted the per-rank prefetch queue. Over its final 20
 steps it averaged 3.6284 seconds per optimizer step, 26.48 global samples/s,
