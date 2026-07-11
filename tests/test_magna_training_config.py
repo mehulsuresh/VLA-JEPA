@@ -1,3 +1,7 @@
+import fcntl
+import os
+import shlex
+import subprocess
 from pathlib import Path
 
 from omegaconf import OmegaConf
@@ -15,6 +19,8 @@ LAUNCHER_PATH = (
     / "scripts/vlajepa_robot_ft_lerobot_magna_interventions_a100x8_qwen35_2b_full_moge_vitb_vjepa_large.sh"
 )
 DOCKER_RUN_PATH = REPO_ROOT / "scripts/docker_run_training.sh"
+CLOUD_SERVICE_PATH = REPO_ROOT / "scripts/run_cloud_training_service.sh"
+IMAGE_BUILD_PATH = REPO_ROOT / "scripts/build_magna_a100_image.sh"
 
 
 def test_magna_production_config_contract():
@@ -75,3 +81,175 @@ def test_docker_launcher_forwards_generic_and_realman_data_roots():
 
     assert "  DATA_ROOT_DIR\n" in docker_run
     assert "  REALMAN_DATA_ROOT\n" in docker_run
+    assert 'DOCKER_ARGS+=(--name "${DOCKER_NAME}")' in docker_run
+
+
+def test_cloud_service_runner_has_reproducible_run_guards():
+    for script_path in (CLOUD_SERVICE_PATH, IMAGE_BUILD_PATH):
+        subprocess.run(["bash", "-n", str(script_path)], check=True)
+
+    service = CLOUD_SERVICE_PATH.read_text(encoding="utf-8")
+    assert "RUN_ENV_FILE" in service
+    assert "RESUME_CHECKPOINT" in service
+    assert "EXPECTED_SOURCE_COMMIT" in service
+    assert "Runtime source mismatch" in service
+    assert "Runtime source path mismatch" in service
+    assert 'acquire_service_lock "${SERVICE_NAME}"' in service
+    assert "SERVICE_NAME=tensorboard" in service
+    assert "production_preflight_manifest.txt" in service
+    assert "HANDOFF_METADATA_DIR" in service
+    assert 'EXTRA_METADATA_DIR="${HANDOFF_METADATA_DIR}"' in service
+    assert 'MOUNT_GCLOUD=0' in service
+    assert 'DOCKER_GPU_MODE=none' in service
+    assert 'DOCKER_NAME="${TRAIN_CONTAINER_NAME}"' in service
+
+    image_build = IMAGE_BUILD_PATH.read_text(encoding="utf-8")
+    assert 'INSTALL_DEEPSPEED="${INSTALL_DEEPSPEED:-0}"' in image_build
+    assert 'FLASH_ATTN_CUDA_ARCH_LIST="${FLASH_ATTN_CUDA_ARCH_LIST:-8.0}"' in image_build
+    assert "Refusing to build the production image from a dirty worktree" in image_build
+
+
+def test_cloud_service_runner_launches_named_container_and_records_exit(tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    docker_calls = tmp_path / "docker_calls.txt"
+    fake_docker = bin_dir / "docker"
+    fake_docker.write_text(
+        "#!/usr/bin/env bash\n"
+        f"printf '%s\\n' \"$*\" >> {shlex.quote(str(docker_calls))}\n",
+        encoding="utf-8",
+    )
+    fake_docker.chmod(0o755)
+
+    scratch = tmp_path / "scratch"
+    checkpoint_root = scratch / "checkpoints"
+    log_root = scratch / "logs"
+    launch_env = tmp_path / "launch.env"
+    launch_env.write_text("RUN_ID=service-smoke\n", encoding="utf-8")
+    launch_env.chmod(0o644)
+    env = os.environ.copy()
+    env.update(
+        {
+            "PATH": f"{bin_dir}:{env['PATH']}",
+            "RUN_ID": "service-smoke",
+            "VLA_JEPA_SCRATCH": str(scratch),
+            "CHECKPOINT_ROOT": str(checkpoint_root),
+            "LOG_ROOT": str(log_root),
+            "TRAIN_LAUNCHER": "/bin/true",
+            "RUN_ENV_FILE": str(launch_env),
+        }
+    )
+
+    subprocess.run(
+        ["bash", str(CLOUD_SERVICE_PATH), "train"],
+        check=True,
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+
+    calls = docker_calls.read_text(encoding="utf-8")
+    assert "--name service-smoke-train" in calls
+    assert "-e RUN_ID=service-smoke" in calls
+    assert (log_root / "service-smoke.exit").read_text(encoding="utf-8") == "0\n"
+
+
+def test_cloud_service_runner_rejects_nonempty_run_without_resume(tmp_path):
+    scratch = tmp_path / "scratch"
+    run_dir = scratch / "checkpoints/service-smoke"
+    run_dir.mkdir(parents=True)
+    (run_dir / "partial-artifact").write_text("incomplete\n", encoding="utf-8")
+    launch_env = tmp_path / "launch.env"
+    launch_env.write_text("RUN_ID=service-smoke\n", encoding="utf-8")
+    launch_env.chmod(0o644)
+    env = os.environ.copy()
+    env.update(
+        {
+            "RUN_ID": "service-smoke",
+            "VLA_JEPA_SCRATCH": str(scratch),
+            "CHECKPOINT_ROOT": str(scratch / "checkpoints"),
+            "LOG_ROOT": str(scratch / "logs"),
+            "TRAIN_LAUNCHER": "/bin/true",
+            "RUN_ENV_FILE": str(launch_env),
+        }
+    )
+
+    result = subprocess.run(
+        ["bash", str(CLOUD_SERVICE_PATH), "train"],
+        check=False,
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode == 2
+    assert "Run directory is not empty" in result.stderr
+    assert (scratch / "logs/service-smoke.exit").read_text(encoding="utf-8") == "2\n"
+
+
+def test_cloud_service_runner_rejects_duplicate_without_replacing_exit_marker(
+    tmp_path,
+):
+    scratch = tmp_path / "scratch"
+    log_root = scratch / "logs"
+    log_root.mkdir(parents=True)
+    lock_path = log_root / "service-smoke.train.lock"
+    launch_env = tmp_path / "launch.env"
+    launch_env.write_text("RUN_ID=service-smoke\n", encoding="utf-8")
+    launch_env.chmod(0o644)
+    env = os.environ.copy()
+    env.update(
+        {
+            "RUN_ID": "service-smoke",
+            "VLA_JEPA_SCRATCH": str(scratch),
+            "CHECKPOINT_ROOT": str(scratch / "checkpoints"),
+            "LOG_ROOT": str(log_root),
+            "RUN_ENV_FILE": str(launch_env),
+        }
+    )
+
+    with lock_path.open("w", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        result = subprocess.run(
+            ["bash", str(CLOUD_SERVICE_PATH), "train"],
+            check=False,
+            env=env,
+            text=True,
+            capture_output=True,
+        )
+
+    assert result.returncode == 2
+    assert "Another train service already owns" in result.stderr
+    assert not (log_root / "service-smoke.exit").exists()
+
+
+def test_cloud_service_runner_rejects_unsafe_launch_environment(tmp_path):
+    injected_path = tmp_path / "injected"
+    cases = (
+        (
+            f"RUN_ID=$(touch {injected_path})\n",
+            "only comments, blanks, and literal KEY=value assignments",
+        ),
+        (
+            "RUN_ID=service-smoke\nWANDB_API_KEY=not-a-real-key\n",
+            "secret-like variable",
+        ),
+    )
+
+    for index, (contents, expected_error) in enumerate(cases):
+        launch_env = tmp_path / f"unsafe-{index}.env"
+        launch_env.write_text(contents, encoding="utf-8")
+        launch_env.chmod(0o644)
+        env = os.environ.copy()
+        env["RUN_ENV_FILE"] = str(launch_env)
+        result = subprocess.run(
+            ["bash", str(CLOUD_SERVICE_PATH), "train"],
+            check=False,
+            env=env,
+            text=True,
+            capture_output=True,
+        )
+        assert result.returncode == 2
+        assert expected_error in result.stderr
+
+    assert not injected_path.exists()

@@ -45,6 +45,14 @@ DOCKER_ARGS=(
 
 DOCKER_MOUNT_TARGETS=("${CONTAINER_WORKDIR}")
 
+if [[ -n "${DOCKER_NAME:-}" ]]; then
+  if [[ ! "${DOCKER_NAME}" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; then
+    echo "Invalid DOCKER_NAME=${DOCKER_NAME}" >&2
+    exit 1
+  fi
+  DOCKER_ARGS+=(--name "${DOCKER_NAME}")
+fi
+
 add_docker_mount() {
   local source_path="$1"
   local target_path="${2:-$1}"

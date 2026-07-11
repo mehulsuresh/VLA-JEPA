@@ -18,6 +18,7 @@ REMOTE_CHECKPOINT_MAX_TO_KEEP="${REMOTE_CHECKPOINT_MAX_TO_KEEP:-0}"
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-${RUN_DIR}/checkpoints}"
 FINAL_MODEL_DIR="${FINAL_MODEL_DIR:-${RUN_DIR}/final_model}"
 TENSORBOARD_DIR="${TENSORBOARD_DIR:-${RUN_DIR}/starvla}"
+EXTRA_METADATA_DIR="${EXTRA_METADATA_DIR:-}"
 
 if [[ ! "${REMOTE_CHECKPOINT_MAX_TO_KEEP}" =~ ^[0-9]+$ ]]; then
   echo "REMOTE_CHECKPOINT_MAX_TO_KEEP must be a non-negative integer" >&2
@@ -70,22 +71,39 @@ upload_metadata() {
   local marker="${STATE_DIR}/uploaded_metadata"
   local metadata_dir="${STATE_DIR}/metadata"
   local upload_log="${STATE_DIR}/metadata_upload.log"
-  if [[ -e "${marker}" ]]; then
+  local fingerprint
+
+  mkdir -p "${metadata_dir}"
+  find "${metadata_dir}" -mindepth 1 -maxdepth 1 -type f -delete
+  for source_dir in "${EXTRA_METADATA_DIR}" "${RUN_DIR}"; do
+    if [[ -z "${source_dir}" || ! -d "${source_dir}" ]]; then
+      continue
+    fi
+    find "${source_dir}" -maxdepth 1 -type f \
+      \( -name 'config.yaml' -o -name 'config.json' -o -name 'dataset_statistics.json' -o -name 'canonical_subset_summary.json' -o -name 'canonical_subset_manifest.jsonl' -o -name 'launch.env' -o -name 'production_preflight_manifest.txt' \) \
+      -exec cp -p {} "${metadata_dir}/" \;
+  done
+  if ! find "${metadata_dir}" -type f | grep -q .; then
     return 0
   fi
-  mkdir -p "${metadata_dir}"
-  find "${RUN_DIR}" -maxdepth 1 -type f \
-    \( -name 'config.yaml' -o -name 'config.json' -o -name 'dataset_statistics.json' -o -name 'canonical_subset_summary.json' -o -name 'canonical_subset_manifest.jsonl' \) \
-    -exec cp -p {} "${metadata_dir}/" \;
-  if find "${metadata_dir}" -type f | grep -q .; then
-    log "Uploading run metadata -> ${GCS_DEST}/metadata"
-    if gcloud storage rsync --recursive "${metadata_dir}" "${GCS_DEST}/metadata" >"${upload_log}" 2>&1; then
-      date -Is > "${marker}"
-      log "Uploaded run metadata"
-    else
-      log "Run metadata upload failed; will retry in ${UPLOAD_FAILURE_BACKOFF_SECONDS}s (details: ${upload_log})"
-      return 1
-    fi
+
+  fingerprint="$({
+    cd "${metadata_dir}"
+    find . -maxdepth 1 -type f -printf '%P\0' \
+      | sort -z \
+      | xargs -0 sha256sum
+  } | sha256sum | awk '{print $1}')"
+  if [[ -e "${marker}" && "$(cat "${marker}")" == "${fingerprint}" ]]; then
+    return 0
+  fi
+
+  log "Synchronizing changed run metadata -> ${GCS_DEST}/metadata"
+  if gcloud storage rsync --recursive "${metadata_dir}" "${GCS_DEST}/metadata" >"${upload_log}" 2>&1; then
+    printf '%s\n' "${fingerprint}" > "${marker}"
+    log "Synchronized run metadata"
+  else
+    log "Run metadata upload failed; will retry in ${UPLOAD_FAILURE_BACKOFF_SECONDS}s (details: ${upload_log})"
+    return 1
   fi
 }
 

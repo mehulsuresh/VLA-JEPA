@@ -139,7 +139,7 @@ VLA-JEPA/
 <a id="environment-setup"></a>
 ## ⚙️ Environment Setup
 
-For cloud GPU training, prefer the Docker runtime in [`docs/docker_training.md`](./docs/docker_training.md). It packages the Python 3.13, PyTorch, PyAV, Qwen3-VL, optional MoGe, and optional DeepSpeed stack behind one image and includes a preflight check for H100/A100-style machines.
+For cloud GPU training, prefer the Docker runtime in [`docs/docker_training.md`](./docs/docker_training.md). It packages the Python 3.13, PyTorch, PyAV, Qwen3-VL, optional MoGe, and optional DeepSpeed stack behind one image and includes a preflight check for H100/A100-style machines. Agents preparing or handing off the Magna A100x8 production workflow must start with the living [`docs/magna_a100x8_training_runbook.md`](./docs/magna_a100x8_training_runbook.md).
 
 For local bare-metal development, the recommended path is the no-compile Python 3.13 setup. It installs the latest PyPI PyTorch/torchvision pair first, then the small runtime package set in [`requirements-py313-min.txt`](./requirements-py313-min.txt). Full setup notes, optional accelerators, and legacy CUDA 12.4 instructions live in [`docs/repo_environment_setup.md`](./docs/repo_environment_setup.md).
 
