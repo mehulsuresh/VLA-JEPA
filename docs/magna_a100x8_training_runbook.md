@@ -65,12 +65,12 @@ GPUs                          8x A100-SXM4-80GB, full NVLink mesh
 Host CPUs / RAM / swap        96 / approximately 1.3 TiB / none
 Scratch                       approximately 2.9 TiB RAID0 at /mnt/disks/ssd-array
 Docker data root              /mnt/vla-jepa/docker
-Runtime code commit           70c57e9 (full hash recorded in the cloud manifest)
+Runtime code commit           f2aafad (full hash recorded in the cloud manifest)
 8-GPU smoke commit            4d263d2ab41df3895d2e46b83a86bc44bbe043bf
-Image source commit           70c57e9 (full hash recorded in the cloud manifest)
+Image source commit           f2aafad (full hash recorded in the cloud manifest)
 V-JEPA2 helper commit         204698b45b3712590f06245fbfba32d3be539812
 MoGe helper commit            07444410f1e33f402353b99d6ccd26bd31e469e8
-Last fully baked image ID     sha256:c72b73afda6dc0822b4e21a131b1e122580243c1d7b7101941476046dd729ba8
+Last fully baked image ID     sha256:633e1a2a28550726531771b0dc888a83531ec1f599ee17a678f96373b45b6ccc
 Image Python / Torch / CUDA   3.13.14 / 2.13.0+cu130 / 13.0
 FlashAttention               2.8.3.post1, compiled only for SM80
 ```
@@ -80,7 +80,7 @@ SHA-256 check of every file. The manifest is
 `/mnt/vla-jepa/logs/magna_training_data.sha256`; its own SHA-256 is:
 
 ```text
-45e8204172b2f279ce1f52e6ac768fa08b28ada8ba8edb9da8abb6c7dd41fef9
+02d062e4cc7535b9794cd804f30ea0093b0ce1b4937e64cfacb30c33bebcc49a
 ```
 
 Completed smoke evidence:
@@ -95,6 +95,7 @@ Completed smoke evidence:
 | 8 GPUs, batch 12/rank, 30 steps | Passed; steady throughput and loader test | `/mnt/vla-jepa/logs/magna_a100x8_b12_final_smoke_d3821a1_20260711_050611.log` |
 | 8 GPUs, batch 12/rank, two-step clean exit | Passed; no resource-tracker warning or new semaphore names | `/mnt/vla-jepa/logs/magna_a100x8_shutdown_smoke_4d263d2_20260711_051742.log` |
 | Full-state checkpoint and resume | Passed; saved step 1 and resumed all eight ranks through step 2 | `/mnt/vla-jepa/logs/magna_a100x8_checkpoint_smoke_4d263d2_20260711_052718.log` and `.resume.log` |
+| Final 18D action config, 8 GPUs, batch 12/rank | Passed two optimizer steps; action statistics are 18D and state remains 19D | `/mnt/vla-jepa/logs/magna_a100x8_18d_smoke_f2aafad_20260711_0910.result.txt` |
 
 Batch 12 is the measured upper bound: both batch 13 and batch 14 passed their
 first step before later sample/token variation exhausted memory. Retain enough
@@ -111,8 +112,8 @@ The verified commit and image contain:
 - idempotent DataLoader teardown without calling Python 3.13's private
   `resource_tracker._stop()` while semaphore finalizers are still live.
 
-Local `pytest tests -q` passed with `136 passed, 1 skipped`; the final baked
-cloud image passed with `135 passed, 2 skipped`. Use `pytest tests -q`;
+Local `pytest tests -q` passed with `141 passed, 1 skipped`; the final baked
+cloud image passed with `140 passed, 2 skipped`. Use `pytest tests -q`;
 bare `pytest -q` also collects optional simulation packages that are not part
 of this training image.
 
