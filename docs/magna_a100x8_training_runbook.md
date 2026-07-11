@@ -65,12 +65,12 @@ GPUs                          8x A100-SXM4-80GB, full NVLink mesh
 Host CPUs / RAM / swap        96 / approximately 1.3 TiB / none
 Scratch                       approximately 2.9 TiB RAID0 at /mnt/disks/ssd-array
 Docker data root              /mnt/vla-jepa/docker
-Runtime code commit           f94d28d (full hash recorded in the cloud manifest)
+Runtime code commit           70c57e9 (full hash recorded in the cloud manifest)
 8-GPU smoke commit            4d263d2ab41df3895d2e46b83a86bc44bbe043bf
-Image source commit           f94d28d (full hash recorded in the cloud manifest)
+Image source commit           70c57e9 (full hash recorded in the cloud manifest)
 V-JEPA2 helper commit         204698b45b3712590f06245fbfba32d3be539812
 MoGe helper commit            07444410f1e33f402353b99d6ccd26bd31e469e8
-Last fully baked image ID     sha256:6078bcc8b360fef8571f8b6ceede2a03ccff251fdbaa71c7c420509aae5e852a
+Last fully baked image ID     sha256:c72b73afda6dc0822b4e21a131b1e122580243c1d7b7101941476046dd729ba8
 Image Python / Torch / CUDA   3.13.14 / 2.13.0+cu130 / 13.0
 FlashAttention               2.8.3.post1, compiled only for SM80
 ```
@@ -111,8 +111,8 @@ The verified commit and image contain:
 - idempotent DataLoader teardown without calling Python 3.13's private
   `resource_tracker._stop()` while semaphore finalizers are still live.
 
-Local `pytest tests -q` passed with `135 passed, 1 skipped`; the final baked
-cloud image passed with `134 passed, 2 skipped`. Use `pytest tests -q`;
+Local `pytest tests -q` passed with `136 passed, 1 skipped`; the final baked
+cloud image passed with `135 passed, 2 skipped`. Use `pytest tests -q`;
 bare `pytest -q` also collects optional simulation packages that are not part
 of this training image.
 
