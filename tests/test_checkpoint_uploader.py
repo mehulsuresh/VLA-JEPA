@@ -107,3 +107,44 @@ def test_uploader_waits_for_stable_checkpoint_and_final_model(tmp_path):
     state_dir = run_dir / ".upload_state"
     assert not (state_dir / "uploaded_steps_1").exists()
     assert not (state_dir / "uploaded_final_model").exists()
+
+
+def test_uploader_supports_read_only_container_owned_run_directory(tmp_path):
+    run_dir = tmp_path / "container-owned-run"
+    checkpoint = run_dir / "checkpoints/steps_1"
+    checkpoint.mkdir(parents=True)
+    (run_dir / "config.yaml").write_text("trainer: {}\n", encoding="utf-8")
+    (checkpoint / "model.safetensors").write_bytes(b"checkpoint")
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    calls_path = tmp_path / "gcloud_calls.txt"
+    _write_fake_gcloud(bin_dir, calls_path)
+    state_root = tmp_path / "external-upload-state"
+
+    run_dir.chmod(0o555)
+    try:
+        env = os.environ.copy()
+        env.update(
+            {
+                "PATH": f"{bin_dir}:{env['PATH']}",
+                "RUN_ONCE": "1",
+                "STABLE_SECONDS": "0",
+                "CLOUDSDK_CONFIG": str(tmp_path / "gcloud-config"),
+                "UPLOAD_STATE_ROOT": str(state_root),
+            }
+        )
+        subprocess.run(
+            ["bash", str(UPLOADER), str(run_dir), "gs://test-bucket/test-run"],
+            check=True,
+            env=env,
+            text=True,
+            capture_output=True,
+        )
+    finally:
+        run_dir.chmod(0o755)
+
+    state_dir = state_root / run_dir.name
+    assert (state_dir / "uploaded_metadata").exists()
+    assert (state_dir / "uploaded_steps_1").exists()
+    assert (state_dir / "metadata/config.yaml").exists()

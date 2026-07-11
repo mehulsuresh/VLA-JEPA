@@ -14,10 +14,22 @@ STABLE_SECONDS="${STABLE_SECONDS:-180}"
 UPLOAD_FAILURE_BACKOFF_SECONDS="${UPLOAD_FAILURE_BACKOFF_SECONDS:-900}"
 LOG_SYNC_SECONDS="${LOG_SYNC_SECONDS:-900}"
 RUN_ONCE="${RUN_ONCE:-0}"
-STATE_DIR="${STATE_DIR:-${RUN_DIR}/.upload_state}"
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-${RUN_DIR}/checkpoints}"
 FINAL_MODEL_DIR="${FINAL_MODEL_DIR:-${RUN_DIR}/final_model}"
 TENSORBOARD_DIR="${TENSORBOARD_DIR:-${RUN_DIR}/starvla}"
+
+if [[ -z "${STATE_DIR:-}" ]]; then
+  run_state_name="$(basename "${RUN_DIR}" | tr '/ ' '__' | tr -cd 'A-Za-z0-9._=-')"
+  if [[ -n "${UPLOAD_STATE_ROOT:-}" ]]; then
+    STATE_DIR="${UPLOAD_STATE_ROOT%/}/${run_state_name}"
+  elif [[ -w "${RUN_DIR}" ]]; then
+    STATE_DIR="${RUN_DIR}/.upload_state"
+  elif [[ -d /mnt/vla-jepa/logs && -w /mnt/vla-jepa/logs ]]; then
+    STATE_DIR="/mnt/vla-jepa/logs/checkpoint_upload_state/${run_state_name}"
+  else
+    STATE_DIR="${RUN_DIR}/.upload_state"
+  fi
+fi
 
 if [[ -z "${CLOUDSDK_CONFIG:-}" && -d /mnt/vla-jepa/gcloud-config ]]; then
   export CLOUDSDK_CONFIG=/mnt/vla-jepa/gcloud-config
@@ -50,7 +62,7 @@ PY
 
 upload_metadata() {
   local marker="${STATE_DIR}/uploaded_metadata"
-  local metadata_dir="${RUN_DIR}/.upload_metadata"
+  local metadata_dir="${STATE_DIR}/metadata"
   local upload_log="${STATE_DIR}/metadata_upload.log"
   if [[ -e "${marker}" ]]; then
     return 0
