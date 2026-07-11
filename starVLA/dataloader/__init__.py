@@ -116,16 +116,29 @@ def _resolve_output_dir(cfg) -> Path | None:
     return None
 
 
-def _close_worker_dataset_readers(dataset) -> None:
+def _close_worker_dataset_readers(dataset, visited: set[int] | None = None) -> None:
     """Best-effort cleanup for native video readers held by worker-local dataset copies."""
     if dataset is None:
         return
+    if visited is None:
+        visited = set()
+    dataset_id = id(dataset)
+    if dataset_id in visited:
+        return
+    visited.add(dataset_id)
     wrapped = getattr(dataset, "dataset", None)
     if wrapped is not None and wrapped is not dataset:
-        _close_worker_dataset_readers(wrapped)
+        _close_worker_dataset_readers(wrapped, visited)
+    children = getattr(dataset, "datasets", None)
+    if children is not None:
+        for child in children:
+            _close_worker_dataset_readers(child, visited)
     close_readers = getattr(dataset, "close_video_readers", None)
     if callable(close_readers):
         close_readers()
+    close_parquet_cache = getattr(dataset, "close_parquet_cache", None)
+    if callable(close_parquet_cache):
+        close_parquet_cache()
     readers = getattr(dataset, "_decord_readers", None)
     if readers is not None:
         try:

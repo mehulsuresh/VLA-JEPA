@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import random
 from typing import Any
 
 
@@ -57,6 +58,34 @@ def task_id_label_from_config(task_id: Any, data_cfg: Any) -> str | None:
     return template.format(task_id=task_id, label=label).strip()
 
 
+def _task_id_prompt_append_probability(data_cfg: Any) -> float:
+    value = cfg_get(
+        data_cfg,
+        "task_id_prompt_append_probability",
+        cfg_get(data_cfg, "subtask_prompt_append_probability", 1.0),
+    )
+    try:
+        probability = float(value)
+    except (TypeError, ValueError):
+        probability = 1.0
+    if probability > 1.0:
+        probability = probability / 100.0
+    return max(0.0, min(1.0, probability))
+
+
+def _ignored_prompt_labels(data_cfg: Any) -> set[str]:
+    values = cfg_get(data_cfg, "subtask_prompt_ignored_labels", ("__unlabeled__",))
+    if values is None:
+        return set()
+    if isinstance(values, str):
+        values = (values,)
+    try:
+        return {str(value).strip().casefold() for value in values if str(value).strip()}
+    except TypeError:
+        text = str(values).strip()
+        return {text.casefold()} if text else set()
+
+
 def append_prompt_label(language: Any, label: str, data_cfg: Any) -> str:
     task = str(language).strip()
     label = str(label).strip()
@@ -75,8 +104,23 @@ def append_prompt_label(language: Any, label: str, data_cfg: Any) -> str:
     return f"{task}{separator}{label}"
 
 
-def append_task_id_label_to_language(language: Any, task_id: Any, data_cfg: Any) -> tuple[str, str | None]:
-    label = task_id_label_from_config(task_id, data_cfg)
+def append_resolved_label_to_language(language: Any, label: Any, data_cfg: Any) -> tuple[str, str | None]:
+    if not bool(cfg_get(data_cfg, "append_task_id_to_prompt", False)):
+        return str(language).strip(), None
+
     if label is None:
         return str(language).strip(), None
+    label = str(label).strip()
+    if not label:
+        return str(language).strip(), None
+    if label.casefold() in _ignored_prompt_labels(data_cfg):
+        return str(language).strip(), None
+
+    if random.random() >= _task_id_prompt_append_probability(data_cfg):
+        return str(language).strip(), None
     return append_prompt_label(language, label, data_cfg), label
+
+
+def append_task_id_label_to_language(language: Any, task_id: Any, data_cfg: Any) -> tuple[str, str | None]:
+    label = task_id_label_from_config(task_id, data_cfg)
+    return append_resolved_label_to_language(language, label, data_cfg)

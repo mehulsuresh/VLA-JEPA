@@ -119,6 +119,7 @@ def get_vla_dataset(
         gpu_video_decode_on_rank=bool(data_cfg.get("gpu_video_decode_on_rank", False)),
         cpu_video_decode_drop_worker_images=bool(data_cfg.get("cpu_video_decode_drop_worker_images", False)),
         seed=seed,
+        metadata_config=data_cfg,
         **kwargs,
     )
 

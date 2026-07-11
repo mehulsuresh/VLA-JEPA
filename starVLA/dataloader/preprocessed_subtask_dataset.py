@@ -12,6 +12,11 @@ from PIL import Image
 from torch.utils.data import Dataset
 from transformers import AutoProcessor
 
+from starVLA.dataloader.action_validity_mask import (
+    build_action_mask_from_valid_flags,
+    cfg_get,
+    valid_flags_from_label_values,
+)
 from starVLA.dataloader.prompt_labels import append_task_id_label_to_language
 
 
@@ -102,6 +107,10 @@ class PreprocessedSubtaskCollator:
             collated["action_is_pad"] = torch.from_numpy(
                 np.asarray([sample["action_is_pad"] for sample in batch], dtype=bool)
             )
+        if "action_mask" in batch[0]:
+            collated["action_mask"] = torch.from_numpy(
+                np.asarray([sample["action_mask"] for sample in batch], dtype=bool)
+            )
 
         if "video_compact" in batch[0]:
             compact_videos = np.stack([sample["video_compact"] for sample in batch]).transpose(0, 1, 2, 5, 3, 4)
@@ -171,6 +180,13 @@ class PreprocessedSubtaskVLADataset(Dataset):
         self.data_cfg = data_cfg
         self.current_cameras = list(current_cameras or ALL_CAMERAS)
         self.frame_cache_size = max(int(frame_cache_size), 0)
+        self.use_action_validity_prefix_mask = bool(
+            cfg_get(data_cfg, "use_action_validity_prefix_mask", False)
+        )
+        self.action_validity_invalid_run_length = max(
+            1,
+            int(cfg_get(data_cfg, "action_validity_invalid_run_length", 3)),
+        )
 
         self.episodes: dict[str, dict[str, Any]] = {}
         self.records: list[tuple[str, int]] = []
@@ -405,12 +421,15 @@ class PreprocessedSubtaskVLADataset(Dataset):
 
         action_rows = []
         action_is_pad = []
+        action_mistake_labels = []
         for offset in range(self.action_horizon):
             requested_idx = row_idx + offset
             future_idx = min(requested_idx, len(frame_indices) - 1)
             action_rows.append(episode["action"][future_idx])
             action_is_pad.append(requested_idx >= len(frame_indices))
+            action_mistake_labels.append(episode["mistake_label"][future_idx])
         action = np.stack(action_rows, axis=0).astype(np.float32, copy=False)
+        action_is_pad = np.asarray(action_is_pad, dtype=bool)
         state = episode["state"][row_idx : row_idx + 1].astype(np.float32, copy=False)
 
         future_idx = min(row_idx + self.action_horizon - 1, len(frame_indices) - 1)
@@ -446,7 +465,7 @@ class PreprocessedSubtaskVLADataset(Dataset):
             "lang": language,
             "video_compact": np.stack(compact_video_views, axis=0),
             "state": state,
-            "action_is_pad": np.asarray(action_is_pad, dtype=bool),
+            "action_is_pad": action_is_pad,
             "frame_index": current_frame_idx,
             "task_id": current_task,
             "future_task_id": future_task,
@@ -459,6 +478,18 @@ class PreprocessedSubtaskVLADataset(Dataset):
         }
         if task_id_label is not None:
             sample["task_id_label"] = task_id_label
+        if self.use_action_validity_prefix_mask:
+            valid_flags = (
+                valid_flags_from_label_values(action_mistake_labels, positive_is_valid=False)
+                if episode["has_mistake_labels"]
+                else np.ones(self.action_horizon, dtype=bool)
+            )
+            sample["action_mask"] = build_action_mask_from_valid_flags(
+                valid_flags,
+                invalid_run_length=self.action_validity_invalid_run_length,
+                action_dim=int(action.shape[1]),
+                action_is_pad=action_is_pad,
+            ).astype(bool, copy=False)
         if episode["has_global_complexity_to_go"]:
             sample["rabc_global_progress"] = current_global_progress
             sample["rabc_future_global_progress"] = future_global_progress

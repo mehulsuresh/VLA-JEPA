@@ -392,7 +392,9 @@ class TrainerUtils:
         epoch_counter += 1
 
         # 2. set new epoch (distributed core)
-        if hasattr(dataloader, "sampler") and callable(getattr(dataloader.sampler, "set_epoch", None)):
+        if callable(getattr(dataloader, "set_epoch", None)):
+            dataloader.set_epoch(epoch_counter)
+        elif hasattr(dataloader, "sampler") and callable(getattr(dataloader.sampler, "set_epoch", None)):
             dataloader.sampler.set_epoch(epoch_counter)
 
         # 3. create new iterator

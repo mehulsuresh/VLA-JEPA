@@ -80,6 +80,66 @@ def _pyav_seek_to_timestamp(
         return False
 
 
+def _decode_pyav_nearest_frames(
+    container: av.container.InputContainer,
+    stream,
+    requested_timestamps: np.ndarray,
+    min_timestamp: float,
+) -> list[np.ndarray]:
+    """Decode sequentially but convert only frames nearest requested timestamps."""
+    requested = np.asarray(requested_timestamps, dtype=np.float64).reshape(-1)
+    if requested.size == 0:
+        return []
+
+    order = np.argsort(requested, kind="stable")
+    sorted_targets = requested[order]
+    selected: list[np.ndarray | None] = [None] * requested.size
+    converted: list[tuple[av.VideoFrame, np.ndarray]] = []
+
+    def as_rgb(frame: av.VideoFrame) -> np.ndarray:
+        for cached_frame, cached_array in converted:
+            if cached_frame is frame:
+                return cached_array
+        array = frame.to_ndarray(format="rgb24")
+        converted.append((frame, array))
+        return array
+
+    previous_frame = None
+    previous_timestamp = None
+    target_index = 0
+    for frame_index, frame in enumerate(container.decode(stream)):
+        timestamp = _pyav_frame_time_seconds(frame, stream, frame_index)
+        if timestamp < min_timestamp:
+            continue
+
+        while target_index < sorted_targets.size and timestamp >= sorted_targets[target_index]:
+            target = float(sorted_targets[target_index])
+            if (
+                previous_frame is not None
+                and previous_timestamp is not None
+                and abs(previous_timestamp - target) <= abs(timestamp - target)
+            ):
+                nearest_frame = previous_frame
+            else:
+                nearest_frame = frame
+            selected[int(order[target_index])] = as_rgb(nearest_frame)
+            target_index += 1
+
+        previous_frame = frame
+        previous_timestamp = timestamp
+        if target_index >= sorted_targets.size:
+            break
+
+    if previous_frame is not None:
+        while target_index < sorted_targets.size:
+            selected[int(order[target_index])] = as_rgb(previous_frame)
+            target_index += 1
+
+    if any(frame is None for frame in selected):
+        return []
+    return [frame for frame in selected if frame is not None]
+
+
 @lru_cache(maxsize=512)
 def _get_decord_frame_timestamps(
     video_path: str,
@@ -254,7 +314,6 @@ def get_frames_by_timestamps(
             seek_margin = float((video_backend_kwargs or {}).get("seek_margin_seconds", 1.0))
             use_seek = bool((video_backend_kwargs or {}).get("seek", True))
             start_at = max(0.0, float(np.min(requested_ts)) - max(frame_margin, seek_margin))
-            stop_after = float(np.max(requested_ts)) + frame_margin
             duration_seconds = None
             if stream.duration is not None and stream.time_base is not None:
                 duration_seconds = float(stream.duration * stream.time_base)
@@ -262,22 +321,17 @@ def get_frames_by_timestamps(
                 duration_seconds = float(container.duration / av.time_base)
 
             def collect_frames(min_ts: float):
-                frame_ts = []
-                frames = []
-                for frame_index, frame in enumerate(container.decode(stream)):
-                    ts = _pyav_frame_time_seconds(frame, stream, frame_index)
-                    if ts < min_ts:
-                        continue
-                    frame_ts.append(ts)
-                    frames.append(frame.to_ndarray(format="rgb24"))
-                    if ts > stop_after:
-                        break
-                return frame_ts, frames
+                return _decode_pyav_nearest_frames(
+                    container,
+                    stream,
+                    requested_ts,
+                    min_ts,
+                )
 
             seeked = False
             if use_seek:
                 seeked = _pyav_seek_to_timestamp(container, stream, start_at)
-            frame_ts, frames = collect_frames(start_at)
+            frames = collect_frames(start_at)
 
             if not frames and seeked:
                 # Preserve the old nearest-frame behavior for timestamps beyond
@@ -291,16 +345,15 @@ def get_frames_by_timestamps(
                         duration_seconds - max(5.0, seek_margin, frame_margin * 20.0),
                     )
                     if _pyav_seek_to_timestamp(container, stream, end_start):
-                        frame_ts, frames = collect_frames(end_start)
+                        frames = collect_frames(end_start)
                 if not frames:
-                    frame_ts, frames = collect_frames(0.0)
+                    frames = collect_frames(0.0)
         finally:
             container.close()
 
         if not frames:
             raise ValueError(f"Unable to read frames from video file: {video_path}")
-        closest_indices = np.abs(np.asarray(frame_ts)[:, None] - requested_ts[None, :]).argmin(axis=0)
-        return np.stack([frames[int(index)] for index in closest_indices], axis=0)
+        return np.stack(frames, axis=0)
     else:
         raise NotImplementedError
 

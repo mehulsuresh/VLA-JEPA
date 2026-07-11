@@ -39,6 +39,7 @@ Thumbs.db
 .env
 .pytest_cache/
 *.log
+MUJOCO_LOG.TXT
 # Local benchmarks
 tmp_bench/
 artifacts/

@@ -36,6 +36,8 @@ CONFIGURE_DOCKER_DATA_ROOT="${CONFIGURE_DOCKER_DATA_ROOT:-1}"
 DOCKER_DATA_ROOT="${DOCKER_DATA_ROOT:-${VLA_JEPA_SCRATCH_LINK}/docker}"
 INSTALL_GIT="${INSTALL_GIT:-1}"
 INSTALL_RIPGREP="${INSTALL_RIPGREP:-1}"
+INSTALL_RSYNC="${INSTALL_RSYNC:-1}"
+INSTALL_TMUX="${INSTALL_TMUX:-1}"
 DOCKER_USERS="${DOCKER_USERS:-}"
 
 # Fabric Manager is not needed on the GCP A2 Ultra VM shape I tested; NVLink
@@ -83,6 +85,12 @@ install_host_runtime_tools() {
   fi
   if [[ "$INSTALL_RIPGREP" == "1" ]]; then
     packages+=(ripgrep)
+  fi
+  if [[ "$INSTALL_RSYNC" == "1" ]]; then
+    packages+=(rsync)
+  fi
+  if [[ "$INSTALL_TMUX" == "1" ]]; then
+    packages+=(tmux)
   fi
 
   if [[ "${#packages[@]}" -gt 0 ]]; then
@@ -429,7 +437,13 @@ verify_node() {
     git --version
   fi
   if command -v rg >/dev/null 2>&1; then
-    rg --version | head -1
+    rg --version | sed -n '1p'
+  fi
+  if command -v rsync >/dev/null 2>&1; then
+    rsync --version | sed -n '1p'
+  fi
+  if command -v tmux >/dev/null 2>&1; then
+    tmux -V
   fi
   if command -v docker >/dev/null 2>&1; then
     docker --version

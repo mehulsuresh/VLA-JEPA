@@ -30,13 +30,15 @@ import json
 import os
 import sys
 import time
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from functools import lru_cache
 from pathlib import Path
 from typing import Sequence
 
 import numpy as np
 import pandas as pd
+import pyarrow.compute as pc
+import pyarrow.parquet as pq
 from pydantic import BaseModel, Field, ValidationError
 from torch.utils.data import Dataset
 from tqdm import tqdm
@@ -55,7 +57,15 @@ from starVLA.dataloader.gr00t_lerobot.schema import (
     LeRobotStateActionMetadata,
 )
 from starVLA.dataloader.gr00t_lerobot.transform import ComposedModalityTransform
-from starVLA.dataloader.prompt_labels import append_task_id_label_to_language
+from starVLA.dataloader.action_validity_mask import (
+    build_action_mask_from_valid_flags,
+    cfg_get,
+    valid_flags_from_label_values,
+)
+from starVLA.dataloader.prompt_labels import (
+    append_resolved_label_to_language,
+    append_task_id_label_to_language,
+)
 
 from functools import partial
 from typing import Tuple, List
@@ -70,6 +80,7 @@ LE_ROBOT_RAW_STATS_FILENAME = "meta/stats.json"
 LE_ROBOT_DATA_FILENAME = "data/*/*.parquet"
 LE_ROBOT_STEPS_FILENAME = "meta/steps.pkl"
 LE_ROBOT3_TASKS_FILENAME = "meta/tasks.parquet"
+LE_ROBOT3_SUBTASKS_FILENAME = "meta/subtasks.parquet"
 LE_ROBOT3_EPISODE_FILENAME = "meta/episodes/*/*.parquet"
 EPSILON = 5e-4
 GPU_DECODE_FRAME_INDEX_CACHE_DIRNAME = "gpu_decode_frame_indices_v1"
@@ -213,7 +224,10 @@ class LeRobotSingleDataset(Dataset):
         self._video_path_pattern = self._get_video_path_pattern()
         self._chunk_size = self._get_chunk_size()
         self._tasks = self._get_tasks()
+        self._subtask_labels = self._get_subtask_labels()
         self.trajectory_ids_to_metadata = {}
+        self._v3_data_file_start_indices = {}
+        self._v3_parquet_shard_cache = OrderedDict()
         self.curr_traj_data = None
         self.curr_traj_id = None
 
@@ -329,16 +343,11 @@ class LeRobotSingleDataset(Dataset):
         """
 
         # 1. Modality metadata
-        modality_meta_path = self.dataset_path / LE_ROBOT_MODALITY_FILENAME
-        assert (
-            modality_meta_path.exists()
-        ), f"Please provide a {LE_ROBOT_MODALITY_FILENAME} file in {self.dataset_path}"
         # 1.1. State and action modalities
         simplified_modality_meta: dict[str, dict] = {}
-        with open(modality_meta_path, "r") as f:
-            le_modality_meta = LeRobotModalityMetadata.model_validate(
-                self._apply_modality_metadata_overrides(json.load(f))
-            )
+        le_modality_meta = LeRobotModalityMetadata.model_validate(
+            self._apply_modality_metadata_overrides(self._load_lerobot_modality_dict())
+        )
         for modality in ["state", "action"]:
             simplified_modality_meta[modality] = {}
             le_state_action_meta: dict[str, LeRobotStateActionMetadata] = getattr(
@@ -474,8 +483,26 @@ class LeRobotSingleDataset(Dataset):
                 ]
                 for file_row_index, (_, episode) in enumerate(episodes_data.iterrows()):
                     trajectory_id = int(episode["episode_index"])
+                    data_chunk_index = int(episode["data/chunk_index"])
+                    data_file_index = int(episode["data/file_index"])
                     trajectory_ids.append(trajectory_id)
                     trajectory_lengths.append(int(episode["length"]))
+
+                    dataset_from_index = episode.get("dataset_from_index")
+                    dataset_to_index = episode.get("dataset_to_index")
+                    if pd.notna(dataset_from_index) and pd.notna(dataset_to_index):
+                        dataset_from_index = int(dataset_from_index)
+                        dataset_to_index = int(dataset_to_index)
+                        file_key = (data_chunk_index, data_file_index)
+                        previous_start = self._v3_data_file_start_indices.get(file_key)
+                        self._v3_data_file_start_indices[file_key] = (
+                            dataset_from_index
+                            if previous_start is None
+                            else min(previous_start, dataset_from_index)
+                        )
+                    else:
+                        dataset_from_index = None
+                        dataset_to_index = None
 
                     from_timestamps = {}
                     for col in timestamp_cols:
@@ -486,9 +513,11 @@ class LeRobotSingleDataset(Dataset):
                         from_timestamps[video_key] = float(value)
 
                     self.trajectory_ids_to_metadata[trajectory_id] = {
-                        "data/chunk_index": int(episode["data/chunk_index"]),
-                        "data/file_index": int(episode["data/file_index"]),
+                        "data/chunk_index": data_chunk_index,
+                        "data/file_index": data_file_index,
                         "data/file_from_index": int(file_row_index),
+                        "dataset_from_index": dataset_from_index,
+                        "dataset_to_index": dataset_to_index,
                         "videos/from_timestamps": from_timestamps,
                     }
             return np.array(trajectory_ids), np.array(trajectory_lengths)
@@ -844,14 +873,76 @@ class LeRobotSingleDataset(Dataset):
 
     def _get_lerobot_modality_meta(self) -> LeRobotModalityMetadata:
         """Get the metadata for the LeRobot dataset."""
+        modality_meta = LeRobotModalityMetadata.model_validate(
+            self._apply_modality_metadata_overrides(self._load_lerobot_modality_dict())
+        )
+        return modality_meta
+
+    def _load_lerobot_modality_dict(self) -> dict:
+        """Load modality.json, or synthesize the common LeRobot v3 metadata if it is absent."""
         modality_meta_path = self.dataset_path / LE_ROBOT_MODALITY_FILENAME
-        assert (
-            modality_meta_path.exists()
-        ), f"Please provide a {LE_ROBOT_MODALITY_FILENAME} file in {self.dataset_path}"
-        with open(modality_meta_path, "r") as f:
-            modality_meta = LeRobotModalityMetadata.model_validate(
-                self._apply_modality_metadata_overrides(json.load(f))
+        if modality_meta_path.exists():
+            with open(modality_meta_path, "r") as f:
+                return json.load(f)
+
+        info_path = self.dataset_path / LE_ROBOT_INFO_FILENAME
+        if not info_path.exists():
+            raise FileNotFoundError(
+                f"Please provide {LE_ROBOT_MODALITY_FILENAME} or {LE_ROBOT_INFO_FILENAME} in {self.dataset_path}"
             )
+        with open(info_path, "r") as f:
+            info = json.load(f)
+        features = info.get("features", {})
+
+        modality_meta: dict[str, dict] = {
+            "state": {},
+            "action": {},
+            "video": {},
+            "annotation": {
+                "human.action.task_description": {
+                    "original_key": "task_index",
+                },
+            },
+        }
+
+        if "observation.state" in features:
+            state_shape = features["observation.state"].get("shape", [0])
+            modality_meta["state"]["joints"] = {
+                "start": 0,
+                "end": int(state_shape[0]),
+                "original_key": "observation.state",
+                "absolute": True,
+                "dtype": str(features["observation.state"].get("dtype", "float32")),
+            }
+        if "action" in features:
+            action_shape = features["action"].get("shape", [0])
+            modality_meta["action"]["delta_joints"] = {
+                "start": 0,
+                "end": int(action_shape[0]),
+                "original_key": "action",
+                "absolute": False,
+                "dtype": str(features["action"].get("dtype", "float32")),
+            }
+
+        video_key_map = {
+            "observation.images.head": "base_view",
+            "observation.images.main": "base_view",
+            "observation.images.top": "base_view",
+            "observation.images.wrist_left": "left_wrist",
+            "observation.images.left": "left_wrist",
+            "observation.images.wrist_right": "right_wrist",
+            "observation.images.right": "right_wrist",
+            "observation.images.extra": "extra_view",
+        }
+        for original_key, subkey in video_key_map.items():
+            if original_key in features:
+                modality_meta["video"][subkey] = {"original_key": original_key}
+
+        if not modality_meta["video"]:
+            for original_key in sorted(k for k in features if k.startswith("observation.images.")):
+                subkey = original_key.rsplit(".", 1)[-1]
+                modality_meta["video"][subkey] = {"original_key": original_key}
+
         return modality_meta
 
     def _get_data_cfg_value(self, key: str, default=None):
@@ -964,6 +1055,71 @@ class LeRobotSingleDataset(Dataset):
                 continue
             tasks.loc[int(task_index), "task"] = task_text
         return tasks
+
+    @staticmethod
+    def _coerce_label_value(value):
+        if isinstance(value, np.generic):
+            return value.item()
+        if isinstance(value, np.ndarray):
+            if value.size == 1:
+                item = value.reshape(-1)[0]
+                return item.item() if isinstance(item, np.generic) else item
+            return value
+        if isinstance(value, (list, tuple)) and len(value) == 1:
+            item = value[0]
+            return item.item() if isinstance(item, np.generic) else item
+        return value
+
+    def _get_subtask_labels(self) -> dict[int, str]:
+        """Load optional LeRobot v3 subtask_index -> text labels."""
+        subtasks_path = self.dataset_path / LE_ROBOT3_SUBTASKS_FILENAME
+        if self._lerobot_version != "v3.0" or not subtasks_path.exists():
+            return {}
+
+        label_column = self._get_data_cfg_value(
+            "subtask_prompt_label_column",
+            self._get_data_cfg_value("task_id_prompt_label_column", "local_subtask_text"),
+        )
+        candidate_columns = (
+            str(label_column),
+            "local_subtask_text",
+            "description",
+            "subtask",
+        )
+
+        try:
+            subtasks = pd.read_parquet(subtasks_path)
+        except Exception as exc:
+            print(f"Failed to load subtask labels from {subtasks_path}: {exc}")
+            return {}
+
+        if "subtask_index" not in subtasks.columns:
+            return {}
+
+        text_column = next((col for col in candidate_columns if col in subtasks.columns), None)
+        if text_column is None:
+            return {}
+
+        labels: dict[int, str] = {}
+        for _, row in subtasks.iterrows():
+            raw_index = self._coerce_label_value(row["subtask_index"])
+            raw_text = self._coerce_label_value(row[text_column])
+            if raw_index is None or pd.isna(raw_index):
+                continue
+            if raw_text is None or pd.isna(raw_text):
+                continue
+            text = str(raw_text).strip()
+            if not text:
+                continue
+            labels[int(raw_index)] = text
+        return labels
+
+    def _subtask_label_for_index(self, subtask_index) -> str | None:
+        subtask_index = self._coerce_label_value(subtask_index)
+        try:
+            return self._subtask_labels.get(int(subtask_index))
+        except (TypeError, ValueError):
+            return None
 
     def _check_integrity(self):
         """Use the config to check if the keys are valid and detect silent data corruption."""
@@ -1120,6 +1276,64 @@ class LeRobotSingleDataset(Dataset):
         self.curr_traj_data = data
         return data
 
+    def _get_v3_parquet_cache_size(self) -> int:
+        configured = self._get_data_cfg_value("lerobot_v3_parquet_cache_size", 1)
+        try:
+            return max(0, int(configured or 0))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "lerobot_v3_parquet_cache_size must be a non-negative integer, "
+                f"got {configured!r}"
+            ) from exc
+
+    def _get_v3_parquet_shard(self, parquet_path: Path):
+        """Load a shared v3 shard once per worker and keep a bounded Arrow cache."""
+        cache = getattr(self, "_v3_parquet_shard_cache", None)
+        if cache is None:
+            cache = OrderedDict()
+            self._v3_parquet_shard_cache = cache
+
+        cached = cache.pop(parquet_path, None)
+        if cached is not None:
+            cache[parquet_path] = cached
+            return cached
+
+        table = pq.read_table(
+            parquet_path,
+            memory_map=True,
+            pre_buffer=False,
+            use_threads=False,
+        )
+        cache_size = self._get_v3_parquet_cache_size()
+        if cache_size > 0:
+            cache[parquet_path] = table
+            while len(cache) > cache_size:
+                cache.popitem(last=False)
+        return table
+
+    def close_parquet_cache(self) -> None:
+        cache = getattr(self, "_v3_parquet_shard_cache", None)
+        if cache is not None:
+            cache.clear()
+        self.curr_traj_id = None
+        self.curr_traj_data = None
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        # Spawned workers must create their own bounded cache. Serializing an
+        # already-warm Arrow table would copy the complete shard into each worker.
+        state["_v3_parquet_shard_cache"] = OrderedDict()
+        state["curr_traj_id"] = None
+        state["curr_traj_data"] = None
+        return state
+
+    def __setstate__(self, state):
+        state.setdefault("_v3_data_file_start_indices", {})
+        state.setdefault("_v3_parquet_shard_cache", OrderedDict())
+        state.setdefault("curr_traj_id", None)
+        state.setdefault("curr_traj_data", None)
+        self.__dict__.update(state)
+
     def get_trajectory_data_lerobot_v3(self, trajectory_id: int) -> pd.DataFrame:
         """Get a single trajectory from a shared LeRobot v3 parquet shard."""
         if self.curr_traj_id == trajectory_id and self.curr_traj_data is not None:
@@ -1131,9 +1345,44 @@ class LeRobotSingleDataset(Dataset):
             file_index=episode_meta["data/file_index"],
         )
         assert parquet_path.exists(), f"Parquet file not found at {parquet_path}"
-        file_data = pd.read_parquet(parquet_path)
-        # Reset to a dense 0..T-1 index so downstream step indexing stays positional.
-        trajectory_data = file_data.loc[file_data["episode_index"] == trajectory_id].reset_index(drop=True).copy()
+        file_data = self._get_v3_parquet_shard(parquet_path)
+
+        file_key = (
+            int(episode_meta["data/chunk_index"]),
+            int(episode_meta["data/file_index"]),
+        )
+        file_start = getattr(self, "_v3_data_file_start_indices", {}).get(file_key)
+        dataset_from_index = episode_meta.get("dataset_from_index")
+        dataset_to_index = episode_meta.get("dataset_to_index")
+        trajectory_table = None
+        if (
+            file_start is not None
+            and dataset_from_index is not None
+            and dataset_to_index is not None
+        ):
+            local_start = int(dataset_from_index) - int(file_start)
+            trajectory_length = int(dataset_to_index) - int(dataset_from_index)
+            if local_start >= 0 and trajectory_length >= 0 and local_start + trajectory_length <= file_data.num_rows:
+                candidate = file_data.slice(local_start, trajectory_length)
+                if candidate.num_rows == trajectory_length:
+                    candidate_episode_ids = candidate.column("episode_index").to_numpy(zero_copy_only=False)
+                    if np.all(candidate_episode_ids == trajectory_id):
+                        trajectory_table = candidate
+
+        if trajectory_table is None:
+            trajectory_table = file_data.filter(
+                pc.equal(file_data.column("episode_index"), int(trajectory_id))
+            )
+
+        expected_length = int(self.trajectory_lengths[self.get_trajectory_index(trajectory_id)])
+        if trajectory_table.num_rows != expected_length:
+            raise RuntimeError(
+                f"LeRobot v3 episode {trajectory_id} resolved to {trajectory_table.num_rows} rows, "
+                f"expected {expected_length} in {parquet_path}"
+            )
+
+        # Convert only the selected episode, not the complete shared shard.
+        trajectory_data = trajectory_table.to_pandas().reset_index(drop=True)
         return self._set_current_trajectory_data(trajectory_id, trajectory_data)
 
     def get_trajectory_index(self, trajectory_id: int) -> int:
@@ -1841,6 +2090,13 @@ class LeRobotMixtureDataset(Dataset):
         self.video_target_shift_steps = max(int(video_target_shift_steps), 0)
         self.gpu_video_decode_on_rank = bool(gpu_video_decode_on_rank)
         self.cpu_video_decode_drop_worker_images = bool(cpu_video_decode_drop_worker_images)
+        self.use_action_validity_prefix_mask = bool(
+            metadata_config.get("use_action_validity_prefix_mask", False)
+        )
+        self.action_validity_invalid_run_length = max(
+            1,
+            int(metadata_config.get("action_validity_invalid_run_length", 3)),
+        )
         timing_env = str(os.environ.get("STARVLA_DATASET_TIMING", "0")).lower()
         self.dataset_timing_enabled = timing_env in {"1", "true", "yes", "on"} or bool(
             metadata_config.get("dataset_timing_logging", False)
@@ -2047,6 +2303,82 @@ class LeRobotMixtureDataset(Dataset):
         single_step_index = rng.choice(len(dataset.all_steps))
         trajectory_id, base_index = dataset.all_steps[single_step_index]
         return dataset, trajectory_id, base_index
+
+    def _build_action_validity_mask(
+        self,
+        dataset: LeRobotSingleDataset,
+        *,
+        step: int,
+        action: np.ndarray,
+        action_is_pad: np.ndarray | None,
+    ) -> np.ndarray | None:
+        if not bool(cfg_get(dataset.data_cfg, "use_action_validity_prefix_mask", self.use_action_validity_prefix_mask)):
+            return None
+        if dataset.curr_traj_data is None or not dataset.modality_keys.get("action"):
+            return None
+
+        action_key = dataset.modality_keys["action"][0]
+        action_step_indices = np.asarray(dataset.delta_indices[action_key], dtype=np.int64) + int(step)
+        if action_step_indices.shape[0] != action.shape[0]:
+            # Keep training behavior unchanged rather than risk an off-by-one mask.
+            return np.ones(action.shape, dtype=bool)
+
+        max_index = len(dataset.curr_traj_data) - 1
+        if max_index < 0:
+            return np.ones(action.shape, dtype=bool)
+        clamped_indices = np.clip(action_step_indices, 0, max_index)
+        label_rows = dataset.curr_traj_data.iloc[clamped_indices]
+
+        valid_flags = None
+        label_key = cfg_get(dataset.data_cfg, "action_validity_label_key", None)
+        positive_is_valid = cfg_get(dataset.data_cfg, "action_validity_positive_is_valid", None)
+        if label_key:
+            label_key = str(label_key)
+            if label_key in label_rows.columns:
+                if positive_is_valid is None:
+                    positive_is_valid = label_key not in {
+                        "mistake",
+                        "mistake_label",
+                        "is_mistake",
+                        "failure",
+                        "error",
+                    }
+                valid_flags = valid_flags_from_label_values(
+                    label_rows[label_key].to_numpy(),
+                    positive_is_valid=bool(positive_is_valid),
+                )
+        else:
+            for candidate_key, candidate_positive_is_valid in (
+                ("valid_state", True),
+                ("sub_task_id", True),
+                ("mistake", False),
+                ("mistake_label", False),
+                ("is_mistake", False),
+                ("failure", False),
+                ("error", False),
+            ):
+                if candidate_key in label_rows.columns:
+                    valid_flags = valid_flags_from_label_values(
+                        label_rows[candidate_key].to_numpy(),
+                        positive_is_valid=candidate_positive_is_valid,
+                    )
+                    break
+        if valid_flags is None:
+            return np.ones(action.shape, dtype=bool)
+
+        invalid_run_length = int(
+            cfg_get(
+                dataset.data_cfg,
+                "action_validity_invalid_run_length",
+                self.action_validity_invalid_run_length,
+            )
+        )
+        return build_action_mask_from_valid_flags(
+            valid_flags,
+            invalid_run_length=max(1, invalid_run_length),
+            action_dim=int(action.shape[1]),
+            action_is_pad=action_is_pad,
+        ).astype(bool, copy=False)
     
     def resize_video_opencv(self, video: np.ndarray, N: int) -> np.ndarray:
         """
@@ -2297,8 +2629,10 @@ class LeRobotMixtureDataset(Dataset):
                 action = np.concatenate(action, axis=1).astype(np.float16)
 
                 return_dict = dict(action=action, lang=language)
+                action_is_pad = None
                 if action_pad_masks:
-                    return_dict["action_is_pad"] = np.logical_or.reduce(action_pad_masks)
+                    action_is_pad = np.logical_or.reduce(action_pad_masks)
+                    return_dict["action_is_pad"] = action_is_pad
                 if build_worker_images:
                     return_dict["image"] = images
                 if self.gpu_video_decode_on_rank:
@@ -2321,6 +2655,14 @@ class LeRobotMixtureDataset(Dataset):
 
                 label_start = time.perf_counter()
                 if dataset.curr_traj_data is not None and step < len(dataset.curr_traj_data):
+                    action_validity_mask = self._build_action_validity_mask(
+                        dataset,
+                        step=step,
+                        action=action,
+                        action_is_pad=action_is_pad,
+                    )
+                    if action_validity_mask is not None:
+                        return_dict["action_mask"] = action_validity_mask
                     label_row = dataset.curr_traj_data.iloc[step]
                     for label_key in (
                         "index",
@@ -2328,16 +2670,16 @@ class LeRobotMixtureDataset(Dataset):
                         "episode_index",
                         "task_index",
                         "task_id",
+                        "subtask_index",
                         "sub_task_id",
                         "reward",
+                        "valid_state",
+                        "valid_state_source",
                         "global_complexity_to_go",
                         "local_complexity_to_go",
                     ):
                         if label_key in label_row.index:
-                            label_value = label_row[label_key]
-                            if isinstance(label_value, np.generic):
-                                label_value = label_value.item()
-                            return_dict[label_key] = label_value
+                            return_dict[label_key] = dataset._coerce_label_value(label_row[label_key])
 
                     future_step = min(step + action.shape[0] - 1, len(dataset.curr_traj_data) - 1)
                     future_row = dataset.curr_traj_data.iloc[future_step]
@@ -2346,20 +2688,43 @@ class LeRobotMixtureDataset(Dataset):
                         "global_complexity_to_go",
                         "local_complexity_to_go",
                         "task_id",
+                        "subtask_index",
                         "sub_task_id",
+                        "valid_state",
+                        "valid_state_source",
                     ):
                         if label_key in future_row.index:
-                            label_value = future_row[label_key]
-                            if isinstance(label_value, np.generic):
-                                label_value = label_value.item()
-                            return_dict[f"future_{label_key}"] = label_value
+                            return_dict[f"future_{label_key}"] = dataset._coerce_label_value(future_row[label_key])
 
-                    if "task_id" in label_row.index:
-                        prompt_language, task_id_label = append_task_id_label_to_language(
-                            return_dict["lang"],
-                            label_row["task_id"],
-                            dataset.data_cfg,
-                        )
+                    if "subtask_index" in label_row.index:
+                        subtask_label = dataset._subtask_label_for_index(label_row["subtask_index"])
+                        if subtask_label is not None:
+                            return_dict["subtask_label"] = subtask_label
+
+                    prompt_source_column = dataset._get_data_cfg_value("task_id_prompt_source_column", "task_id")
+                    if prompt_source_column in label_row.index:
+                        prompt_source_value = dataset._coerce_label_value(label_row[prompt_source_column])
+                        prompt_label = None
+                        prompt_text_column = dataset._get_data_cfg_value("task_id_prompt_text_column", None)
+                        if prompt_text_column and prompt_text_column in label_row.index:
+                            prompt_label = str(
+                                dataset._coerce_label_value(label_row[prompt_text_column])
+                            ).strip()
+                        elif str(prompt_source_column) == "subtask_index":
+                            prompt_label = dataset._subtask_label_for_index(prompt_source_value)
+
+                        if prompt_label:
+                            prompt_language, task_id_label = append_resolved_label_to_language(
+                                return_dict["lang"],
+                                prompt_label,
+                                dataset.data_cfg,
+                            )
+                        else:
+                            prompt_language, task_id_label = append_task_id_label_to_language(
+                                return_dict["lang"],
+                                prompt_source_value,
+                                dataset.data_cfg,
+                            )
                         return_dict["lang"] = prompt_language
                         if task_id_label is not None:
                             return_dict["task_id_label"] = task_id_label
@@ -2718,7 +3083,7 @@ class LeRobotMixtureDataset(Dataset):
             self.merged_metadata[tag] = self.merge_metadata(
                 metadatas=metadatas,
                 dataset_sampling_weights=self.dataset_sampling_weights.tolist(),
-                percentile_mixing_method=metadata_config["percentile_mixing_method"],
+                percentile_mixing_method=cfg_get(metadata_config, "percentile_mixing_method", "min_max"),
             )
         for dataset in self.datasets:
             dataset.set_transforms_metadata(self.merged_metadata[dataset.tag])

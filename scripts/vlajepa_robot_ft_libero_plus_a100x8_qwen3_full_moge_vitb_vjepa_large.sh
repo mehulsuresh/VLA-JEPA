@@ -73,7 +73,9 @@ add_arg_if_env() {
   fi
 }
 
+add_arg_if_env DATA_ROOT_DIR --datasets.vla_data.data_root_dir
 add_arg_if_env LIBERO_DATA_ROOT --datasets.vla_data.data_root_dir
+add_arg_if_env REALMAN_DATA_ROOT --datasets.vla_data.data_root_dir
 add_arg_if_env PER_DEVICE_BATCH_SIZE --datasets.vla_data.per_device_batch_size
 add_arg_if_env DATALOADER_NUM_WORKERS --datasets.vla_data.num_workers
 add_arg_if_env DATALOADER_PREFETCH_FACTOR --datasets.vla_data.prefetch_factor

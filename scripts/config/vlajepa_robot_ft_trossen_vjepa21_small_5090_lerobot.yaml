@@ -87,6 +87,8 @@ datasets:
     gpu_video_decode_on_rank: false
     cpu_video_decode_drop_worker_images: true
     runtime_timing_logging: true
+    use_action_validity_prefix_mask: true
+    action_validity_invalid_run_length: 10
     per_device_batch_size: 80
     num_workers: 5
     prefetch_factor: 2
@@ -158,7 +160,7 @@ trainer:
   save_plain_weights_in_checkpoints: false
   drop_checkpoint_page_cache: true
   trim_process_memory_after_checkpoint: true
-  use_rabc: true
+  use_rabc: false
   rabc_progress_key: rabc_progress_delta
   rabc_fallback_progress_key: rabc_global_progress_delta
   rabc_kappa: 0.01

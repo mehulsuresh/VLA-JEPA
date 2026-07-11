@@ -55,6 +55,14 @@ DATASET_NAMED_MIXTURES = {
         ("", 1.0, "realman_bimanual_source_no_base", "v3.0"),
     ],
 
+    "ogrealman_source_no_base_human_labelled_cloud_v3": [
+        ("", 1.0, "realman_bimanual_source_no_base", "v3.0"),
+    ],
+
+    "magna_source_no_base_interventions_v3": [
+        ("", 1.0, "realman_bimanual_source_no_base", "v3.0"),
+    ],
+
     "libero_goal": [
         ("libero_goal_no_noops_1.0.0_lerobot", 1.0, "libero_franka"),
     ],

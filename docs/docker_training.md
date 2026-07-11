@@ -5,6 +5,12 @@ keeps Python/PyTorch/PyAV/Qwen/MoGe/DeepSpeed setup consistent while still
 letting each cloud choose the right CUDA base image and optional CUDA-extension
 builds.
 
+For the end-to-end fresh-node and next-agent handoff checklist used by the
+Magna A100x8 run, including the reboot-sensitive bootstrap, source/data
+synchronization, recovery inspection, smoke gates, monitoring, and checkpoint
+backup, see
+[`docs/magna_a100x8_training_runbook.md`](magna_a100x8_training_runbook.md).
+
 ## Build
 
 Default build, tested against the Python 3.13 runtime path:

@@ -2856,6 +2856,12 @@ class VLA_JEPA(baseframework):
 
         timing_stats["predictor_action_head_time"] += time.perf_counter() - predictor_head_start
         result = {"action_loss": action_loss, "wm_loss": teacher_forcing_wm_loss, **depth_teacher_metrics, **timing_stats}
+        if action_loss_mask is not None:
+            mask_for_stats = action_loss_mask.detach().float()
+            result["action_loss_mask_keep_ratio"] = mask_for_stats.mean()
+            result["action_loss_mask_all_zero_ratio"] = (
+                mask_for_stats.sum(dim=(1, 2)) <= 0
+            ).float().mean()
         if rabc_weights is not None:
             result["rabc_mean_weight"] = rabc_weights.detach().mean()
         return result

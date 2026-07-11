@@ -543,6 +543,16 @@ def test_predict_action_warns_when_rtc_requested_without_prefix():
 def test_robot_ft_configs_keep_per_token_dit_disabled_except_full_qwen():
     explicit_rtc_configs = {
         Path("scripts/config/vlajepa_robot_ft_lerobot_trossen_qwen35_08b_lora_moge_vits_5090.yaml"),
+        Path(
+            "scripts/config/vlajepa_robot_ft_lerobot_magna_interventions_a100x8_qwen35_2b_full_moge_vitb_vjepa_large.yaml"
+        ),
+        Path(
+            "scripts/config/vlajepa_robot_ft_lerobot_ogrealman_human_labelled_cloud_a100x8_qwen35_2b_full_moge_vitb_vjepa_large.yaml"
+        ),
+        Path("scripts/config/vlajepa_robot_ft_lerobot_ogrealman_qwen35_08b_lora_moge_vits_5090.yaml"),
+        Path(
+            "scripts/config/vlajepa_robot_ft_lerobot_ogrealman_source_qwen35_08b_lora_moge_vits_5090.yaml"
+        ),
         Path("scripts/config/vlajepa_robot_ft_canonical_full_a100x8_qwen_full_zero3_moge_vits.yaml"),
     }
     for path in sorted(Path("scripts/config").glob("vlajepa_robot_ft*.yaml")):

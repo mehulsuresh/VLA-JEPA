@@ -1,5 +1,9 @@
 import torch
 
+from starVLA.dataloader.action_validity_mask import (
+    action_validity_prefix_mask,
+    build_action_mask_from_valid_flags,
+)
 from starVLA.model.modules.action_model.rtc_training import reduce_masked_loss
 from starVLA.model.framework.VLA_JEPA import VLA_JEPA
 
@@ -57,3 +61,55 @@ def test_action_is_pad_masks_padded_future_loss():
         reduce_masked_loss(base_loss, loss_mask=loss_mask),
         reduce_masked_loss(changed_padded_loss, loss_mask=loss_mask),
     )
+
+
+def test_action_validity_prefix_mask_truncates_after_sustained_invalid_run():
+    mask = action_validity_prefix_mask(
+        [0, 1, 1, 0, 0, 0, 1],
+        invalid_run_length=3,
+    )
+
+    assert mask.tolist() == [False, True, True, False, False, False, False]
+
+
+def test_action_validity_prefix_mask_keeps_isolated_invalid_sections():
+    mask = action_validity_prefix_mask(
+        [1, 1, 0, 1, 1, 1, 1],
+        invalid_run_length=3,
+    )
+
+    assert mask.tolist() == [True, True, False, True, True, True, True]
+
+
+def test_action_validity_prefix_mask_combines_with_existing_loss_mask():
+    model = _make_vlajepa_with_future_window(6)
+    actions_target = torch.zeros(1, 7, 2)
+    action_mask = torch.from_numpy(
+        build_action_mask_from_valid_flags(
+            [0, 1, 1, 0, 0, 0, 1],
+            invalid_run_length=3,
+            action_dim=2,
+        )
+    ).unsqueeze(0)
+
+    loss_mask = model._build_training_action_loss_mask(
+        action_mask=action_mask,
+        action_is_pad=None,
+        actions_target=actions_target,
+        device=actions_target.device,
+    )
+
+    expected = torch.tensor(
+        [
+            [
+                [0.0, 0.0],
+                [1.0, 1.0],
+                [1.0, 1.0],
+                [0.0, 0.0],
+                [0.0, 0.0],
+                [0.0, 0.0],
+                [0.0, 0.0],
+            ]
+        ]
+    )
+    assert torch.equal(loss_mask, expected)

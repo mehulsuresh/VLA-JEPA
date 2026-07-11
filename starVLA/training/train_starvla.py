@@ -1370,6 +1370,13 @@ class VLATrainer(TrainerUtils):
         if not dist.is_initialized():
             return
 
+        if callable(getattr(self.vla_train_dataloader, "set_epoch", None)):
+            logger.info(
+                "Prepared VLA dataloader wrapper "
+                f"`{type(self.vla_train_dataloader).__name__}` manages epoch seeding"
+            )
+            return
+
         sampler = _find_sampler(self.vla_train_dataloader)
 
         if sampler is None:
@@ -2050,14 +2057,77 @@ class VLATrainer(TrainerUtils):
         kappa = float(trainer_cfg.get("rabc_kappa", 0.01))
         epsilon = float(trainer_cfg.get("rabc_epsilon", 1e-6))
         mistake_penalty = float(trainer_cfg.get("rabc_mistake_weight", 0.0))
+        valid_state_key = trainer_cfg.get("rabc_valid_state_key", None)
+        future_valid_state_key = trainer_cfg.get(
+            "rabc_future_valid_state_key",
+            f"future_{valid_state_key}" if valid_state_key else None,
+        )
+        invalid_state_weight = float(trainer_cfg.get("rabc_invalid_state_weight", mistake_penalty))
+
+        def _as_float_tensor(value):
+            if value is None:
+                return None
+            if torch.is_tensor(value):
+                tensor = value.to(self.accelerator.device, dtype=torch.float32, non_blocking=True)
+            else:
+                tensor = torch.as_tensor(value, device=self.accelerator.device, dtype=torch.float32)
+            if tensor.ndim > 1 and tensor.shape[-1] == 1:
+                tensor = tensor.squeeze(-1)
+            return tensor
+
+        def _as_scalar_float(value, default=None):
+            if value is None:
+                return default
+            if isinstance(value, np.ndarray):
+                if value.size == 0:
+                    return default
+                value = value.reshape(-1)[0]
+            if isinstance(value, (list, tuple)):
+                if not value:
+                    return default
+                value = value[0]
+            if isinstance(value, np.generic):
+                value = value.item()
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return default
 
         if isinstance(batch_vla, dict):
             raw_deltas = batch_vla.get(progress_key, batch_vla.get(fallback_progress_key))
-            if raw_deltas is None:
+            raw_valid_state = batch_vla.get(valid_state_key) if valid_state_key else None
+            raw_future_valid_state = (
+                batch_vla.get(future_valid_state_key)
+                if future_valid_state_key and isinstance(batch_vla, dict)
+                else None
+            )
+            if raw_deltas is None and raw_valid_state is None:
                 return None, {}
-            deltas = raw_deltas.to(self.accelerator.device, dtype=torch.float32, non_blocking=True)
-            valid_mask = torch.isfinite(deltas)
-            deltas = torch.where(valid_mask, deltas, torch.zeros_like(deltas))
+            progress_available = raw_deltas is not None
+            if progress_available:
+                deltas = _as_float_tensor(raw_deltas)
+                valid_mask = torch.isfinite(deltas)
+                deltas = torch.where(valid_mask, deltas, torch.zeros_like(deltas))
+            else:
+                valid_reference = _as_float_tensor(raw_valid_state)
+                deltas = torch.zeros_like(valid_reference)
+                valid_mask = torch.ones_like(deltas, dtype=torch.bool)
+
+            if raw_valid_state is None:
+                valid_state_mask = None
+            else:
+                current_valid_state = _as_float_tensor(raw_valid_state)
+                future_valid_state = (
+                    _as_float_tensor(raw_future_valid_state)
+                    if raw_future_valid_state is not None
+                    else current_valid_state
+                )
+                valid_state_mask = (
+                    torch.isfinite(current_valid_state)
+                    & torch.isfinite(future_valid_state)
+                    & (current_valid_state > 0.5)
+                    & (future_valid_state > 0.5)
+                )
 
             current_mistake = batch_vla.get("mistake_label")
             future_mistake = batch_vla.get("future_mistake_label")
@@ -2065,12 +2135,12 @@ class VLATrainer(TrainerUtils):
                 mistake_mask = torch.zeros_like(deltas, dtype=torch.bool)
             else:
                 current_mistake = (
-                    current_mistake.to(self.accelerator.device, dtype=torch.float32, non_blocking=True)
+                    _as_float_tensor(current_mistake)
                     if current_mistake is not None
                     else torch.zeros_like(deltas)
                 )
                 future_mistake = (
-                    future_mistake.to(self.accelerator.device, dtype=torch.float32, non_blocking=True)
+                    _as_float_tensor(future_mistake)
                     if future_mistake is not None
                     else torch.zeros_like(deltas)
                 )
@@ -2080,7 +2150,9 @@ class VLATrainer(TrainerUtils):
         else:
             deltas = []
             valid_mask = []
+            valid_state_mask = []
             mistake_mask = []
+            progress_available = False
             mistake_keys = (
                 "mistake",
                 "mistake_label",
@@ -2093,42 +2165,73 @@ class VLATrainer(TrainerUtils):
                 delta = example.get(progress_key, example.get(fallback_progress_key))
                 if delta is None:
                     deltas.append(0.0)
-                    valid_mask.append(False)
+                    valid_mask.append(bool(valid_state_key and valid_state_key in example))
                 else:
-                    delta = float(delta)
+                    delta = _as_scalar_float(delta, np.nan)
                     is_valid = not np.isnan(delta)
                     deltas.append(0.0 if not is_valid else delta)
                     valid_mask.append(is_valid)
+                    progress_available = progress_available or is_valid
+
+                if valid_state_key:
+                    current_valid = _as_scalar_float(example.get(valid_state_key), None)
+                    future_valid = _as_scalar_float(
+                        example.get(future_valid_state_key, current_valid) if future_valid_state_key else current_valid,
+                        current_valid,
+                    )
+                    if current_valid is None and future_valid is None:
+                        valid_state_mask.append(True)
+                    else:
+                        valid_state_mask.append(
+                            current_valid is not None
+                            and future_valid is not None
+                            and current_valid > 0.5
+                            and future_valid > 0.5
+                        )
 
                 has_mistake = False
                 for key in mistake_keys:
                     if key in example or f"future_{key}" in example:
-                        current_val = float(example.get(key, 0.0))
-                        future_val = float(example.get(f"future_{key}", 0.0))
+                        current_val = _as_scalar_float(example.get(key), 0.0)
+                        future_val = _as_scalar_float(example.get(f"future_{key}"), 0.0)
                         has_mistake = max(current_val, future_val) > 0.5
                         break
                 mistake_mask.append(has_mistake)
 
             deltas = torch.tensor(deltas, device=self.accelerator.device, dtype=torch.float32)
             valid_mask = torch.tensor(valid_mask, device=self.accelerator.device, dtype=torch.bool)
+            valid_state_mask = (
+                torch.tensor(valid_state_mask, device=self.accelerator.device, dtype=torch.bool)
+                if valid_state_key
+                else None
+            )
             mistake_mask = torch.tensor(mistake_mask, device=self.accelerator.device, dtype=torch.bool)
 
         if not valid_mask.any():
             return None, {}
 
-        valid_deltas = deltas[valid_mask]
-        delta_mean = torch.clamp(valid_deltas.mean(), min=0.0)
-        delta_std = torch.clamp(valid_deltas.std(unbiased=False), min=epsilon)
-        lower_bound = delta_mean - 2 * delta_std
-        soft_weights = torch.clamp((deltas - lower_bound) / (4 * delta_std + epsilon), 0.0, 1.0)
+        stats_mask = valid_mask
+        if valid_state_mask is not None and (valid_mask & valid_state_mask).any():
+            stats_mask = valid_mask & valid_state_mask
+        valid_deltas = deltas[stats_mask]
 
-        weights = torch.zeros_like(deltas)
-        weights = torch.where(deltas > kappa, torch.ones_like(weights), weights)
-        moderate_mask = (deltas >= 0.0) & (deltas <= kappa)
-        weights = torch.where(moderate_mask, soft_weights, weights)
-        weights = torch.where(valid_mask, weights, torch.ones_like(weights))
+        if progress_available:
+            delta_mean = torch.clamp(valid_deltas.mean(), min=0.0)
+            delta_std = torch.clamp(valid_deltas.std(unbiased=False), min=epsilon)
+            lower_bound = delta_mean - 2 * delta_std
+            soft_weights = torch.clamp((deltas - lower_bound) / (4 * delta_std + epsilon), 0.0, 1.0)
+
+            weights = torch.zeros_like(deltas)
+            weights = torch.where(deltas > kappa, torch.ones_like(weights), weights)
+            moderate_mask = (deltas >= 0.0) & (deltas <= kappa)
+            weights = torch.where(moderate_mask, soft_weights, weights)
+            weights = torch.where(valid_mask, weights, torch.ones_like(weights))
+        else:
+            weights = torch.ones_like(deltas)
         if mistake_mask.any():
             weights = torch.where(mistake_mask, torch.full_like(weights, mistake_penalty), weights)
+        if valid_state_mask is not None:
+            weights = torch.where(valid_state_mask, weights, torch.full_like(weights, invalid_state_weight))
 
         weights = weights * weights.shape[0] / (weights.sum() + epsilon)
         stats = {
@@ -2139,6 +2242,8 @@ class VLATrainer(TrainerUtils):
         }
         if mistake_mask.any():
             stats["rabc_mistake_ratio"] = mistake_mask.float().mean().detach()
+        if valid_state_mask is not None:
+            stats["rabc_valid_state_ratio"] = valid_state_mask.float().mean().detach()
         return weights, stats
 
     def _train_step(self, batch_vla, batch_vlm=None):
