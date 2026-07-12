@@ -6,7 +6,7 @@ Realman Magna intervention run. Do not start a production job until the exact
 config, measured smoke result, ETA, and backup plan have been reviewed with the
 user.
 
-Last full operational audit: **2026-07-11 18:54 UTC**. The immutable source,
+Last full operational audit: **2026-07-12 03:20 UTC**. The immutable source,
 image, dataset, and run identities for the active job are recorded below. Live
 step and ETA values are snapshots; always refresh them before acting.
 
@@ -108,14 +108,16 @@ Follow these invariants:
   hashes, launch environment, commands, log paths, run ID, current metrics,
   latest local and remote checkpoints, and remaining action.
 
-### Current Live Handoff Snapshot (2026-07-11 18:54 UTC)
+### Current Live Handoff Snapshot (2026-07-12 03:20 UTC)
 
 This snapshot records what was actually observed. It is not a substitute for
 the inspection command above. Replace the timestamp and volatile fields before
 every handoff; do not stack newer status paragraphs on top of stale ones.
 
-**Current state: production training is active. Do not launch a second job or
-resume a checkpoint while `magna_train` or its training container is alive.**
+**Current state: production training is healthy, but durable backup is degraded
+because the mounted user gcloud credential requires reauthentication. Do not
+launch a second job or resume a checkpoint while `magna_train` or its training
+container is alive. Do not start a second uploader.**
 
 | Field | Observed value |
 | --- | --- |
@@ -127,18 +129,21 @@ resume a checkpoint while `magna_train` or its training container is alive.**
 | Source config SHA-256 | `68fb8ce40e4d0c79860694850333f082669786b0e78f93de01d12ee378a20c42` |
 | Resolved run config SHA-256 | `e3bc2dc364163c33d5330f170ac339dceeb50e93ab24eae80a651b3163609587` |
 | Dataset manifest SHA-256 | `02d062e4cc7535b9794cd804f30ea0093b0ce1b4937e64cfacb30c33bebcc49a` |
-| Step snapshot | 9,010 / 76,644; 864,960 physical samples; epoch 0.353 / 3 |
-| Throughput snapshot | 25.81 logged samples/s; 3.672 s median over the latest 100 steps |
-| ETA snapshot | Approximately 69.0 hours remaining; `2026-07-14T15:53:49Z` from the latest-100-step median |
-| Loss snapshot (latest / mean 100) | total `0.10982 / 0.11421`; action `0.02276 / 0.02911`; world model `0.80982 / 0.79519`; depth `0.37995 / 0.34891` |
-| Mask snapshot (latest / mean 100) | keep ratio `0.83500 / 0.89118`; all-zero ratio `0.08333 / 0.08250` |
-| Latest checkpoint MAE | `0.082495` at `steps_7500` |
-| Checkpoints | `steps_2500`, `steps_5000`, and `steps_7500` exist locally and were uploaded to GCS |
+| Step snapshot | 17,220 / 76,644 (22.47%); 1,653,120 physical samples; epoch 0.674 / 3 |
+| Throughput snapshot | 25.86 logged samples/s; 3.624 s median over the latest 100 steps |
+| ETA snapshot | Approximately 59.8 hours remaining; `2026-07-14T15:09:58Z` from the latest-100-step median |
+| Loss snapshot (latest / mean 100) | total `0.09402 / 0.09878`; action `0.01403 / 0.02152`; world model `0.75362 / 0.72806`; depth `0.28911 / 0.27804` |
+| Mask snapshot (latest / mean 100) | keep ratio `0.83333 / 0.87012`; all-zero ratio `0.16667 / 0.10417` |
+| LR snapshot | Action LR `9.1525e-5`; one peak at the intended step-3,000 warmup boundary followed by monotonic cosine decay. Resolved config records `_accelerate_step_scheduler_with_optimizer: false`. |
+| Latest checkpoint MAE | `0.067684` at `steps_15000`, down monotonically from `0.124961` at `steps_2500` |
+| Local checkpoints | `steps_10000`, `steps_12500`, and `steps_15000` |
+| Durable checkpoint state | Uploader logs confirm `steps_12500` as the latest successful upload. Based on successful uploads and retention pruning, GCS should contain `steps_7500`, `steps_10000`, and `steps_12500`; direct listing is blocked by the same expired credential. `steps_15000` is local-only and has failed repeated upload retries. |
+| Backup blocker | Both VM and local gcloud report `Reauthentication failed`; VM failures began at `2026-07-12T00:15Z`. Refresh `/mnt/vla-jepa/gcloud-config`; the existing uploader retries every 900 seconds and must not be duplicated. |
 | GCS destination | `gs://robotics-datasets-yonduai/gcloud/vla-jepa/checkpoints/magna_interventions_a100x8_qwen35_2b_full_18d_20260711_023223` |
 | Sessions | `magna_train`, `magna_uploader`, `magna_tensorboard`, `magna_tb_compare` |
 | Exact current service file | `/mnt/vla-jepa/logs/magna_interventions_a100x8_qwen35_2b_full_18d_20260711_023223.services.sh` |
 | Primary logs | `/mnt/vla-jepa/logs/magna_interventions_a100x8_qwen35_2b_full_18d_20260711_023223.log` and `/mnt/vla-jepa/logs/magna_interventions_a100x8_qwen35_2b_full_18d_20260711_023223.gcs_upload.log` |
-| Health snapshot | Restart count 0; no OOM, NCCL, decode, worker-exit, or non-finite errors; GPU memory 78,294-78,314 MiB; host RAM approximately 120 GiB used / 1.2 TiB available; no swap; approximately 2.7 TiB free |
+| Health snapshot | Restart count 0; no OOM, NCCL, decode, worker-exit, or non-finite errors; GPU memory 78,294-78,314 MiB; host RAM approximately 120 GiB used / 1.2 TiB available; no swap; approximately 2.8 TiB free |
 
 The current run predates `scripts/run_cloud_training_service.sh`; its external
 service file is preserved above. New runs must use the committed service runner
@@ -247,21 +252,27 @@ files. A clean restore downloaded `18,526,901,498` checkpoint bytes at about
 made completed checkpoints/final models host-readable. The uploader now also
 rejects unreadable artifacts before beginning a partial transfer.
 
-The VM service account still has only the `devstorage.read_only` OAuth scope,
-but `mehul@yonduai.com` is authenticated in the mounted
-`/mnt/vla-jepa/gcloud-config`. VM-side write/read/delete and the complete
-checkpoint round trip passed against the approved bucket. Do not stop this
-local-SSD instance merely to change its service-account scopes.
+The VM service account still has only the `devstorage.read_only` OAuth scope.
+The mounted `mehul@yonduai.com` credential passed VM-side write/read/delete and
+the complete checkpoint round trip before launch, but began requiring
+interactive reauthentication during this multi-day run. A human user credential
+is therefore a temporary fallback, not a durable unattended backup identity.
+Use a `cloud-platform`-scoped service account plus least-privilege bucket IAM on
+the next node. Do not stop this local-SSD instance merely to change its scopes.
 
 The ordered work while this run is active is:
 
-1. Monitor training without modifying the running checkout, container, config,
+1. Reauthenticate the existing mounted gcloud config using the documented SSH
+   command, then let the existing uploader retry. Verify `steps_15000` succeeds
+   and remote retention leaves the latest three checkpoints; do not launch a
+   duplicate uploader.
+2. Monitor training without modifying the running checkout, container, config,
    dataset, or event files.
-2. Verify every new `steps_N` checkpoint becomes stable locally and then appears
+3. Verify every new `steps_N` checkpoint becomes stable locally and then appears
    in the GCS uploader log; retain three local and three remote checkpoints.
-3. Investigate before restarting if the training container exits. Resume only
+4. Investigate before restarting if the training container exits. Resume only
    from a complete uploaded or local full-state checkpoint.
-4. At completion, verify `final_model`, the final three checkpoints, config,
+5. At completion, verify `final_model`, the final three checkpoints, config,
    launch metadata, TensorBoard logs, and summary are present in GCS before the
    VM is stopped or deleted.
 
@@ -1101,6 +1112,8 @@ path that the production run will use.
 | Checkpoint exists only on Local SSD | It is not durable. Wait for stability, verify uploader success, list/download it from GCS, and compare files before relying on it. |
 | Host uploader cannot write into a Docker-created run directory | Do not chmod or chown an active run tree. Stage launch/preflight files in `/mnt/vla-jepa/logs/run_metadata/<run-id>` and pass it as `EXTRA_METADATA_DIR`; merge it with readable trainer metadata during upload. |
 | GCS read works but writes fail | Check both IAM identity and OAuth scope. Use `cloud-platform` for a new VM or the approved mounted user credential; test write/read/delete. |
+| A user-authenticated uploader worked at launch but fails hours later | Inspect the uploader log and test `gcloud auth print-access-token`; an active uploader process is not proof of durable backup. Reauthenticate the same mounted config and let the single uploader retry. For unattended production, use a `cloud-platform`-scoped service account with least-privilege IAM instead of relying on human reauthentication. |
+| LR or action loss repeatedly falls and rises on multi-rank training | Inspect `lr_action_model` turning points and require `_accelerate_step_scheduler_with_optimizer: false` when the trainer calls `lr_scheduler.step()` itself. The old 8-rank LIBERO run advanced the scheduler eight times per optimizer step, compressing warmup from 3,000 to about 375 steps and producing repeated cosine cycles. |
 | TensorBoard curves from different runs appear misaligned | Compare on physical samples seen with `scripts/tensorboard_compare_samples.py`, not raw optimizer step. |
 | Checkpoint saves make occasional long steps | Use median/p95 plus overall samples/s for ETA. The observed approximately 37 s checkpoint outlier is expected and low-overhead at a 2,500-step cadence. |
 | Disk usage grows despite checkpoint retention | Check incomplete smoke runs, logs, Docker layers, uploader state, and final-model copies separately. Never delete an active checkpoint or audit artifact without identifying ownership. |
@@ -1165,3 +1178,4 @@ The detailed diff remains in Git history.
 | 2026-07-11 | GCS authentication, unreadable container files, and local/remote retention probes | Added credential preflight, host-readable artifact checks, stable upload behavior, restore verification, and three-checkpoint retention. |
 | 2026-07-11 | Production launch and live TensorBoard comparison | Corrected runtime-source versus image identity, recorded the active run, added sample-aligned comparisons, and replaced stale launch-pending state. |
 | 2026-07-11 | Agent-to-agent operational audit | Added root agent routing; required clean committed source, immutable per-run worktrees, versioned non-secret launch environments, named containers, committed service/build runners, failure-path exit markers, content-aware metadata resynchronization, and mandatory continuous improvement. |
+| 2026-07-12 | Live learning-rate and backup audit | Verified the corrected one-cycle scheduler against the old 8x-stepped LIBERO trace; separated backup health from process health, required last-successful-upload verification, and prohibited unattended production from relying solely on a human credential. |
