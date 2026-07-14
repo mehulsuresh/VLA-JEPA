@@ -453,6 +453,37 @@ def test_cloud_service_runner_has_reproducible_run_guards():
     assert "Refusing to build the production image from a dirty worktree" in image_build
 
 
+def test_cloud_service_runner_accepts_symlinked_run_source(tmp_path):
+    linked_repo = tmp_path / "repo-link"
+    linked_repo.symlink_to(REPO_ROOT, target_is_directory=True)
+    scratch = tmp_path / "scratch"
+    launch_env = tmp_path / "launch.env"
+    launch_env.write_text("RUN_ID=symlink-source-smoke\n", encoding="utf-8")
+    launch_env.chmod(0o644)
+    env = os.environ.copy()
+    env.update(
+        {
+            "RUN_ID": "symlink-source-smoke",
+            "RUN_SOURCE": str(linked_repo),
+            "VLA_JEPA_SCRATCH": str(scratch),
+            "CHECKPOINT_ROOT": str(scratch / "checkpoints"),
+            "LOG_ROOT": str(scratch / "logs"),
+            "RUN_ENV_FILE": str(launch_env),
+        }
+    )
+
+    result = subprocess.run(
+        ["bash", str(linked_repo / "scripts/run_cloud_training_service.sh"), "status"],
+        check=False,
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "Runtime source path mismatch" not in result.stderr
+
+
 def test_cloud_service_runner_launches_named_container_and_records_exit(tmp_path):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()

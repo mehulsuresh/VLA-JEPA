@@ -153,8 +153,9 @@ if [[ -n "${RUN_SOURCE}" ]]; then
     exit 2
   fi
   resolved_run_source="$(realpath -e "${RUN_SOURCE}")"
-  if [[ "${resolved_run_source}" != "${REPO_ROOT}" ]]; then
-    echo "Runtime source path mismatch: expected ${resolved_run_source}, invoked ${REPO_ROOT}" >&2
+  resolved_repo_root="$(realpath -e "${REPO_ROOT}")"
+  if [[ "${resolved_run_source}" != "${resolved_repo_root}" ]]; then
+    echo "Runtime source path mismatch: expected ${resolved_run_source}, invoked ${resolved_repo_root}" >&2
     exit 2
   fi
 fi
