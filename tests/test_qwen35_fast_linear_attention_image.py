@@ -76,6 +76,8 @@ def test_probe_contract_matches_qwen35_2b_and_sm90_defaults():
     assert probe.DEFAULT_FLA_VERSION == "0.5.1"
     assert probe.DEFAULT_CAUSAL_CONV1D_VERSION == "1.6.2.post1"
     assert probe.DEFAULT_TRANSFORMERS_VERSION == "5.13.1"
+    assert probe.DEFAULT_TILELANG_VERSION == "0.1.9"
+    assert probe.DEFAULT_TVM_FFI_VERSION == "0.1.10"
     assert probe.QWEN35_2B_LINEAR_ATTN_SHAPE == {
         "hidden_size": 2048,
         "linear_conv_kernel_dim": 4,
@@ -135,6 +137,11 @@ def test_generic_image_build_keeps_fast_linear_attention_off_by_default(tmp_path
     assert build_args["FAST_LINEAR_ATTN_SPEC"] == "flash-linear-attention[cuda]==0.5.1"
     assert build_args["CAUSAL_CONV1D_SPEC"] == "causal-conv1d==1.6.2.post1"
     assert build_args["FAST_LINEAR_ATTN_TRANSFORMERS_SPEC"] == "transformers==5.13.1"
+    assert build_args["FAST_LINEAR_ATTN_TILELANG_SPEC"] == "tilelang==0.1.9"
+    assert (
+        build_args["FAST_LINEAR_ATTN_TVM_FFI_SPEC"]
+        == "apache-tvm-ffi==0.1.10"
+    )
     assert build_args["FAST_LINEAR_ATTN_CUDA_ARCH_LIST"] == "8.0"
 
 
@@ -182,6 +189,20 @@ def test_managed_environment_overrides_duplicate_raw_build_args(tmp_path):
             "must be an exact",
         ),
         (
+            {
+                "INSTALL_FAST_LINEAR_ATTN": "1",
+                "FAST_LINEAR_ATTN_TILELANG_SPEC": "tilelang>=0.1.9",
+            },
+            "must be an exact",
+        ),
+        (
+            {
+                "INSTALL_FAST_LINEAR_ATTN": "1",
+                "FAST_LINEAR_ATTN_TVM_FFI_SPEC": "apache-tvm-ffi>=0.1.10",
+            },
+            "must be an exact",
+        ),
+        (
             {"INSTALL_FAST_LINEAR_ATTN": "1", "FAST_LINEAR_ATTN_CUDA_ARCH_LIST": "native"},
             "explicit numeric CUDA architectures",
         ),
@@ -207,9 +228,11 @@ def test_dockerfile_forces_source_build_and_import_probe_when_enabled():
     assert "PIP_NO_BINARY=causal-conv1d" in dockerfile
     assert "probe_qwen35_fast_linear_attention.py" in dockerfile
     assert "--imports-only" in dockerfile
-    assert '"${FAST_LINEAR_ATTN_TRANSFORMERS_SPEC}" "${CAUSAL_CONV1D_SPEC}"' in dockerfile
+    assert '"${FAST_LINEAR_ATTN_TVM_FFI_SPEC}" "${FAST_LINEAR_ATTN_TILELANG_SPEC}"' in dockerfile
     assert "python -m pip check" in dockerfile
     assert '--expected-transformers-version "${FAST_LINEAR_ATTN_TRANSFORMERS_SPEC##*==}"' in dockerfile
     assert 'INSTALL_FAST_LINEAR_ATTN="${INSTALL_FAST_LINEAR_ATTN:-0}"' in wrapper
     assert 'FAST_LINEAR_ATTN_TRANSFORMERS_SPEC="${FAST_LINEAR_ATTN_TRANSFORMERS_SPEC:-transformers==5.13.1}"' in wrapper
+    assert 'FAST_LINEAR_ATTN_TILELANG_SPEC="${FAST_LINEAR_ATTN_TILELANG_SPEC:-tilelang==0.1.9}"' in wrapper
+    assert 'FAST_LINEAR_ATTN_TVM_FFI_SPEC="${FAST_LINEAR_ATTN_TVM_FFI_SPEC:-apache-tvm-ffi==0.1.10}"' in wrapper
     assert 'FAST_LINEAR_ATTN_CUDA_ARCH_LIST="${FAST_LINEAR_ATTN_CUDA_ARCH_LIST:-8.0}"' in wrapper

@@ -685,6 +685,8 @@ ssh reward-model-small '
   FAST_LINEAR_ATTN_SPEC="flash-linear-attention[cuda]==0.5.1" \
   CAUSAL_CONV1D_SPEC=causal-conv1d==1.6.2.post1 \
   FAST_LINEAR_ATTN_TRANSFORMERS_SPEC=transformers==5.13.1 \
+  FAST_LINEAR_ATTN_TILELANG_SPEC=tilelang==0.1.9 \
+  FAST_LINEAR_ATTN_TVM_FFI_SPEC=apache-tvm-ffi==0.1.10 \
   FAST_LINEAR_ATTN_CUDA_ARCH_LIST=9.0 \
   FAST_LINEAR_ATTN_MAX_JOBS=64 \
     ./scripts/build_magna_a100_image.sh --network=host
@@ -695,7 +697,11 @@ Fast linear attention remains off by default in both image build wrappers, so
 the A100 image contract is unchanged. Enabling it requires exact package pins,
 an explicit architecture, and a positive build-worker count. The image build
 forces a source build of `causal-conv1d` and fails if the pinned packages or
-their Qwen3.5 symbols cannot be imported.
+their Qwen3.5 symbols cannot be imported. The exact TileLang and TVM-FFI pins
+are required for training on Hopper: FLA 0.5.1 refuses its Triton backward
+kernel there because that combination is known to produce incorrect results,
+and the otherwise-resolved TVM-FFI 0.1.12 is not import-compatible with
+TileLang 0.1.9 in this image.
 
 Require exit zero and preserve the image identity and package inventory. Before
 any multi-GPU smoke, execute both strict single-GPU probes in the exact image:
@@ -708,6 +714,8 @@ IMAGE="vla-jepa:py313-cu130-h100-${SOURCE_SHORT}" GPUS=0 MOUNT_GCLOUD=0 \
     --expected-transformers-version 5.13.1 \
     --expected-fla-version 0.5.1 \
     --expected-causal-conv1d-version 1.6.2.post1 \
+    --expected-tilelang-version 0.1.9 \
+    --expected-tvm-ffi-version 0.1.10 \
     --expected-compute-capability 9.0
 ```
 

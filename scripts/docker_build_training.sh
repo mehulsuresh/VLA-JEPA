@@ -19,6 +19,8 @@ INSTALL_FAST_LINEAR_ATTN="${INSTALL_FAST_LINEAR_ATTN:-0}"
 FAST_LINEAR_ATTN_SPEC="${FAST_LINEAR_ATTN_SPEC:-flash-linear-attention[cuda]==0.5.1}"
 CAUSAL_CONV1D_SPEC="${CAUSAL_CONV1D_SPEC:-causal-conv1d==1.6.2.post1}"
 FAST_LINEAR_ATTN_TRANSFORMERS_SPEC="${FAST_LINEAR_ATTN_TRANSFORMERS_SPEC:-transformers==5.13.1}"
+FAST_LINEAR_ATTN_TILELANG_SPEC="${FAST_LINEAR_ATTN_TILELANG_SPEC:-tilelang==0.1.9}"
+FAST_LINEAR_ATTN_TVM_FFI_SPEC="${FAST_LINEAR_ATTN_TVM_FFI_SPEC:-apache-tvm-ffi==0.1.10}"
 FAST_LINEAR_ATTN_CUDA_ARCH_LIST="${FAST_LINEAR_ATTN_CUDA_ARCH_LIST:-8.0}"
 FAST_LINEAR_ATTN_MAX_JOBS="${FAST_LINEAR_ATTN_MAX_JOBS:-32}"
 PLATFORM_ARGS=()
@@ -44,6 +46,14 @@ if [[ "${INSTALL_FAST_LINEAR_ATTN}" == "1" ]]; then
   fi
   if [[ ! "${FAST_LINEAR_ATTN_TRANSFORMERS_SPEC}" =~ ^transformers==[A-Za-z0-9][A-Za-z0-9._+-]*$ ]]; then
     echo "FAST_LINEAR_ATTN_TRANSFORMERS_SPEC must be an exact transformers version pin" >&2
+    exit 2
+  fi
+  if [[ ! "${FAST_LINEAR_ATTN_TILELANG_SPEC}" =~ ^tilelang==[A-Za-z0-9][A-Za-z0-9._+-]*$ ]]; then
+    echo "FAST_LINEAR_ATTN_TILELANG_SPEC must be an exact tilelang version pin" >&2
+    exit 2
+  fi
+  if [[ ! "${FAST_LINEAR_ATTN_TVM_FFI_SPEC}" =~ ^apache-tvm-ffi==[A-Za-z0-9][A-Za-z0-9._+-]*$ ]]; then
+    echo "FAST_LINEAR_ATTN_TVM_FFI_SPEC must be an exact apache-tvm-ffi version pin" >&2
     exit 2
   fi
   if [[ ! "${FAST_LINEAR_ATTN_CUDA_ARCH_LIST}" =~ ^[0-9]+\.[0-9]+([[:space:];]+[0-9]+\.[0-9]+)*$ ]]; then
@@ -79,6 +89,8 @@ docker build \
   --build-arg "FAST_LINEAR_ATTN_SPEC=${FAST_LINEAR_ATTN_SPEC}" \
   --build-arg "CAUSAL_CONV1D_SPEC=${CAUSAL_CONV1D_SPEC}" \
   --build-arg "FAST_LINEAR_ATTN_TRANSFORMERS_SPEC=${FAST_LINEAR_ATTN_TRANSFORMERS_SPEC}" \
+  --build-arg "FAST_LINEAR_ATTN_TILELANG_SPEC=${FAST_LINEAR_ATTN_TILELANG_SPEC}" \
+  --build-arg "FAST_LINEAR_ATTN_TVM_FFI_SPEC=${FAST_LINEAR_ATTN_TVM_FFI_SPEC}" \
   --build-arg "FAST_LINEAR_ATTN_CUDA_ARCH_LIST=${FAST_LINEAR_ATTN_CUDA_ARCH_LIST}" \
   --build-arg "FAST_LINEAR_ATTN_MAX_JOBS=${FAST_LINEAR_ATTN_MAX_JOBS}" \
   "${REPO_ROOT}"

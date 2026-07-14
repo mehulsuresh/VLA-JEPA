@@ -14,6 +14,8 @@ from typing import Any
 DEFAULT_FLA_VERSION = "0.5.1"
 DEFAULT_CAUSAL_CONV1D_VERSION = "1.6.2.post1"
 DEFAULT_TRANSFORMERS_VERSION = "5.13.1"
+DEFAULT_TILELANG_VERSION = "0.1.9"
+DEFAULT_TVM_FFI_VERSION = "0.1.10"
 QWEN35_2B_LINEAR_ATTN_SHAPE = {
     "hidden_size": 2048,
     "linear_conv_kernel_dim": 4,
@@ -70,6 +72,8 @@ def _load_integrations(
     expected_fla_version: str,
     expected_causal_conv1d_version: str,
     expected_transformers_version: str,
+    expected_tilelang_version: str,
+    expected_tvm_ffi_version: str,
     *,
     require_transformers_bindings: bool,
 ):
@@ -82,6 +86,12 @@ def _load_integrations(
         ),
         "transformers": _require_exact_package_version(
             "transformers", expected_transformers_version
+        ),
+        "tilelang": _require_exact_package_version(
+            "tilelang", expected_tilelang_version
+        ),
+        "apache-tvm-ffi": _require_exact_package_version(
+            "apache-tvm-ffi", expected_tvm_ffi_version
         ),
     }
 
@@ -344,6 +354,14 @@ def _build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_TRANSFORMERS_VERSION,
     )
     parser.add_argument(
+        "--expected-tilelang-version",
+        default=DEFAULT_TILELANG_VERSION,
+    )
+    parser.add_argument(
+        "--expected-tvm-ffi-version",
+        default=DEFAULT_TVM_FFI_VERSION,
+    )
+    parser.add_argument(
         "--expected-compute-capability",
         default=(9, 0),
         type=_parse_compute_capability,
@@ -361,6 +379,8 @@ def main() -> int:
         args.expected_fla_version,
         args.expected_causal_conv1d_version,
         args.expected_transformers_version,
+        args.expected_tilelang_version,
+        args.expected_tvm_ffi_version,
         require_transformers_bindings=not args.imports_only,
     )
     result: dict[str, Any] = {
