@@ -44,6 +44,12 @@ def test_uploader_copies_checkpoints_final_model_and_logs(tmp_path):
     extra_metadata.mkdir()
 
     (run_dir / "config.yaml").write_text("trainer: {}\n", encoding="utf-8")
+    (run_dir / "dataset_provenance.json").write_text(
+        '{"episode_split": {"enabled": true}}\n', encoding="utf-8"
+    )
+    (run_dir / "heldout_eval_windows.json").write_text(
+        '{"observation_count": 96}\n', encoding="utf-8"
+    )
     (extra_metadata / "launch.env").write_text("RUN_ID=test-run\n", encoding="utf-8")
     (extra_metadata / "production_preflight_manifest.txt").write_text(
         "repo_head=test\n", encoding="utf-8"
@@ -93,6 +99,8 @@ def test_uploader_copies_checkpoints_final_model_and_logs(tmp_path):
     assert (state_dir / "uploaded_runtime_logs").exists()
     assert (state_dir / "metadata/launch.env").exists()
     assert (state_dir / "metadata/production_preflight_manifest.txt").exists()
+    assert (state_dir / "metadata/dataset_provenance.json").exists()
+    assert (state_dir / "metadata/heldout_eval_windows.json").exists()
 
 
 def test_uploader_waits_for_stable_checkpoint_and_final_model(tmp_path):

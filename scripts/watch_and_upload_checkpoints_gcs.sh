@@ -80,7 +80,7 @@ upload_metadata() {
       continue
     fi
     find "${source_dir}" -maxdepth 1 -type f \
-      \( -name 'config.yaml' -o -name 'config.json' -o -name 'dataset_statistics.json' -o -name 'canonical_subset_summary.json' -o -name 'canonical_subset_manifest.jsonl' -o -name 'launch.env' -o -name 'production_preflight_manifest.txt' \) \
+      \( -name 'config.yaml' -o -name 'config.json' -o -name 'dataset_statistics.json' -o -name 'dataset_provenance.json' -o -name 'heldout_eval_windows.json' -o -name 'canonical_subset_summary.json' -o -name 'canonical_subset_manifest.jsonl' -o -name 'launch.env' -o -name 'production_preflight_manifest.txt' \) \
       -exec cp -p {} "${metadata_dir}/" \;
   done
   if ! find "${metadata_dir}" -type f | grep -q .; then

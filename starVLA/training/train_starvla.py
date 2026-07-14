@@ -15,11 +15,13 @@ warnings.filterwarnings("ignore")
 
 # Standard Library
 import argparse
+from contextlib import contextmanager
 import ctypes
 import gc
 import math
 import json
 import os
+import random
 import shutil
 import sys
 import logging
@@ -459,6 +461,28 @@ def build_accelerator(cfg) -> Accelerator:
     trackers = resolve_trackers(cfg)
     project_dir = os.path.join(cfg.run_root_dir, cfg.run_id)
     trainer_cfg = cfg.get("trainer", {})
+    raw_gradient_accumulation_steps = trainer_cfg.get(
+        "gradient_accumulation_steps", 1
+    )
+    if isinstance(raw_gradient_accumulation_steps, bool):
+        raise ValueError(
+            "trainer.gradient_accumulation_steps must be a positive integer, "
+            f"got {raw_gradient_accumulation_steps!r}."
+        )
+    try:
+        gradient_accumulation_steps = int(raw_gradient_accumulation_steps)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            "trainer.gradient_accumulation_steps must be a positive integer, "
+            f"got {raw_gradient_accumulation_steps!r}."
+        ) from exc
+    if gradient_accumulation_steps <= 0 or float(
+        raw_gradient_accumulation_steps
+    ) != float(gradient_accumulation_steps):
+        raise ValueError(
+            "trainer.gradient_accumulation_steps must be a positive integer, "
+            f"got {raw_gradient_accumulation_steps!r}."
+        )
     step_scheduler_with_optimizer = bool(trainer_cfg.get("step_scheduler_with_optimizer", False))
     ddp_kwargs = DistributedDataParallelKwargs(
         find_unused_parameters=bool(trainer_cfg.get("find_unused_parameters", True)),
@@ -472,6 +496,7 @@ def build_accelerator(cfg) -> Accelerator:
             mixed_precision=mixed_precision,
             log_with=trackers or None,
             project_dir=project_dir,
+            gradient_accumulation_steps=gradient_accumulation_steps,
             step_scheduler_with_optimizer=step_scheduler_with_optimizer,
             kwargs_handlers=[ddp_kwargs],
         )
@@ -480,6 +505,7 @@ def build_accelerator(cfg) -> Accelerator:
             mixed_precision=mixed_precision,
             log_with=trackers or None,
             project_dir=project_dir,
+            gradient_accumulation_steps=gradient_accumulation_steps,
             step_scheduler_with_optimizer=step_scheduler_with_optimizer,
             kwargs_handlers=[ddp_kwargs],
         )
@@ -487,11 +513,26 @@ def build_accelerator(cfg) -> Accelerator:
     if torch.cuda.is_available():
         # Ensure NCCL collectives run on the process-local device before any early barrier().
         torch.cuda.set_device(accelerator.local_process_index)
+    runtime_gradient_accumulation_steps = int(
+        accelerator.gradient_accumulation_steps
+    )
+    if runtime_gradient_accumulation_steps != gradient_accumulation_steps:
+        raise RuntimeError(
+            "Accelerator gradient accumulation differs from the training config: "
+            f"runtime={runtime_gradient_accumulation_steps}, "
+            f"config={gradient_accumulation_steps}."
+        )
     try:
         OmegaConf.update(
             cfg,
             "trainer._accelerate_distributed_type",
             str(accelerator.distributed_type).lower(),
+            force_add=True,
+        )
+        OmegaConf.update(
+            cfg,
+            "trainer._accelerate_gradient_accumulation_steps",
+            runtime_gradient_accumulation_steps,
             force_add=True,
         )
         OmegaConf.update(
@@ -778,6 +819,30 @@ def prepare_data(cfg, accelerator, output_dir, model=None) -> Tuple[DataLoader, 
     return vla_train_dataloader
 
 
+def prepare_heldout_eval_data(cfg, accelerator, output_dir, model=None):
+    """Build a separate manifest-selected checkpoint-evaluation loader.
+
+    Presence of ``episode_split_manifest`` enables the heldout path.  The same
+    config is passed with ``mode="eval"`` so the dataset layer selects complete
+    holdout episodes while loading only the manifest-bound train statistics.
+    """
+
+    del output_dir  # The dataloader resolves the run output path from ``cfg``.
+    vla_dataset_cfg = cfg.datasets.vla_data
+    if not vla_dataset_cfg.get("episode_split_manifest", None):
+        return None
+    from starVLA.dataloader import build_dataloader
+
+    vla_eval_dataloader = build_dataloader(
+        cfg=cfg,
+        dataset_py=vla_dataset_cfg.dataset_py,
+        model=model,
+        mode="eval",
+    )
+    accelerator.dataloader_config.dispatch_batches = False
+    return vla_eval_dataloader
+
+
 def _find_sampler(obj, visited: set[int] | None = None):
     if obj is None:
         return None
@@ -805,6 +870,105 @@ def _find_sampler(obj, visited: set[int] | None = None):
             return nested_sampler
 
     return None
+
+
+def _collect_dataset_object_ids(obj, visited: set[int] | None = None) -> set[int]:
+    """Collect dataset object identities through common loader/wrapper shapes."""
+
+    if obj is None:
+        return set()
+    if visited is None:
+        visited = set()
+    obj_id = id(obj)
+    if obj_id in visited:
+        return set()
+    visited.add(obj_id)
+    result: set[int] = set()
+
+    if isinstance(obj, Dataset):
+        result.add(obj_id)
+    for attr_name in ("dataset", "dataloader", "base_dataloader"):
+        nested = getattr(obj, attr_name, None)
+        if nested is not None:
+            result.update(_collect_dataset_object_ids(nested, visited))
+    children = getattr(obj, "datasets", None)
+    if children is not None:
+        for child in children:
+            result.update(_collect_dataset_object_ids(child, visited))
+    return result
+
+
+def _reset_loader_generators(obj, seed: int, visited: set[int] | None = None) -> int:
+    """Reset only generators owned by the independent deterministic eval loader."""
+
+    if obj is None:
+        return 0
+    if visited is None:
+        visited = set()
+    obj_id = id(obj)
+    if obj_id in visited:
+        return 0
+    visited.add(obj_id)
+    reset_count = 0
+    generator = getattr(obj, "generator", None)
+    if isinstance(generator, torch.Generator):
+        generator.manual_seed(int(seed))
+        reset_count += 1
+    for attr_name in (
+        "dataset",
+        "sampler",
+        "batch_sampler",
+        "dataloader",
+        "base_dataloader",
+    ):
+        nested = getattr(obj, attr_name, None)
+        if nested is not None:
+            reset_count += _reset_loader_generators(nested, seed, visited)
+    return reset_count
+
+
+def _close_heldout_eval_caches(obj, visited: set[int] | None = None) -> None:
+    if obj is None:
+        return
+    if visited is None:
+        visited = set()
+    obj_id = id(obj)
+    if obj_id in visited:
+        return
+    visited.add(obj_id)
+    close_eval_caches = getattr(obj, "close_eval_caches", None)
+    if callable(close_eval_caches):
+        close_eval_caches()
+    for attr_name in ("dataset", "dataloader", "base_dataloader"):
+        nested = getattr(obj, attr_name, None)
+        if nested is not None:
+            _close_heldout_eval_caches(nested, visited)
+
+
+@contextmanager
+def _isolated_evaluation_rng(seed: int, device: torch.device):
+    """Run stochastic diffusion inference without advancing training RNGs."""
+
+    python_state = random.getstate()
+    numpy_state = np.random.get_state()
+    cuda_devices: list[int] = []
+    if device.type == "cuda" and torch.cuda.is_available():
+        cuda_devices = [
+            int(device.index)
+            if device.index is not None
+            else int(torch.cuda.current_device())
+        ]
+    try:
+        with torch.random.fork_rng(devices=cuda_devices, enabled=True):
+            random.seed(int(seed))
+            np.random.seed(int(seed) % (2**32))
+            torch.manual_seed(int(seed))
+            if cuda_devices:
+                torch.cuda.manual_seed(int(seed))
+            yield
+    finally:
+        random.setstate(python_state)
+        np.random.set_state(numpy_state)
 
 
 def _summarize_batch_structure(batch) -> str:
@@ -1099,10 +1263,20 @@ def setup_optimizer_and_scheduler(model, cfg) -> Tuple[torch.optim.Optimizer, to
 
 
 class VLATrainer(TrainerUtils):
-    def __init__(self, cfg, model, vla_train_dataloader, optimizer, lr_scheduler, accelerator):
+    def __init__(
+        self,
+        cfg,
+        model,
+        vla_train_dataloader,
+        optimizer,
+        lr_scheduler,
+        accelerator,
+        vla_eval_dataloader=None,
+    ):
         self.config = cfg
         self.model = model
         self.vla_train_dataloader = vla_train_dataloader
+        self.vla_eval_dataloader = vla_eval_dataloader
         self.optimizer = optimizer
         self.lr_scheduler = lr_scheduler
         self.accelerator = accelerator
@@ -1117,10 +1291,61 @@ class VLATrainer(TrainerUtils):
         self.best_metric_mode = str(self.config.trainer.get("best_metric_mode", "min")).lower()
         self.best_metric_value = None
         self._warned_missing_best_metric = False
+        self._warned_training_stream_eval_disabled = False
+
+        if self.vla_eval_dataloader is not None:
+            shared_dataset_ids = _collect_dataset_object_ids(
+                self.vla_train_dataloader
+            ) & _collect_dataset_object_ids(self.vla_eval_dataloader)
+            if shared_dataset_ids:
+                raise ValueError(
+                    "Heldout evaluation must use a separately constructed dataset/loader; "
+                    "it shares dataset objects with the training loader."
+                )
+            from starVLA.dataloader.heldout_eval import sampling_seed_from_dataset
+
+            self.heldout_eval_seed = sampling_seed_from_dataset(
+                getattr(self.vla_eval_dataloader, "dataset", self.vla_eval_dataloader),
+                default=int(self.config.get("seed", 0)),
+            )
+            eval_dataset = getattr(
+                self.vla_eval_dataloader,
+                "dataset",
+                self.vla_eval_dataloader,
+            )
+            report_fn = getattr(eval_dataset, "sampling_report", None)
+            if not callable(report_fn):
+                raise ValueError(
+                    "Heldout eval loader dataset must expose its immutable sampling_report()."
+                )
+            self.heldout_eval_sampling_report = report_fn()
+            self.heldout_eval_expected_valid_elements = int(
+                self.heldout_eval_sampling_report["valid_action_element_count"]
+            )
+            self.heldout_eval_expected_valid_observations = int(
+                self.heldout_eval_sampling_report[
+                    "action_evaluable_observation_count"
+                ]
+            )
+        else:
+            self.heldout_eval_seed = int(self.config.get("seed", 0))
+            self.heldout_eval_sampling_report = None
+            self.heldout_eval_expected_valid_elements = None
+            self.heldout_eval_expected_valid_observations = None
 
         # training status tracking
         self.completed_steps = 0
         self.total_batch_size = self._calculate_total_batch_size()
+        if self.heldout_eval_sampling_report is not None:
+            report_observations = int(
+                self.heldout_eval_sampling_report["observation_count"]
+            )
+            if report_observations != self.total_batch_size:
+                raise ValueError(
+                    "Heldout eval sampling report must contain exactly one effective "
+                    f"global training batch: report={report_observations}, "
+                    f"expected={self.total_batch_size}."
+                )
         self.train_start_time = time.perf_counter()
         self.progress_eta_window = max(int(self.config.trainer.get("progress_eta_window", 50)), 1)
         self.progress_eta_warmup_steps = max(int(self.config.trainer.get("progress_eta_warmup_steps", 3)), 0)
@@ -1332,6 +1557,29 @@ class VLATrainer(TrainerUtils):
         )
         if self.accelerator.is_main_process:
             logger.info("Step 0 debug: accelerator.prepare returned")
+        if self.vla_eval_dataloader is not None:
+            # Prepare the independent loader only after the model/train objects.
+            # With split_batches=false, Accelerate assigns distinct local
+            # microbatches to ranks without padding because the manifest count
+            # is an exact effective global batch.
+            self.vla_eval_dataloader = self.accelerator.prepare(
+                self.vla_eval_dataloader
+            )
+            expected_eval_microbatches = max(
+                1, int(self.config.trainer.get("gradient_accumulation_steps", 1))
+            )
+            actual_eval_microbatches = len(self.vla_eval_dataloader)
+            if actual_eval_microbatches != expected_eval_microbatches:
+                raise RuntimeError(
+                    "Prepared heldout eval loader must expose exactly one local "
+                    "microbatch per gradient-accumulation step: "
+                    f"got {actual_eval_microbatches}, expected "
+                    f"{expected_eval_microbatches}."
+                )
+            logger.info(
+                "Prepared independent heldout eval loader with "
+                f"{actual_eval_microbatches} local microbatch(es) per checkpoint eval"
+            )
         self._validate_prepared_dataloader()
         if self.accelerator.is_main_process:
             logger.info("Step 0 debug: prepared dataloader validated")
@@ -1808,7 +2056,10 @@ class VLATrainer(TrainerUtils):
         self._create_data_iterators()
         self.optimizer.zero_grad(set_to_none=True)
         if bool(self.config.trainer.get("eval_before_train", False)):
-            baseline_metrics = self.eval_action_model({})
+            if self.vla_eval_dataloader is not None:
+                baseline_metrics = self.eval_heldout_action_model({})
+            else:
+                baseline_metrics = self.eval_action_model({})
             if self.accelerator.is_main_process:
                 baseline_metrics["epoch"] = 0.0
                 baseline_metrics["samples_seen"] = 0.0
@@ -1833,45 +2084,115 @@ class VLATrainer(TrainerUtils):
 
             t_start_model = time.perf_counter()
             step_metrics = self._train_step(batch_vla)
+            # Capture this once at the optimization boundary.  Accelerate keeps
+            # ``sync_gradients`` false on intermediate accumulation
+            # microbatches; periodic evaluation and checkpointing must never
+            # re-run merely because ``completed_steps`` still names the last
+            # completed optimizer step.
+            optimizer_step_completed = bool(self.accelerator.sync_gradients)
             t_end_model = time.perf_counter()
 
-            if self.accelerator.sync_gradients:
+            if optimizer_step_completed:
                 progress_bar.update(1)
                 self.completed_steps += 1
 
-            # evaluate model
-            if self.completed_steps > 0 and self.completed_steps % self.config.trainer.eval_interval == 0:
-                step_metrics = self.eval_action_model(step_metrics)
+            eval_due = (
+                optimizer_step_completed
+                and self.completed_steps > 0
+                and self.completed_steps % self.config.trainer.eval_interval == 0
+            )
+            save_due = (
+                optimizer_step_completed
+                and self.completed_steps > 0
+                and self.completed_steps % self.config.trainer.save_interval == 0
+            )
+            checkpoint_saved_this_step = False
+
+            # A heldout evaluator is intentionally fail-closed.  At a
+            # coincident unconditional save/eval boundary, make the completed
+            # optimizer step recoverable first so a decode, inference, metric,
+            # or collective failure cannot discard the entire run.  Best-only
+            # saving still has to evaluate first because the metric determines
+            # whether a checkpoint should exist.
+            if (
+                eval_due
+                and save_due
+                and not bool(self.config.trainer.get("save_best_only", False))
+            ):
+                self._save_checkpoint()
+                checkpoint_saved_this_step = True
+
+            # The legacy "eval" path consumes the next shuffled training batch.
+            # Keep it available only as an explicitly named diagnostic; it is
+            # not held-out validation and must not silently advance the train
+            # iterator or select a best checkpoint.
+            if eval_due:
+                if self.vla_eval_dataloader is not None:
+                    eval_start = time.perf_counter()
+                    step_metrics = self.eval_heldout_action_model(step_metrics)
+                    step_metrics["heldout_eval_time"] = time.perf_counter() - eval_start
+                elif bool(self.config.trainer.get("allow_training_stream_eval", False)):
+                    step_metrics = self.eval_action_model(step_metrics)
+                elif (
+                    self.accelerator.is_main_process
+                    and not self._warned_training_stream_eval_disabled
+                ):
+                    logger.warning(
+                        "Periodic in-process evaluation is disabled because no held-out "
+                        "dataloader is configured. Add an immutable episode_split_manifest "
+                        "for one-window-per-episode checkpoint eval. The legacy path consumes "
+                        "a shuffled training batch; set "
+                        "trainer.allow_training_stream_eval=true only for a clearly "
+                        "labeled training-stream diagnostic."
+                    )
+                    self._warned_training_stream_eval_disabled = True
 
             # record metrics
             step_metrics["data_time"] = t_end_data - t_start_data
             step_metrics["model_time"] = t_end_model - t_start_model
 
             # save checkpoint
-            force_checkpoint_requested = self._force_checkpoint_requested()
-            if self.completed_steps % self.config.trainer.save_interval == 0 and self.completed_steps > 0:
-                should_save_checkpoint = self._should_save_checkpoint(step_metrics)
-                if should_save_checkpoint or force_checkpoint_requested:
-                    if force_checkpoint_requested and self.accelerator.is_main_process:
+            if optimizer_step_completed and self.completed_steps > 0:
+                force_checkpoint_requested = self._force_checkpoint_requested()
+                if save_due:
+                    if not checkpoint_saved_this_step:
+                        should_save_checkpoint = self._should_save_checkpoint(
+                            step_metrics
+                        )
+                        if should_save_checkpoint or force_checkpoint_requested:
+                            if (
+                                force_checkpoint_requested
+                                and self.accelerator.is_main_process
+                            ):
+                                logger.info(
+                                    f"Force checkpoint requested via `{self.force_checkpoint_path}` at step {self.completed_steps}"
+                                )
+                            self._save_checkpoint()
+                            checkpoint_saved_this_step = True
+                    elif (
+                        force_checkpoint_requested
+                        and self.accelerator.is_main_process
+                    ):
+                        logger.info(
+                            "Force checkpoint request was satisfied by the "
+                            f"already-saved step {self.completed_steps} checkpoint"
+                        )
+                    if force_checkpoint_requested:
+                        self._clear_force_checkpoint_request()
+                elif force_checkpoint_requested:
+                    if self.accelerator.is_main_process:
                         logger.info(
                             f"Force checkpoint requested via `{self.force_checkpoint_path}` at step {self.completed_steps}"
                         )
                     self._save_checkpoint()
-                if force_checkpoint_requested:
+                    checkpoint_saved_this_step = True
                     self._clear_force_checkpoint_request()
-            elif force_checkpoint_requested and self.completed_steps > 0:
-                if self.accelerator.is_main_process:
-                    logger.info(
-                        f"Force checkpoint requested via `{self.force_checkpoint_path}` at step {self.completed_steps}"
-                    )
-                self._save_checkpoint()
-                self._clear_force_checkpoint_request()
 
             step_metrics["wall_step_time"] = time.perf_counter() - t_start_step
-            if self.accelerator.sync_gradients and self.completed_steps > self.progress_eta_warmup_steps:
+            if optimizer_step_completed and self.completed_steps > self.progress_eta_warmup_steps:
                 self._recent_wall_step_times.append(step_metrics["wall_step_time"])
             if (
-                self.accelerator.sync_gradients
+                optimizer_step_completed
                 and self.completed_steps > 0
                 and self.completed_steps % self._detailed_timing_frequency() == 0
             ):
@@ -1925,80 +2246,469 @@ class VLATrainer(TrainerUtils):
 
         # execute evaluation step
 
-    def eval_action_model(self, step_metrics: dict = None) -> float:
-        """
-        Evaluate the model on the given dataset using the specified metric function.
+    @staticmethod
+    def _eval_numpy(value) -> np.ndarray:
+        if isinstance(value, torch.Tensor):
+            value = value.detach().cpu().numpy()
+        return np.asarray(value)
 
-        :param eval_dataset: List of evaluation samples, each containing 'image', 'instruction', and 'action'.
-        :param metric_fn: Function to compute the distance between predicted and ground truth actions.
-        :return: Average metric score across the evaluation dataset.
-        """
+    @staticmethod
+    def _heldout_indices_from_batch(examples) -> list[int]:
+        if isinstance(examples, Mapping):
+            values = examples.get("_heldout_eval_index")
+            if values is None:
+                return []
+            return [int(value) for value in VLATrainer._eval_numpy(values).reshape(-1)]
+        if isinstance(examples, Sequence) and not isinstance(examples, (str, bytes)):
+            indices = []
+            for example in examples:
+                if not isinstance(example, Mapping) or "_heldout_eval_index" not in example:
+                    return []
+                indices.append(int(example["_heldout_eval_index"]))
+            return indices
+        return []
 
-        step_metrics = step_metrics or {}
+    @staticmethod
+    def _without_heldout_metadata(examples):
+        if isinstance(examples, Mapping):
+            return {
+                key: value
+                for key, value in examples.items()
+                if not str(key).startswith("_heldout_eval_")
+            }
+        if isinstance(examples, Sequence) and not isinstance(examples, (str, bytes)):
+            return [
+                {
+                    key: value
+                    for key, value in example.items()
+                    if not str(key).startswith("_heldout_eval_")
+                }
+                if isinstance(example, Mapping)
+                else example
+                for example in examples
+            ]
+        return examples
 
-        examples = self._get_next_eval_batch()
+    def _eval_arm_dimensions(self, action_dim: int) -> tuple[int, ...] | None:
+        configured = self.config.trainer.get(
+            "heldout_eval_arm_dimensions",
+            None,
+        )
+        if configured is not None:
+            dimensions = tuple(int(value) for value in configured)
+        elif int(action_dim) in {18, 19, 22}:
+            # RealMan: left 7 arm joints, left gripper, right 7 arm
+            # joints, right gripper, then head/base/lift controls.
+            dimensions = tuple(range(0, 7)) + tuple(range(8, 15))
+        else:
+            return None
+        if (
+            not dimensions
+            or len(set(dimensions)) != len(dimensions)
+            or min(dimensions) < 0
+            or max(dimensions) >= int(action_dim)
+        ):
+            raise ValueError(
+                "trainer.heldout_eval_arm_dimensions must be unique indices "
+                f"inside action_dim={action_dim}, got {dimensions}."
+            )
+        return dimensions
+
+    def _evaluate_action_batches(
+        self,
+        batches,
+        *,
+        step_metrics: dict,
+        metric_prefix: str,
+        expected_observations: int | None = None,
+        expected_valid_observations: int | None = None,
+        expected_valid_elements: int | None = None,
+        require_heldout_indices: bool = False,
+    ) -> dict:
+        """Run deterministic deployment-style diffusion on one eval pass."""
+
         infer_model = self.accelerator.unwrap_model(self.model)
-        if isinstance(examples, dict):
-            actions = examples["action"].cpu().numpy()
-            action_mask = examples.get("action_mask")
-            if action_mask is not None:
-                action_mask = action_mask.cpu().numpy()
-            action_is_pad = examples.get("action_is_pad")
-            if action_is_pad is not None:
-                action_is_pad = action_is_pad.cpu().numpy()
-            with torch.no_grad():
-                output_dict = infer_model.predict_action(
-                    batch=examples,
-                    use_ddim=True,
-                    num_ddim_steps=20,
-                )
-        else:
-            actions = [example["action"] for example in examples]
-            action_mask = [example["action_mask"] for example in examples] if "action_mask" in examples[0] else None
-            action_is_pad = [example["action_is_pad"] for example in examples] if "action_is_pad" in examples[0] else None
-            state = [example["state"] for example in examples] if "state" in examples[0] else None
-            with torch.no_grad():
-                output_dict = infer_model.predict_action(
-                    batch=examples,
-                    state=state,
-                    use_ddim=True,
-                    num_ddim_steps=20,
-                )
+        module_modes = [(module, bool(module.training)) for module in infer_model.modules()]
+        # This is deliberately the same action-model setting embedded in the
+        # checkpoint and used by deployment, not a trainer-only DDIM override.
+        num_inference_timesteps = int(
+            self.config.framework.action_model.get("num_inference_timesteps", 8)
+        )
+        if num_inference_timesteps <= 0:
+            raise ValueError(
+                "framework.action_model.num_inference_timesteps must be positive "
+                "for heldout checkpoint evaluation."
+            )
 
-        actions = np.asarray(actions, dtype=np.float32)
-        normalized_actions = np.asarray(output_dict["normalized_actions"], dtype=np.float32)
-        diff = normalized_actions - actions
-        metric_mask = None
-        if action_mask is not None:
-            metric_mask = np.asarray(action_mask, dtype=np.float32)
-        if action_is_pad is not None:
-            timestep_mask = (~np.asarray(action_is_pad, dtype=bool)).astype(np.float32)
-            if timestep_mask.ndim == 2:
-                timestep_mask = timestep_mask[..., None]
-            metric_mask = timestep_mask if metric_mask is None else metric_mask * timestep_mask
-        if metric_mask is not None:
-            if metric_mask.shape != diff.shape:
-                metric_mask = np.broadcast_to(metric_mask, diff.shape)
-            diff = diff * metric_mask
-            metric_count = float(metric_mask.sum())
-        else:
-            metric_count = float(diff.size)
+        local_abs_sum = 0.0
+        local_sq_sum = 0.0
+        local_element_count = 0.0
+        local_observation_count = 0
+        local_valid_observation_count = 0
+        local_heldout_indices: list[int] = []
+        requested_prefix_horizons = (1, 5, 10, 20, 50)
+        prefix_abs_sums: dict[int, float] = {}
+        prefix_element_counts: dict[int, float] = {}
+        prefix_arm_abs_sums: dict[int, float] = {}
+        prefix_arm_element_counts: dict[int, float] = {}
+        arm_dimensions: tuple[int, ...] | None = None
+        action_shape: tuple[int, int] | None = None
+        try:
+            infer_model.eval()
+            with _isolated_evaluation_rng(
+                getattr(self, "heldout_eval_seed", 0),
+                self.accelerator.device,
+            ), torch.inference_mode():
+                for raw_examples in batches:
+                    heldout_indices = self._heldout_indices_from_batch(raw_examples)
+                    if require_heldout_indices and not heldout_indices:
+                        raise RuntimeError(
+                            "Heldout eval batch is missing deterministic reference indices; "
+                            "cannot prove complete, duplicate-free coverage."
+                        )
+                    local_heldout_indices.extend(heldout_indices)
+                    examples = self._without_heldout_metadata(raw_examples)
+
+                    if isinstance(examples, Mapping):
+                        actions = self._eval_numpy(examples["action"])
+                        action_mask = examples.get("action_mask")
+                        action_is_pad = examples.get("action_is_pad")
+                        output_dict = infer_model.predict_action(
+                            batch=examples,
+                            prev_actions=None,
+                            prefix_len=0,
+                            rtc_config=None,
+                            num_inference_timesteps=num_inference_timesteps,
+                        )
+                    else:
+                        if not examples:
+                            raise RuntimeError("Evaluation loader produced an empty batch.")
+                        actions = np.asarray(
+                            [self._eval_numpy(example["action"]) for example in examples]
+                        )
+                        action_mask = (
+                            [self._eval_numpy(example["action_mask"]) for example in examples]
+                            if all("action_mask" in example for example in examples)
+                            else None
+                        )
+                        action_is_pad = (
+                            [self._eval_numpy(example["action_is_pad"]) for example in examples]
+                            if all("action_is_pad" in example for example in examples)
+                            else None
+                        )
+                        state = (
+                            [example["state"] for example in examples]
+                            if all("state" in example for example in examples)
+                            else None
+                        )
+                        output_dict = infer_model.predict_action(
+                            batch=examples,
+                            state=state,
+                            prev_actions=None,
+                            prefix_len=0,
+                            rtc_config=None,
+                            num_inference_timesteps=num_inference_timesteps,
+                        )
+
+                    actions = np.asarray(actions, dtype=np.float32)
+                    normalized_actions = np.asarray(
+                        self._eval_numpy(output_dict["normalized_actions"]),
+                        dtype=np.float32,
+                    )
+                    if normalized_actions.shape != actions.shape:
+                        raise RuntimeError(
+                            "Evaluation prediction/target shape mismatch: "
+                            f"predicted={normalized_actions.shape}, target={actions.shape}."
+                        )
+                    if actions.ndim != 3:
+                        raise RuntimeError(
+                            "Evaluation actions must have shape [batch, horizon, dim], "
+                            f"got {actions.shape}."
+                        )
+                    current_action_shape = (int(actions.shape[1]), int(actions.shape[2]))
+                    if action_shape is None:
+                        action_shape = current_action_shape
+                        arm_dimensions = self._eval_arm_dimensions(actions.shape[2])
+                    elif current_action_shape != action_shape:
+                        raise RuntimeError(
+                            "Evaluation action shape changed between microbatches: "
+                            f"{current_action_shape} != {action_shape}."
+                        )
+                    metric_mask = None
+                    if action_mask is not None:
+                        metric_mask = np.asarray(action_mask, dtype=np.float32)
+                    if action_is_pad is not None:
+                        timestep_mask = (
+                            ~np.asarray(action_is_pad, dtype=bool)
+                        ).astype(np.float32)
+                        if timestep_mask.ndim == 2:
+                            timestep_mask = timestep_mask[..., None]
+                        metric_mask = (
+                            timestep_mask
+                            if metric_mask is None
+                            else metric_mask * timestep_mask
+                        )
+                    if metric_mask is not None:
+                        if metric_mask.shape != normalized_actions.shape:
+                            metric_mask = np.broadcast_to(
+                                metric_mask,
+                                normalized_actions.shape,
+                            )
+                        metric_mask = np.asarray(metric_mask, dtype=bool)
+                        nonfinite_valid = metric_mask & (
+                            ~np.isfinite(normalized_actions) | ~np.isfinite(actions)
+                        )
+                        if bool(nonfinite_valid.any()):
+                            raise RuntimeError(
+                                "Evaluation prediction/target contains non-finite "
+                                "values at supervised action elements: "
+                                f"count={int(nonfinite_valid.sum())}."
+                            )
+                        # np.where(pred-target, ...) would still evaluate the
+                        # masked subtraction.  Using ufunc `where` prevents NaN
+                        # or inf in a truly masked target (including the all-
+                        # invalid episode) from poisoning aggregate sums.
+                        diff = np.zeros_like(normalized_actions, dtype=np.float32)
+                        np.subtract(
+                            normalized_actions,
+                            actions,
+                            out=diff,
+                            where=metric_mask,
+                        )
+                        metric_count = float(metric_mask.sum())
+                        per_observation_counts = metric_mask.reshape(
+                            metric_mask.shape[0], -1
+                        ).sum(axis=1)
+                        valid_observation_count = int(
+                            (per_observation_counts > 0).sum()
+                        )
+                    else:
+                        nonfinite = (
+                            ~np.isfinite(normalized_actions) | ~np.isfinite(actions)
+                        )
+                        if bool(nonfinite.any()):
+                            raise RuntimeError(
+                                "Evaluation prediction/target contains non-finite "
+                                "values at supervised action elements: "
+                                f"count={int(nonfinite.sum())}."
+                            )
+                        diff = normalized_actions - actions
+                        metric_count = float(diff.size)
+                        valid_observation_count = int(actions.shape[0])
+
+                    for prefix_horizon in requested_prefix_horizons:
+                        if prefix_horizon > int(actions.shape[1]):
+                            continue
+                        prefix_diff = diff[:, :prefix_horizon, :]
+                        if metric_mask is None:
+                            prefix_count = float(prefix_diff.size)
+                            prefix_arm_count = (
+                                float(
+                                    actions.shape[0]
+                                    * prefix_horizon
+                                    * len(arm_dimensions)
+                                )
+                                if arm_dimensions is not None
+                                else 0.0
+                            )
+                        else:
+                            prefix_mask = metric_mask[:, :prefix_horizon, :]
+                            prefix_count = float(prefix_mask.sum())
+                            prefix_arm_count = (
+                                float(prefix_mask[..., arm_dimensions].sum())
+                                if arm_dimensions is not None
+                                else 0.0
+                            )
+                        prefix_abs_sums[prefix_horizon] = (
+                            prefix_abs_sums.get(prefix_horizon, 0.0)
+                            + float(np.abs(prefix_diff).sum())
+                        )
+                        prefix_element_counts[prefix_horizon] = (
+                            prefix_element_counts.get(prefix_horizon, 0.0)
+                            + prefix_count
+                        )
+                        if arm_dimensions is not None:
+                            prefix_arm_abs_sums[prefix_horizon] = (
+                                prefix_arm_abs_sums.get(prefix_horizon, 0.0)
+                                + float(
+                                    np.abs(prefix_diff[..., arm_dimensions]).sum()
+                                )
+                            )
+                            prefix_arm_element_counts[prefix_horizon] = (
+                                prefix_arm_element_counts.get(prefix_horizon, 0.0)
+                                + prefix_arm_count
+                            )
+
+                    local_abs_sum += float(np.abs(diff).sum())
+                    local_sq_sum += float(np.square(diff).sum())
+                    local_element_count += metric_count
+                    local_observation_count += int(actions.shape[0])
+                    local_valid_observation_count += valid_observation_count
+        finally:
+            # Restore every module's exact prior mode. Calling model.train()
+            # would incorrectly switch frozen V-JEPA/teacher modules that were
+            # intentionally already in eval mode.
+            for module, was_training in module_modes:
+                module.training = was_training
+
+        available_prefix_horizons = tuple(sorted(prefix_abs_sums))
+        local_metric_values = [
+            local_abs_sum,
+            local_sq_sum,
+            local_element_count,
+            float(local_observation_count),
+            float(local_valid_observation_count),
+        ]
+        for prefix_horizon in available_prefix_horizons:
+            local_metric_values.extend(
+                (
+                    prefix_abs_sums[prefix_horizon],
+                    prefix_element_counts[prefix_horizon],
+                )
+            )
+            if arm_dimensions is not None:
+                local_metric_values.extend(
+                    (
+                        prefix_arm_abs_sums[prefix_horizon],
+                        prefix_arm_element_counts[prefix_horizon],
+                    )
+                )
         local_metrics = torch.tensor(
-            [
-                float(np.abs(diff).sum()),
-                float(np.square(diff).sum()),
-                metric_count,
-            ],
+            local_metric_values,
             device=self.accelerator.device,
             dtype=torch.float64,
         )
         reduced_metrics = self.accelerator.reduce(local_metrics, reduction="sum")
+        reduced_values = reduced_metrics.tolist()
+        (
+            total_abs_sum,
+            total_sq_sum,
+            total_count,
+            total_observations,
+            total_valid_observations,
+        ) = reduced_values[:5]
 
-        total_abs_sum, total_sq_sum, total_count = reduced_metrics.tolist()
+        if expected_observations is not None:
+            if int(total_observations) != int(expected_observations):
+                raise RuntimeError(
+                    "Heldout checkpoint eval did not visit exactly one effective "
+                    f"global batch: got {int(total_observations)} observations, "
+                    f"expected {int(expected_observations)}."
+                )
+            local_index_tensor = torch.tensor(
+                local_heldout_indices,
+                device=self.accelerator.device,
+                dtype=torch.int64,
+            )
+            gather = getattr(self.accelerator, "gather", None)
+            if callable(gather):
+                gathered_indices = gather(local_index_tensor).detach().cpu().tolist()
+            else:
+                # Unit-test/single-process accelerators may expose only reduce.
+                gathered_indices = local_index_tensor.detach().cpu().tolist()
+            expected_indices = list(range(int(expected_observations)))
+            if sorted(int(value) for value in gathered_indices) != expected_indices:
+                raise RuntimeError(
+                    "Heldout checkpoint eval reference coverage contains missing or "
+                    "duplicate episode windows."
+                )
+        if expected_valid_observations is not None and int(
+            total_valid_observations
+        ) != int(expected_valid_observations):
+            raise RuntimeError(
+                "Heldout eval action-evaluable observation coverage differs from "
+                f"its immutable sampling report: got {int(total_valid_observations)}, "
+                f"expected {int(expected_valid_observations)}."
+            )
+        if expected_valid_elements is not None and int(total_count) != int(
+            expected_valid_elements
+        ):
+            raise RuntimeError(
+                "Heldout eval valid action-element coverage differs from its "
+                f"immutable sampling report: got {int(total_count)}, expected "
+                f"{int(expected_valid_elements)}."
+            )
+
+        step_metrics[f"{metric_prefix}_observations"] = float(total_observations)
+        step_metrics[f"{metric_prefix}_action_evaluable_observations"] = float(
+            total_valid_observations
+        )
+        step_metrics[f"{metric_prefix}_valid_action_elements"] = float(total_count)
+        metric_offset = 5
+        for prefix_horizon in available_prefix_horizons:
+            prefix_abs_sum = float(reduced_values[metric_offset])
+            prefix_count = float(reduced_values[metric_offset + 1])
+            metric_offset += 2
+            step_metrics[
+                f"{metric_prefix}_valid_all_action_elements_h{prefix_horizon}"
+            ] = prefix_count
+            if prefix_count > 0:
+                step_metrics[
+                    f"{metric_prefix}_normalized_all_action_mae_h{prefix_horizon}"
+                ] = prefix_abs_sum / prefix_count
+            if arm_dimensions is not None:
+                prefix_arm_abs_sum = float(reduced_values[metric_offset])
+                prefix_arm_count = float(reduced_values[metric_offset + 1])
+                metric_offset += 2
+                step_metrics[
+                    f"{metric_prefix}_valid_arm_elements_h{prefix_horizon}"
+                ] = prefix_arm_count
+                if prefix_arm_count > 0:
+                    step_metrics[
+                        f"{metric_prefix}_normalized_arm_mae_h{prefix_horizon}"
+                    ] = prefix_arm_abs_sum / prefix_arm_count
         if total_count > 0:
-            step_metrics["mae_score"] = total_abs_sum / total_count
-            step_metrics["norm_l2_per_element"] = (total_sq_sum ** 0.5) / total_count
+            step_metrics[f"{metric_prefix}_normalized_action_mae"] = (
+                total_abs_sum / total_count
+            )
+            step_metrics[f"{metric_prefix}_normalized_action_rmse"] = (
+                total_sq_sum / total_count
+            ) ** 0.5
         return step_metrics
+
+    def eval_heldout_action_model(self, step_metrics: dict = None) -> dict:
+        if self.vla_eval_dataloader is None:
+            raise RuntimeError("No independent heldout eval dataloader is configured.")
+        _reset_loader_generators(
+            self.vla_eval_dataloader,
+            int(self.heldout_eval_seed),
+        )
+        try:
+            metrics = self._evaluate_action_batches(
+                self.vla_eval_dataloader,
+                step_metrics=step_metrics or {},
+                metric_prefix="heldout_eval",
+                expected_observations=int(self.total_batch_size),
+                expected_valid_observations=int(
+                    self.heldout_eval_expected_valid_observations
+                ),
+                expected_valid_elements=int(self.heldout_eval_expected_valid_elements),
+                require_heldout_indices=True,
+            )
+        finally:
+            _close_heldout_eval_caches(self.vla_eval_dataloader)
+        zero_valid_episodes = self.heldout_eval_sampling_report.get(
+            "zero_valid_action_episodes", []
+        )
+        metrics["heldout_eval_zero_valid_action_episodes"] = float(
+            len(zero_valid_episodes)
+        )
+        return metrics
+
+    def eval_action_model(self, step_metrics: dict = None) -> dict:
+        """Run the explicitly enabled legacy training-stream diagnostic."""
+
+        if not bool(self.config.trainer.get("allow_training_stream_eval", False)):
+            raise RuntimeError(
+                "eval_action_model() reads the live training iterator and is disabled by "
+                "default. Set trainer.allow_training_stream_eval=true only for an "
+                "explicit training-stream diagnostic."
+            )
+        return self._evaluate_action_batches(
+            [self._get_next_eval_batch()],
+            step_metrics=step_metrics or {},
+            metric_prefix="train_stream_probe",
+        )
 
     def _log_training_config(self):
         """record training config"""
@@ -2391,6 +3101,7 @@ class VLATrainer(TrainerUtils):
             _shutdown_dataloader_iterator(iterator)
             setattr(self, attr_name, None)
         _shutdown_dataloader_workers(getattr(self, "vla_train_dataloader", None))
+        _shutdown_dataloader_workers(getattr(self, "vla_eval_dataloader", None))
         gc.collect()
 
 
@@ -2400,6 +3111,7 @@ def main(cfg) -> None:
     interrupted = False
     trainer = None
     vla_train_dataloader = None
+    vla_eval_dataloader = None
 
     try:
         # create output directory and save config
@@ -2408,6 +3120,12 @@ def main(cfg) -> None:
         vla = build_model(cfg)
         # prepare data
         vla_train_dataloader = prepare_data(
+            cfg=cfg,
+            accelerator=accelerator,
+            output_dir=output_dir,
+            model=vla,
+        )
+        vla_eval_dataloader = prepare_heldout_eval_data(
             cfg=cfg,
             accelerator=accelerator,
             output_dir=output_dir,
@@ -2429,6 +3147,7 @@ def main(cfg) -> None:
             optimizer=optimizer,
             lr_scheduler=lr_scheduler,
             accelerator=accelerator,
+            vla_eval_dataloader=vla_eval_dataloader,
         )
 
         # execute training preparation
@@ -2451,6 +3170,7 @@ def main(cfg) -> None:
         elif vla_train_dataloader is not None:
             try:
                 _shutdown_dataloader_workers(vla_train_dataloader)
+                _shutdown_dataloader_workers(vla_eval_dataloader)
             except Exception as exc:
                 logger.warning(f"Fallback dataloader shutdown failed: {exc}")
         if dist.is_initialized():

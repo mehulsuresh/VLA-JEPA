@@ -1,3 +1,4 @@
+import copy
 import json
 import os
 import signal
@@ -116,6 +117,14 @@ def _resolve_output_dir(cfg) -> Path | None:
     return None
 
 
+def _build_eval_lerobot_data_cfg(vla_dataset_cfg):
+    """Clone shared config and cap eval's Arrow shard cache at one."""
+
+    eval_cfg = copy.deepcopy(vla_dataset_cfg)
+    eval_cfg["lerobot_v3_parquet_cache_size"] = 1
+    return eval_cfg
+
+
 def _close_worker_dataset_readers(dataset, visited: set[int] | None = None) -> None:
     """Best-effort cleanup for native video readers held by worker-local dataset copies."""
     if dataset is None:
@@ -206,21 +215,105 @@ def _configure_lerobot_worker(worker_id: int, *, torch_threads: int, cv2_threads
 
 
 
-def build_dataloader(cfg, dataset_py="lerobot_datasets", model=None):
+def build_dataloader(cfg, dataset_py="lerobot_datasets", model=None, *, mode: str = "train"):
+
+    mode_aliases = {
+        "train": "train",
+        "eval": "eval",
+        "evaluation": "eval",
+        "val": "eval",
+        "validation": "eval",
+        "holdout": "eval",
+    }
+    normalized_mode = mode_aliases.get(str(mode).lower())
+    if normalized_mode is None:
+        raise ValueError(
+            f"Unsupported dataloader mode {mode!r}; expected one of {sorted(mode_aliases)}."
+        )
 
     if dataset_py == "lerobot_datasets":
         from starVLA.dataloader.lerobot_datasets import get_vla_dataset, collate_fn
         vla_dataset_cfg = cfg.datasets.vla_data
-        num_workers = int(vla_dataset_cfg.get("num_workers", 8))
-        pin_memory = bool(vla_dataset_cfg.get("pin_memory", torch.cuda.is_available()))
-        drop_last = bool(vla_dataset_cfg.get("drop_last", True))
+        is_eval = normalized_mode == "eval"
+        if is_eval and not vla_dataset_cfg.get("episode_split_manifest", None):
+            raise ValueError(
+                "Heldout evaluation requires datasets.vla_data.episode_split_manifest."
+            )
+        if is_eval and str(vla_dataset_cfg.get("lerobot_statistics_source", "")) != "split_train":
+            raise ValueError(
+                "Heldout evaluation must use the manifest-bound TRAIN normalization "
+                "statistics; set datasets.vla_data.lerobot_statistics_source=split_train."
+            )
+
+        if is_eval:
+            num_workers = int(vla_dataset_cfg.get("eval_num_workers", 0))
+            pin_memory = bool(
+                vla_dataset_cfg.get(
+                    "eval_pin_memory",
+                    vla_dataset_cfg.get("pin_memory", torch.cuda.is_available()),
+                )
+            )
+            # Never allow a loader/sampler implementation detail to discard a
+            # heldout episode.  Exact global/local counts are validated below.
+            drop_last = False
+        else:
+            num_workers = int(vla_dataset_cfg.get("num_workers", 8))
+            pin_memory = bool(vla_dataset_cfg.get("pin_memory", torch.cuda.is_available()))
+            drop_last = bool(vla_dataset_cfg.get("drop_last", True))
+
+        dataset_build_cfg = vla_dataset_cfg
+        if is_eval:
+            # Single-dataset config objects are retained by each child.  Give
+            # eval an independent copy so its one-shard label scan/cache policy
+            # can never mutate training config or worker behavior.
+            dataset_build_cfg = _build_eval_lerobot_data_cfg(vla_dataset_cfg)
 
         vla_dataset = get_vla_dataset(
-            data_cfg=vla_dataset_cfg,
+            data_cfg=dataset_build_cfg,
+            mode=normalized_mode,
             action_horizon=cfg.framework.action_model.action_horizon,
             video_horizon=cfg.framework.vj2_model.num_frames,
             video_frame_stride=vla_dataset_cfg.get("video_frame_stride", 1),
         )
+        loader_generator = None
+        batch_size = int(vla_dataset_cfg.per_device_batch_size)
+        if is_eval:
+            from starVLA.dataloader.heldout_eval import (
+                build_heldout_eval_dataset,
+                validate_global_eval_observation_count,
+            )
+
+            vla_dataset = build_heldout_eval_dataset(
+                vla_dataset,
+                manifest_path=vla_dataset_cfg.episode_split_manifest,
+                action_dim=int(cfg.framework.action_model.action_dim),
+            )
+            gradient_accumulation_steps = max(
+                1, int(cfg.trainer.get("gradient_accumulation_steps", 1))
+            )
+            world_size = _distributed_world_size()
+            validate_global_eval_observation_count(
+                holdout_episode_count=len(vla_dataset),
+                per_device_batch_size=int(vla_dataset_cfg.per_device_batch_size),
+                world_size=world_size,
+                gradient_accumulation_steps=gradient_accumulation_steps,
+            )
+            loader_generator = vla_dataset.make_torch_generator()
+            logger.info(
+                "Heldout checkpoint eval: "
+                f"{len(vla_dataset)} episodes, one deterministic window/episode, "
+                f"world_size={world_size}, local_microbatch={batch_size}, "
+                f"distributed_microbatches={gradient_accumulation_steps}, "
+                f"window_selection_sha256={vla_dataset.heldout_window_digest}"
+            )
+            sampling_report = vla_dataset.sampling_report()
+            zero_valid_episodes = sampling_report["zero_valid_action_episodes"]
+            if zero_valid_episodes:
+                logger.warning(
+                    "Heldout episodes forwarded but excluded from action metrics "
+                    "because every structurally valid window has zero supervised "
+                    f"action elements: {zero_valid_episodes}"
+                )
         if bool(vla_dataset_cfg.get("gpu_video_decode_on_rank", False)):
             logger.info(
                 "LeRobot dataloader will hand off video decode specs to each training rank; "
@@ -234,18 +327,44 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets", model=None):
 
         loader_kwargs = dict(
             dataset=vla_dataset,
-            batch_size=cfg.datasets.vla_data.per_device_batch_size,
+            batch_size=batch_size,
             collate_fn=collate_fn,
-            shuffle=bool(vla_dataset_cfg.get("shuffle", True)),
+            shuffle=False if is_eval else bool(vla_dataset_cfg.get("shuffle", True)),
             num_workers=num_workers,
             pin_memory=pin_memory,
             drop_last=drop_last,
+            generator=loader_generator,
         )
         if num_workers > 0:
-            loader_kwargs["prefetch_factor"] = max(2, int(vla_dataset_cfg.get("prefetch_factor", 2)))
-            loader_kwargs["persistent_workers"] = bool(vla_dataset_cfg.get("persistent_workers", True))
-            loader_kwargs["multiprocessing_context"] = vla_dataset_cfg.get("multiprocessing_context", "spawn")
-            dataloader_timeout_seconds = int(vla_dataset_cfg.get("dataloader_timeout_seconds", 0))
+            prefetch_key = "eval_prefetch_factor" if is_eval else "prefetch_factor"
+            loader_kwargs["prefetch_factor"] = max(
+                1 if is_eval else 2,
+                int(vla_dataset_cfg.get(prefetch_key, vla_dataset_cfg.get("prefetch_factor", 2))),
+            )
+            # Eval workers are transient by default: holding a second complete
+            # set of dataset/video-reader processes for thousands of train steps
+            # would defeat the low-overhead one-batch design.
+            if is_eval and bool(vla_dataset_cfg.get("eval_persistent_workers", False)):
+                raise ValueError(
+                    "eval_persistent_workers=true is incompatible with deterministic, "
+                    "low-footprint checkpoint evaluation."
+                )
+            loader_kwargs["persistent_workers"] = (
+                False
+                if is_eval
+                else bool(vla_dataset_cfg.get("persistent_workers", True))
+            )
+            loader_kwargs["multiprocessing_context"] = vla_dataset_cfg.get(
+                "eval_multiprocessing_context" if is_eval else "multiprocessing_context",
+                vla_dataset_cfg.get("multiprocessing_context", "spawn"),
+            )
+            timeout_key = "eval_dataloader_timeout_seconds" if is_eval else "dataloader_timeout_seconds"
+            dataloader_timeout_seconds = int(
+                vla_dataset_cfg.get(
+                    timeout_key,
+                    vla_dataset_cfg.get("dataloader_timeout_seconds", 0),
+                )
+            )
             if dataloader_timeout_seconds > 0:
                 loader_kwargs["timeout"] = dataloader_timeout_seconds
             loader_kwargs["worker_init_fn"] = partial(
@@ -259,8 +378,19 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets", model=None):
             output_dir = _resolve_output_dir(cfg)
             if output_dir is not None:
                 output_dir.mkdir(parents=True, exist_ok=True)
-                vla_dataset.save_dataset_statistics(output_dir / "dataset_statistics.json")
+                if is_eval:
+                    vla_dataset.save_sampling_report(
+                        output_dir / "heldout_eval_windows.json"
+                    )
+                else:
+                    vla_dataset.save_dataset_statistics(output_dir / "dataset_statistics.json")
+                    vla_dataset.save_dataset_provenance(output_dir / "dataset_provenance.json")
         return vla_train_dataloader
+    elif normalized_mode != "train":
+        raise ValueError(
+            "In-training heldout evaluation is currently implemented only for "
+            f"dataset_py='lerobot_datasets', got {dataset_py!r}. Full sweeps remain offline."
+        )
     elif dataset_py == "canonical_subset_vla":
         from starVLA.dataloader.canonical_subset_dataset import get_vla_dataset, collate_fn
 

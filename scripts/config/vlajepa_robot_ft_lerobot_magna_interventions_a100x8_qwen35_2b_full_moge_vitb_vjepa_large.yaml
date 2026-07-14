@@ -1,7 +1,8 @@
 # A100x8 Magna intervention profile:
 # - Full Qwen3.5-2B fine-tuning; no LoRA adapter.
 # - 18D Realman source-action view with base velocity and lift command removed.
-# - Resolved subtask labels are appended to prompts 30% of the time.
+# - Clean autonomous baseline: no privileged RTC prefix or local-stage prompt.
+# - LeRobot v3 statistics must carry the exact current frame count.
 # - valid_state builds a sustained-invalid-prefix action loss mask; RABC is off.
 run_id: robot_ft_lerobot_magna_interventions_a100x8_qwen35_2b_full_moge_vitb_vjepa_large
 run_root_dir: /mnt/vla-jepa/checkpoints
@@ -46,13 +47,13 @@ framework:
     num_timestep_buckets: 1000
     num_inference_timesteps: 8
     rtc_training:
-      enabled: true
+      enabled: false
       method: prefix
-      max_delay: 11
+      max_delay: 0
       distribution: uniform
-      rtc_prob: 1.0
-      warmup_steps: 10000
-      ramp_steps: 50000
+      rtc_prob: 0.0
+      warmup_steps: 0
+      ramp_steps: 0
       clean_time: 1.0
       condition_dit_tokens: false
     num_target_vision_tokens: 32
@@ -117,12 +118,15 @@ datasets:
     data_root_dir: /mnt/vla-jepa/datasets/magna_training_data_with_interventions
     data_mix: magna_source_no_base_no_lift_interventions_v3
     lerobot_version: v3.0
+    episode_split_manifest: deployment/realman/eval_manifests/magna_internal_holdout_global_batch96_v1.json
+    lerobot_statistics_source: split_train
+    require_statistics_frame_count: true
     action_type: absolute_qpos
     CoT_prompt: "Your task is {instruction}. Use the robot observations and state to produce the corresponding policy actions. {state}{e_actions}{actions}{geometry}"
-    append_task_id_to_prompt: true
+    append_task_id_to_prompt: false
     task_id_prompt_source_column: subtask_index
     subtask_prompt_label_column: local_subtask_text
-    task_id_prompt_append_probability: 0.3
+    task_id_prompt_append_probability: 0.0
     task_id_prompt_separator: " | "
     subtask_prompt_ignored_labels:
       - __unlabeled__
@@ -163,6 +167,7 @@ datasets:
     action_validity_invalid_run_length: 10
     per_device_batch_size: 12
     num_workers: 4
+    eval_num_workers: 0
     prefetch_factor: 2
     dataloader_timeout_seconds: 0
     persistent_workers: true
@@ -175,7 +180,7 @@ datasets:
     pin_memory: true
     drop_last: true
     delete_pause_frame: false
-    load_all_data_for_training: true
+    load_all_data_for_training: false
     with_state: true
     shuffle: true
 
@@ -188,7 +193,7 @@ trainer:
   eval_interval: 2500
   checkpoint_max_to_keep: 3
   save_best_only: false
-  best_metric_name: mae_score
+  best_metric_name: heldout_eval_normalized_arm_mae_h20
   best_metric_mode: min
   learning_rate:
     base: 2.0e-05
@@ -212,6 +217,7 @@ trainer:
   progress_eta_window: 50
   progress_eta_warmup_steps: 10
   eval_before_train: false
+  allow_training_stream_eval: false
   gradient_clipping: 1.0
   gradient_accumulation_steps: 1
   repeated_diffusion_steps: 8

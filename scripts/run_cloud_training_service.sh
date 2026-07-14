@@ -84,7 +84,10 @@ DATA_ROOT_DIR="${DATA_ROOT_DIR:-${VLA_JEPA_SCRATCH}/datasets/magna_training_data
 CHECKPOINT_ROOT="${CHECKPOINT_ROOT:-${VLA_JEPA_SCRATCH}/checkpoints}"
 LOG_ROOT="${LOG_ROOT:-${VLA_JEPA_SCRATCH}/logs}"
 RUN_DIR="${CHECKPOINT_ROOT}/${RUN_ID}"
-TRAIN_LAUNCHER="${TRAIN_LAUNCHER:-./scripts/vlajepa_robot_ft_lerobot_magna_interventions_a100x8_qwen35_2b_full_moge_vitb_vjepa_large.sh}"
+# Training semantics must be selected explicitly in the reviewed RUN_ENV_FILE.
+# A generic fallback previously made it possible to bypass the bounded clean
+# pilot launcher (and its no-resume/RTC/split guards) by omitting one variable.
+TRAIN_LAUNCHER="${TRAIN_LAUNCHER:-}"
 NUM_PROCESSES="${NUM_PROCESSES:-8}"
 MAIN_PROCESS_PORT="${MAIN_PROCESS_PORT:-29573}"
 STARVLA_USE_DEEPSPEED="${STARVLA_USE_DEEPSPEED:-0}"
@@ -212,6 +215,7 @@ prepare_reproducibility_metadata() {
 
 case "${REQUESTED_MODE}" in
   train)
+    require_value TRAIN_LAUNCHER
     if [[ -d "${RUN_DIR}" && -z "${RESUME_CHECKPOINT}" ]]; then
       existing_run_entry="$(find "${RUN_DIR}" -mindepth 1 -maxdepth 1 -print -quit)"
       if [[ -n "${existing_run_entry}" ]]; then

@@ -22,6 +22,7 @@ def make_LeRobotSingleDataset(
     lerobot_version: str | None = None,
     video_backend: str = "decord",
     video_backend_kwargs: dict | None = None,
+    episode_split_role: str | None = None,
 ) -> LeRobotSingleDataset:
     """
     Make a LeRobotSingleDataset object.
@@ -56,6 +57,7 @@ def make_LeRobotSingleDataset(
         delete_pause_frame=delete_pause_frame,
         data_cfg=data_cfg,
         lerobot_version=lerobot_version,
+        episode_split_role=episode_split_role,
     )
 
 def get_vla_dataset(
@@ -75,6 +77,12 @@ def get_vla_dataset(
     """
     data_root_dir = data_cfg.data_root_dir
     data_mix = data_cfg.data_mix
+    if data_cfg.get("episode_split_manifest", None) and balance_dataset_weights:
+        raise ValueError(
+            "balance_dataset_weights=true is incompatible with immutable episode "
+            "splits because train and holdout views would merge the same train-only "
+            "statistics using different role-dependent dataset weights"
+        )
     delete_pause_frame = bool(data_cfg.get("delete_pause_frame", delete_pause_frame))
     video_backend_num_threads = max(1, int(data_cfg.get("video_backend_num_threads", 1)))
     video_backend = str(data_cfg.get("video_backend", "decord"))
@@ -104,7 +112,8 @@ def get_vla_dataset(
                                                           data_cfg=data_cfg,
                                                           lerobot_version=d_version,
                                                           video_backend=video_backend,
-                                                          video_backend_kwargs=video_backend_kwargs), d_weight))
+                                                          video_backend_kwargs=video_backend_kwargs,
+                                                          episode_split_role=mode), d_weight))
 
     return LeRobotMixtureDataset(
         dataset_mixture,

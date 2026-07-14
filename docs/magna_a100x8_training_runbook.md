@@ -520,7 +520,13 @@ ssh "$HOST" '
     printf "runtime_source_status_lines=%s\n" "$(git status --porcelain | wc -l)"
     sha256sum \
       scripts/config/vlajepa_robot_ft_lerobot_magna_interventions_a100x8_qwen35_2b_full_moge_vitb_vjepa_large.yaml \
+      scripts/vlajepa_robot_ft_lerobot_magna_clean_rtc0_pilot_a100x8.sh \
       scripts/vlajepa_robot_ft_lerobot_magna_interventions_a100x8_qwen35_2b_full_moge_vitb_vjepa_large.sh \
+      deployment/realman/eval_manifests/magna_internal_holdout_global_batch96_v1.json \
+      deployment/realman/eval_manifests/artifacts/magna_internal_holdout_global_batch96_v1_train_stats.json \
+      starVLA/dataloader/gr00t_lerobot/episode_split.py \
+      starVLA/dataloader/heldout_eval.py \
+      starVLA/training/train_starvla.py \
       scripts/run_cloud_training_service.sh \
       scripts/docker_run_training.sh \
       scripts/watch_and_upload_checkpoints_gcs.sh
@@ -763,7 +769,9 @@ variable names:
 ssh "$HOST" '
   set -e
   REPO=/mnt/vla-jepa/src/VLA-JEPA
-  RUN_ID=magna_interventions_a100x8_qwen35_2b_full_18d_$(date -u +%Y%m%d_%H%M%S)
+  # The next authorized run is the bounded corrected-data learning gate. Do
+  # not substitute the generic full-run launcher until this pilot passes.
+  RUN_ID=magna_clean_v3_rtc0_pilot_a100x8_$(date -u +%Y%m%d_%H%M%S)
   SOURCE_COMMIT=$(git -C "${REPO}" rev-parse HEAD)
   RUN_SOURCE=/mnt/vla-jepa/src/run_worktrees/${RUN_ID}
   RUN_ENV=/mnt/vla-jepa/logs/${RUN_ID}.launch.env
@@ -789,7 +797,7 @@ VLA_JEPA_SCRATCH=/mnt/vla-jepa
 DATA_ROOT_DIR=/mnt/vla-jepa/datasets/magna_training_data_with_interventions
 CHECKPOINT_ROOT=/mnt/vla-jepa/checkpoints
 LOG_ROOT=/mnt/vla-jepa/logs
-TRAIN_LAUNCHER=./scripts/vlajepa_robot_ft_lerobot_magna_interventions_a100x8_qwen35_2b_full_moge_vitb_vjepa_large.sh
+TRAIN_LAUNCHER=./scripts/vlajepa_robot_ft_lerobot_magna_clean_rtc0_pilot_a100x8.sh
 NUM_PROCESSES=8
 MAIN_PROCESS_PORT=${MAIN_PROCESS_PORT}
 STARVLA_USE_DEEPSPEED=0
@@ -812,7 +820,14 @@ EOF
     printf "runtime_source_status_lines=0\n"
     printf "launch_env_sha256=%s\n" "$(sha256sum "${RUN_ENV}" | awk "{print \$1}")"
     printf "dataset_manifest_sha256=%s\n" "$(sha256sum /mnt/vla-jepa/logs/magna_training_data.sha256 | awk "{print \$1}")"
-    sha256sum scripts/config/vlajepa_robot_ft_lerobot_magna_interventions_a100x8_qwen35_2b_full_moge_vitb_vjepa_large.yaml
+    sha256sum \
+      scripts/config/vlajepa_robot_ft_lerobot_magna_interventions_a100x8_qwen35_2b_full_moge_vitb_vjepa_large.yaml \
+      scripts/vlajepa_robot_ft_lerobot_magna_clean_rtc0_pilot_a100x8.sh \
+      deployment/realman/eval_manifests/magna_internal_holdout_global_batch96_v1.json \
+      deployment/realman/eval_manifests/artifacts/magna_internal_holdout_global_batch96_v1_train_stats.json \
+      starVLA/dataloader/gr00t_lerobot/episode_split.py \
+      starVLA/dataloader/heldout_eval.py \
+      starVLA/training/train_starvla.py
     cat /mnt/vla-jepa/logs/magna_image_identity.txt
     printf "vjepa2_commit=%s\n" "$(git -C /mnt/vla-jepa/src/vjepa2 rev-parse HEAD)"
     printf "moge_commit=%s\n" "$(git -C /mnt/vla-jepa/src/MoGe rev-parse HEAD)"
@@ -823,6 +838,15 @@ EOF
   cat "${PREFLIGHT}"
 '
 ```
+
+For this clean pilot, `RESUME_CHECKPOINT`, `ACCELERATE_BIN`,
+`STARVLA_CLEAN_PILOT_TEST_DRY_RUN`, and
+`STARVLA_HOLDOUT_PREFLIGHT_DRY_RUN` must all be absent. The pilot launcher
+pins RTC off, forbids a RealMan/VLA checkpoint load, evaluates the immutable
+holdout at step 0 and step 2,500, writes one recoverable `steps_2500`
+checkpoint, and skips the redundant final-model copy. Only after reviewing
+the step-0-to-step-2,500 heldout improvement should a separate full-run handoff
+select the generic interventions launcher and a new run ID.
 
 Add the exact final smoke run ID, exit code, throughput, peak memory, and tested
 backup destination to the preflight manifest before approval. The source config
@@ -848,23 +872,24 @@ ssh "$HOST" '
   test -x "${RUN_SOURCE}/scripts/run_cloud_training_service.sh"
   test "$(git -C "${RUN_SOURCE}" rev-parse HEAD)" = "${EXPECTED_SOURCE_COMMIT}"
   test -z "$(git -C "${RUN_SOURCE}" status --porcelain)"
-  for session in magna_train magna_tensorboard magna_uploader; do
+  SESSION_PREFIX="${RUN_ID}"
+  for session in "${SESSION_PREFIX}_train" "${SESSION_PREFIX}_tensorboard" "${SESSION_PREFIX}_uploader"; do
     if tmux has-session -t "${session}" 2>/dev/null; then
       echo "Refusing to replace active tmux session: ${session}" >&2
       exit 1
     fi
   done
 
-  tmux new-session -d -s magna_uploader \
+  tmux new-session -d -s "${SESSION_PREFIX}_uploader" \
     "RUN_ENV_FILE=${RUN_ENV} exec ${RUN_SOURCE}/scripts/run_cloud_training_service.sh uploader"
-  tmux new-session -d -s magna_tensorboard \
+  tmux new-session -d -s "${SESSION_PREFIX}_tensorboard" \
     "RUN_ENV_FILE=${RUN_ENV} exec ${RUN_SOURCE}/scripts/run_cloud_training_service.sh tensorboard"
-  tmux new-session -d -s magna_train \
+  tmux new-session -d -s "${SESSION_PREFIX}_train" \
     "RUN_ENV_FILE=${RUN_ENV} exec ${RUN_SOURCE}/scripts/run_cloud_training_service.sh train"
 
   sleep 5
   tmux list-sessions
-  for session in magna_train magna_tensorboard magna_uploader; do
+  for session in "${SESSION_PREFIX}_train" "${SESSION_PREFIX}_tensorboard" "${SESSION_PREFIX}_uploader"; do
     tmux list-panes -t "${session}" -F "${session}|#{pane_start_command}"
   done
   docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Image}}"

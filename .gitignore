@@ -44,5 +44,12 @@ MUJOCO_LOG.TXT
 tmp_bench/
 artifacts/
 
+# This split-bound, train-only statistics table is a versioned runtime input,
+# not a generated checkpoint artifact. Keep every other file under the local
+# eval artifacts directory ignored unless it is explicitly reviewed here.
+!deployment/realman/eval_manifests/artifacts/
+deployment/realman/eval_manifests/artifacts/*
+!deployment/realman/eval_manifests/artifacts/magna_internal_holdout_global_batch96_v1_train_stats.json
+
 # Local datasets
 playground/Datasets/

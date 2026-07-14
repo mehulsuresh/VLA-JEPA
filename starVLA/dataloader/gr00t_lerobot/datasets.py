@@ -66,6 +66,10 @@ from starVLA.dataloader.prompt_labels import (
     append_resolved_label_to_language,
     append_task_id_label_to_language,
 )
+from starVLA.dataloader.gr00t_lerobot.episode_split import (
+    build_episode_catalog_binding,
+    load_episode_split_selection,
+)
 
 from functools import partial
 from typing import Tuple, List
@@ -83,7 +87,10 @@ LE_ROBOT3_TASKS_FILENAME = "meta/tasks.parquet"
 LE_ROBOT3_SUBTASKS_FILENAME = "meta/subtasks.parquet"
 LE_ROBOT3_EPISODE_FILENAME = "meta/episodes/*/*.parquet"
 EPSILON = 5e-4
-GPU_DECODE_FRAME_INDEX_CACHE_DIRNAME = "gpu_decode_frame_indices_v1"
+# v2 binds cached indices to the per-camera LeRobot v3 video shard and its
+# episode-local timestamp offset. v1 caches were built through get_video_path()
+# when that method incorrectly used the parquet shard for every camera.
+GPU_DECODE_FRAME_INDEX_CACHE_DIRNAME = "gpu_decode_frame_indices_v2"
 
 
 def get_gpu_decode_frame_index_cache_path(dataset_path: Path, trajectory_id: int) -> Path:
@@ -137,6 +144,10 @@ def calculate_dataset_statistics(parquet_paths: list[Path]) -> dict:
             [np.asarray(x, dtype=np.float32) for x in all_low_dim_data[le_modality]]
         )
         dataset_statistics[le_modality] = {
+            # Keep the row count with the generated statistics.  LeRobot v3's
+            # meta/info.json exposes total_frames, so this is the minimum
+            # provenance needed to reject a table copied from an older dataset.
+            "count": [int(np_data.shape[0])],
             "mean": np.mean(np_data, axis=0).tolist(),
             "std": np.std(np_data, axis=0).tolist(),
             "min": np.min(np_data, axis=0).tolist(),
@@ -171,6 +182,7 @@ class LeRobotSingleDataset(Dataset):
         delete_pause_frame: bool = False,
         data_cfg=None,
         lerobot_version: str | None = None,
+        episode_split_role: str | None = None,
     ):
         """
         Initialize the dataset.
@@ -215,6 +227,32 @@ class LeRobotSingleDataset(Dataset):
         else:
             self.tag = embodiment_tag
 
+        # Read the complete episode catalog before loading normalization
+        # statistics.  When an immutable split is configured, this lets us
+        # verify the manifest and select its train-only statistics artifact
+        # before any transform metadata is constructed.
+        self.trajectory_ids_to_metadata = {}
+        self._v3_data_file_start_indices = {}
+        self._v3_parquet_shard_cache = OrderedDict()
+        self.curr_traj_data = None
+        self.curr_traj_id = None
+        full_trajectory_ids, full_trajectory_lengths = self._get_trajectories()
+        self._full_trajectory_ids = np.asarray(full_trajectory_ids, dtype=np.int64)
+        self._full_trajectory_lengths = np.asarray(
+            full_trajectory_lengths, dtype=np.int64
+        )
+        self._episode_catalog_binding = build_episode_catalog_binding(
+            dataset_path=self.dataset_path,
+            dataset_name=self.dataset_name,
+            lerobot_version=self._lerobot_version,
+            trajectory_ids=self._full_trajectory_ids,
+            trajectory_lengths=self._full_trajectory_lengths,
+        )
+        self._episode_split_selection = self._resolve_episode_split_selection(
+            episode_split_role=episode_split_role,
+        )
+        self._apply_episode_split_to_catalog()
+
         self._metadata = self._get_metadata(EmbodimentTag(self.tag))
 
         # LeRobot-specific config
@@ -225,13 +263,6 @@ class LeRobotSingleDataset(Dataset):
         self._chunk_size = self._get_chunk_size()
         self._tasks = self._get_tasks()
         self._subtask_labels = self._get_subtask_labels()
-        self.trajectory_ids_to_metadata = {}
-        self._v3_data_file_start_indices = {}
-        self._v3_parquet_shard_cache = OrderedDict()
-        self.curr_traj_data = None
-        self.curr_traj_id = None
-
-        self._trajectory_ids, self._trajectory_lengths = self._get_trajectories()
         self._modality_keys = self._get_modality_keys()
         self._delta_indices = self._get_delta_indices()
         self._all_steps = self._get_all_steps()
@@ -375,6 +406,8 @@ class LeRobotSingleDataset(Dataset):
         ), f"Please provide a {LE_ROBOT_INFO_FILENAME} file in {self.dataset_path}"
         with open(le_info_path, "r") as f:
             le_info = json.load(f)
+        if self._lerobot_version == "v3.0":
+            self._validate_lerobot_v3_frame_catalog(le_info)
         simplified_modality_meta["video"] = {}
         for new_key in le_modality_meta.video:
             original_key = le_modality_meta.video[new_key].original_key
@@ -397,37 +430,11 @@ class LeRobotSingleDataset(Dataset):
                 "fps": fps,
             }
 
-        # 2. Dataset statistics
-        stats_path = self.dataset_path / LE_ROBOT_STATS_FILENAME
-        try:
-            with open(stats_path, "r") as f:
-                le_statistics = json.load(f)
-            for stat in le_statistics.values():
-                DatasetStatisticalValues.model_validate(stat)
-        except (FileNotFoundError, ValidationError) as e:
-            print(f"Failed to load dataset statistics: {e}")
-            print(f"Calculating dataset statistics for {self.dataset_name}")
-            # Get all parquet files in the dataset paths
-            parquet_files = list((self.dataset_path).glob(LE_ROBOT_DATA_FILENAME))
-            le_statistics = calculate_dataset_statistics(parquet_files)
-            with open(stats_path, "w") as f:
-                json.dump(le_statistics, f, indent=4)
-
-        missing_stat_keys = self._missing_lerobot_stat_keys(le_modality_meta, le_statistics)
-        if missing_stat_keys:
-            raw_stats_path = self.dataset_path / LE_ROBOT_RAW_STATS_FILENAME
-            if raw_stats_path.exists() and raw_stats_path != stats_path:
-                with open(raw_stats_path, "r") as f:
-                    raw_statistics = json.load(f)
-                raw_missing = self._missing_lerobot_stat_keys(le_modality_meta, raw_statistics)
-                if not raw_missing:
-                    le_statistics = raw_statistics
-                    missing_stat_keys = []
-        if missing_stat_keys:
-            raise KeyError(
-                f"Dataset statistics missing required columns {missing_stat_keys} for "
-                f"{self.dataset_name}. Checked {stats_path} and {self.dataset_path / LE_ROBOT_RAW_STATS_FILENAME}."
-            )
+        # 2. Dataset statistics.  For v3, only accept a table whose selected
+        # state/action columns prove that they cover info.json.total_frames.
+        # This prevents a hard-linked stats_gr00t.json from an older dataset
+        # from silently winning merely because it has the expected keys.
+        le_statistics = self._load_lerobot_statistics(le_modality_meta, le_info)
 
         dataset_statistics = {}
         for our_modality in ["state", "action"]:
@@ -476,11 +483,17 @@ class LeRobotSingleDataset(Dataset):
             self.trajectory_ids_to_metadata = {}
             for file_path in file_paths:
                 episodes_data = pd.read_parquet(file_path)
-                timestamp_cols = [
-                    c
-                    for c in episodes_data.columns
-                    if str(c).startswith("videos/") and str(c).endswith("/from_timestamp")
-                ]
+                video_metadata_columns: dict[str, dict[str, str]] = defaultdict(dict)
+                for column in episodes_data.columns:
+                    column_name = str(column)
+                    if not column_name.startswith("videos/"):
+                        continue
+                    remainder = column_name[len("videos/") :]
+                    if "/" not in remainder:
+                        continue
+                    video_key, field = remainder.rsplit("/", 1)
+                    if field in {"chunk_index", "file_index", "from_timestamp", "to_timestamp"}:
+                        video_metadata_columns[video_key][field] = column_name
                 for file_row_index, (_, episode) in enumerate(episodes_data.iterrows()):
                     trajectory_id = int(episode["episode_index"])
                     data_chunk_index = int(episode["data/chunk_index"])
@@ -504,13 +517,23 @@ class LeRobotSingleDataset(Dataset):
                         dataset_from_index = None
                         dataset_to_index = None
 
-                    from_timestamps = {}
-                    for col in timestamp_cols:
-                        value = episode[col]
-                        if pd.isna(value):
-                            continue
-                        video_key = str(col)[len("videos/") : -len("/from_timestamp")]
-                        from_timestamps[video_key] = float(value)
+                    videos: dict[str, dict[str, int | float]] = {}
+                    from_timestamps: dict[str, float] = {}
+                    for video_key, columns in video_metadata_columns.items():
+                        values: dict[str, int | float] = {}
+                        for field, column in columns.items():
+                            value = episode[column]
+                            if pd.isna(value):
+                                continue
+                            values[field] = (
+                                int(value)
+                                if field in {"chunk_index", "file_index"}
+                                else float(value)
+                            )
+                        if values:
+                            videos[video_key] = values
+                        if "from_timestamp" in values:
+                            from_timestamps[video_key] = float(values["from_timestamp"])
 
                     self.trajectory_ids_to_metadata[trajectory_id] = {
                         "data/chunk_index": data_chunk_index,
@@ -518,6 +541,9 @@ class LeRobotSingleDataset(Dataset):
                         "data/file_from_index": int(file_row_index),
                         "dataset_from_index": dataset_from_index,
                         "dataset_to_index": dataset_to_index,
+                        "videos": videos,
+                        # Retain this compatibility view for the cache builder and
+                        # older callers while ``videos`` remains authoritative.
                         "videos/from_timestamps": from_timestamps,
                     }
             return np.array(trajectory_ids), np.array(trajectory_lengths)
@@ -953,6 +979,93 @@ class LeRobotSingleDataset(Dataset):
             return getter(key, default)
         return getattr(self.data_cfg, key, default)
 
+    def _resolve_episode_split_selection(self, *, episode_split_role: str | None):
+        """Load the configured immutable split before statistics/steps exist."""
+
+        manifest = self._get_data_cfg_value("episode_split_manifest", None)
+        configured_role = self._get_data_cfg_value("episode_split_role", None)
+        if configured_role is not None:
+            configured_role = str(configured_role).strip().lower()
+            if not configured_role:
+                raise ValueError("episode_split_role cannot be empty")
+        caller_role = (
+            str(episode_split_role).strip().lower()
+            if episode_split_role is not None
+            else None
+        )
+        if configured_role is not None and caller_role is not None and configured_role != caller_role:
+            raise ValueError(
+                "Configured episode_split_role conflicts with the dataset mode: "
+                f"{configured_role!r} != {caller_role!r}. Remove the override or "
+                "construct an explicit matching role; refusing a silent split change."
+            )
+        requested_role = caller_role or configured_role or "train"
+
+        if manifest is None or not str(manifest).strip():
+            if configured_role is not None:
+                raise ValueError(
+                    "datasets.vla_data.episode_split_role was set without an "
+                    "episode_split_manifest"
+                )
+            if str(self._get_data_cfg_value("lerobot_statistics_source", "auto")).lower() == "split_train":
+                raise ValueError(
+                    "lerobot_statistics_source=split_train requires an "
+                    "episode_split_manifest"
+                )
+            return None
+
+        if bool(self._get_data_cfg_value("load_all_data_for_training", False)):
+            raise ValueError(
+                "episode_split_manifest conflicts with "
+                "load_all_data_for_training=true; refusing to leak holdout "
+                "episodes into training"
+            )
+        statistics_source = str(
+            self._get_data_cfg_value("lerobot_statistics_source", "")
+        ).strip().lower()
+        if statistics_source != "split_train":
+            raise ValueError(
+                "An episode_split_manifest requires "
+                "lerobot_statistics_source=split_train so neither full-dataset "
+                "nor holdout-derived normalization can be loaded"
+            )
+
+        return load_episode_split_selection(
+            manifest_path=manifest,
+            dataset_name=self.dataset_name,
+            role=requested_role,
+            catalog_binding=self._episode_catalog_binding,
+            trajectory_ids=self._full_trajectory_ids,
+            trajectory_lengths=self._full_trajectory_lengths,
+        )
+
+    def _apply_episode_split_to_catalog(self) -> None:
+        """Materialize the selected episode view before step indexing/sampling."""
+
+        split_selection = getattr(self, "_episode_split_selection", None)
+        if split_selection is None:
+            self._trajectory_ids = self._full_trajectory_ids.copy()
+            self._trajectory_lengths = self._full_trajectory_lengths.copy()
+            return
+
+        selected_ids = set(split_selection.selected_episode_ids)
+        selection_mask = np.asarray(
+            [int(value) in selected_ids for value in self._full_trajectory_ids],
+            dtype=bool,
+        )
+        self._trajectory_ids = self._full_trajectory_ids[selection_mask].copy()
+        self._trajectory_lengths = self._full_trajectory_lengths[selection_mask].copy()
+        if set(map(int, self._trajectory_ids.tolist())) != selected_ids:
+            raise RuntimeError(
+                "Validated episode split did not materialize exactly the selected IDs"
+            )
+        if self._lerobot_version == "v3.0":
+            self.trajectory_ids_to_metadata = {
+                int(trajectory_id): metadata
+                for trajectory_id, metadata in self.trajectory_ids_to_metadata.items()
+                if int(trajectory_id) in selected_ids
+            }
+
     def _apply_modality_metadata_overrides(self, modality_meta: dict) -> dict:
         """Allow run configs to remap logical state/action keys to preserved dataset columns."""
         overrides = self._get_data_cfg_value("modality_metadata_overrides", None)
@@ -994,6 +1107,412 @@ class LeRobotSingleDataset(Dataset):
                 if le_key is not None and le_key not in le_statistics:
                     missing_keys.append(le_key)
         return sorted(set(missing_keys))
+
+    @staticmethod
+    def _lerobot_stat_count(stat: dict) -> int | None:
+        """Return a scalar, non-negative statistics row count when present."""
+
+        if not isinstance(stat, dict) or "count" not in stat:
+            return None
+        try:
+            values = np.asarray(stat["count"]).reshape(-1)
+            if values.size != 1:
+                return None
+            value = float(values[0])
+            if not np.isfinite(value) or value < 0 or not value.is_integer():
+                return None
+            return int(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    def _validate_lerobot_statistics(
+        self,
+        le_modality_meta: LeRobotModalityMetadata,
+        statistics: dict,
+        *,
+        total_frames: int | None,
+        require_frame_count: bool,
+    ) -> list[str]:
+        """Return reasons a candidate statistics payload is unsafe to use."""
+
+        if not isinstance(statistics, dict):
+            return ["top-level payload is not an object"]
+
+        missing_stat_keys = self._missing_lerobot_stat_keys(
+            le_modality_meta,
+            statistics,
+        )
+        if missing_stat_keys:
+            return [f"missing required columns {missing_stat_keys}"]
+
+        required_widths: dict[str, int] = {}
+        for modality in ("state", "action"):
+            for state_action_meta in getattr(le_modality_meta, modality).values():
+                key = state_action_meta.original_key
+                if key is not None:
+                    required_widths[key] = max(
+                        required_widths.get(key, 0),
+                        int(state_action_meta.end),
+                    )
+        errors: list[str] = []
+        for key, required_width in sorted(required_widths.items()):
+            stat = statistics[key]
+            try:
+                DatasetStatisticalValues.model_validate(stat)
+            except ValidationError as exc:
+                errors.append(f"column {key!r} has invalid statistics: {exc}")
+                continue
+
+            arrays: dict[str, np.ndarray] = {}
+            for stat_name in ("min", "max", "mean", "std", "q01", "q99"):
+                try:
+                    value = np.asarray(stat[stat_name], dtype=np.float64)
+                except (TypeError, ValueError, OverflowError) as exc:
+                    errors.append(
+                        f"column {key!r} {stat_name} is not numeric: {exc}"
+                    )
+                    continue
+                if value.ndim != 1 or value.size < required_width:
+                    errors.append(
+                        f"column {key!r} {stat_name} shape is {value.shape}; "
+                        f"required width is at least {required_width}"
+                    )
+                    continue
+                selected = value[:required_width]
+                if not np.all(np.isfinite(selected)):
+                    errors.append(
+                        f"column {key!r} {stat_name} contains NaN/Inf in used dimensions"
+                    )
+                    continue
+                arrays[stat_name] = selected
+
+            if {"min", "max"} <= arrays.keys() and np.any(
+                arrays["min"] > arrays["max"]
+            ):
+                errors.append(f"column {key!r} has min greater than max")
+            if "std" in arrays and np.any(arrays["std"] < 0):
+                errors.append(f"column {key!r} has negative std")
+            if {"q01", "q99"} <= arrays.keys() and np.any(
+                arrays["q01"] > arrays["q99"]
+            ):
+                errors.append(f"column {key!r} has q01 greater than q99")
+
+            count = self._lerobot_stat_count(stat)
+            if total_frames is not None:
+                if count is None and require_frame_count:
+                    errors.append(
+                        f"column {key!r} has no scalar count; expected {total_frames}"
+                    )
+                elif count is not None and count != total_frames:
+                    errors.append(
+                        f"column {key!r} count is {count}; expected {total_frames}"
+                    )
+        return errors
+
+    def _statistics_require_quantiles(self) -> bool:
+        """Whether any configured state/action transform consumes q01/q99."""
+
+        for transform in getattr(getattr(self, "transforms", None), "transforms", []):
+            modes = getattr(transform, "normalization_modes", {})
+            if any(str(mode) == "q99" for mode in modes.values()):
+                return True
+        return False
+
+    def _complete_unused_lerobot_quantiles(
+        self,
+        le_modality_meta: LeRobotModalityMetadata,
+        statistics: dict,
+    ) -> tuple[dict, bool]:
+        """Fill schema-only quantiles from extrema when transforms do not use them.
+
+        Historical official stats.json files can contain count/min/max/mean/std
+        but no q01/q99. DatasetMetadata still requires all six fields. For a
+        min-max or mean-std pipeline, copying min/max into the unused quantile
+        slots is deterministic and safer than borrowing uncounted values from
+        another file. A q99 pipeline must provide real counted quantiles.
+        """
+
+        if self._statistics_require_quantiles():
+            return statistics, False
+        required_keys = {
+            state_action_meta.original_key
+            for modality in ("state", "action")
+            for state_action_meta in getattr(le_modality_meta, modality).values()
+            if state_action_meta.original_key is not None
+        }
+        completed = copy.deepcopy(statistics)
+        synthesized = False
+        for key in required_keys:
+            stat = completed.get(key)
+            if not isinstance(stat, dict):
+                continue
+            if "q01" not in stat and "min" in stat:
+                stat["q01"] = copy.deepcopy(stat["min"])
+                synthesized = True
+            if "q99" not in stat and "max" in stat:
+                stat["q99"] = copy.deepcopy(stat["max"])
+                synthesized = True
+        return completed, synthesized
+
+    def _validate_lerobot_v3_frame_catalog(self, le_info: dict) -> None:
+        """Cross-check v3 frame counts using independent metadata sources."""
+
+        raw_total_frames = le_info.get("total_frames")
+        if isinstance(raw_total_frames, bool):
+            raise ValueError("LeRobot v3 info.json total_frames must be a positive integer")
+        try:
+            total_frames = int(raw_total_frames)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                "LeRobot v3 info.json must contain a positive integer total_frames"
+            ) from exc
+        if total_frames <= 0:
+            raise ValueError(
+                f"LeRobot v3 info.json total_frames is invalid: {raw_total_frames!r}"
+            )
+        if isinstance(raw_total_frames, float) and not raw_total_frames.is_integer():
+            raise ValueError(
+                f"LeRobot v3 info.json total_frames is non-integral: {raw_total_frames!r}"
+            )
+
+        episode_paths = sorted(self.dataset_path.glob(LE_ROBOT3_EPISODE_FILENAME))
+        data_paths = sorted(self.dataset_path.glob(LE_ROBOT_DATA_FILENAME))
+        if not episode_paths or not data_paths:
+            raise ValueError(
+                "LeRobot v3 frame-catalog validation requires episode metadata and data parquet files"
+            )
+
+        episode_length_sum = 0
+        episode_manifest = []
+        for path in episode_paths:
+            table = pq.read_table(path, columns=["length"])
+            lengths = np.asarray(table.column("length").to_numpy(), dtype=np.int64)
+            if lengths.size == 0 or np.any(lengths <= 0):
+                raise ValueError(f"Invalid episode lengths in {path}")
+            episode_length_sum += int(lengths.sum(dtype=np.int64))
+            episode_manifest.append(
+                (
+                    str(path.relative_to(self.dataset_path)),
+                    int(path.stat().st_size),
+                    hashlib.sha256(path.read_bytes()).hexdigest(),
+                )
+            )
+
+        parquet_row_sum = 0
+        data_manifest = []
+        for path in data_paths:
+            row_count = int(pq.ParquetFile(path).metadata.num_rows)
+            if row_count <= 0:
+                raise ValueError(f"Data parquet has no rows: {path}")
+            parquet_row_sum += row_count
+            data_manifest.append(
+                (
+                    str(path.relative_to(self.dataset_path)),
+                    int(path.stat().st_size),
+                    row_count,
+                )
+            )
+
+        if episode_length_sum != total_frames or parquet_row_sum != total_frames:
+            raise ValueError(
+                "LeRobot v3 frame catalog is inconsistent: "
+                f"info.total_frames={total_frames}, episode length sum={episode_length_sum}, "
+                f"parquet row sum={parquet_row_sum}"
+            )
+        fingerprint_payload = {
+            "total_frames": total_frames,
+            "episode_files": episode_manifest,
+            "data_files": data_manifest,
+        }
+        self._dataset_catalog_fingerprint = hashlib.sha256(
+            json.dumps(
+                fingerprint_payload,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        self._dataset_catalog_counts = {
+            "info_total_frames": total_frames,
+            "episode_length_sum": episode_length_sum,
+            "parquet_row_sum": parquet_row_sum,
+        }
+
+    def _load_lerobot_statistics(
+        self,
+        le_modality_meta: LeRobotModalityMetadata,
+        le_info: dict,
+    ) -> dict:
+        """Select a current statistics table, rejecting stale v3 candidates.
+
+        ``meta/stats.json`` is LeRobot's canonical table and normally includes
+        a per-column count.  ``meta/stats_gr00t.json`` remains a compatibility
+        fallback, but v3 tables without a matching count are intentionally not
+        trusted.  Set ``lerobot_statistics_source`` to ``raw`` or ``gr00t`` to
+        require one source explicitly; neither option bypasses validation.
+        """
+
+        split_selection = getattr(self, "_episode_split_selection", None)
+        if split_selection is not None:
+            source = str(
+                self._get_data_cfg_value("lerobot_statistics_source", "")
+            ).strip().lower()
+            if source != "split_train":
+                raise ValueError(
+                    "Immutable episode splits require "
+                    "lerobot_statistics_source=split_train"
+                )
+            path = split_selection.train_statistics_path
+            actual_sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
+            if actual_sha256 != split_selection.train_statistics_sha256:
+                raise ValueError(
+                    "Bound train-only statistics changed after split validation: "
+                    f"{path}"
+                )
+            try:
+                with open(path, "r", encoding="utf-8") as handle:
+                    statistics = json.load(handle)
+            except (OSError, json.JSONDecodeError) as exc:
+                raise ValueError(
+                    f"Could not load bound train-only statistics {path}: {exc}"
+                ) from exc
+            statistics, quantiles_synthesized = self._complete_unused_lerobot_quantiles(
+                le_modality_meta,
+                statistics,
+            )
+            expected_train_frames = int(split_selection.train_frame_count)
+            errors = self._validate_lerobot_statistics(
+                le_modality_meta,
+                statistics,
+                total_frames=expected_train_frames,
+                require_frame_count=True,
+            )
+            if errors:
+                raise ValueError(
+                    "Bound train-only normalization statistics failed validation: "
+                    + "; ".join(errors)
+                )
+            self._statistics_source_path = path
+            self._statistics_total_frames = expected_train_frames
+            self._statistics_source_sha256 = actual_sha256
+            self._statistics_effective_sha256 = hashlib.sha256(
+                json.dumps(
+                    statistics,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                ).encode("utf-8")
+            ).hexdigest()
+            self._statistics_quantiles_synthesized = quantiles_synthesized
+            self._statistics_scope = "train_split_only"
+            print(
+                "Using manifest-bound train-only LeRobot statistics "
+                f"from {path} (train_frames={expected_train_frames}, "
+                f"active_role={split_selection.role}, "
+                f"quantiles_synthesized={quantiles_synthesized})"
+            )
+            return statistics
+
+        source = str(
+            self._get_data_cfg_value("lerobot_statistics_source", "auto")
+        ).strip().lower()
+        if source not in {"auto", "raw", "gr00t"}:
+            raise ValueError(
+                "datasets.vla_data.lerobot_statistics_source must be one of "
+                f"auto, raw, or gr00t; got {source!r}"
+            )
+
+        total_frames_value = le_info.get("total_frames")
+        try:
+            total_frames = (
+                int(total_frames_value) if total_frames_value is not None else None
+            )
+        except (TypeError, ValueError, OverflowError):
+            total_frames = None
+        configured_require_count = self._get_data_cfg_value(
+            "require_statistics_frame_count",
+            None,
+        )
+        if self._lerobot_version == "v3.0" and configured_require_count is False:
+            raise ValueError(
+                "LeRobot v3 cannot disable statistics frame-count validation"
+            )
+        require_frame_count = self._lerobot_version == "v3.0" or bool(
+            configured_require_count
+        )
+        if require_frame_count and (total_frames is None or total_frames <= 0):
+            raise ValueError(
+                "Cannot validate LeRobot statistics because info.json total_frames "
+                f"is missing or invalid: {total_frames_value!r}"
+            )
+        raw_path = self.dataset_path / LE_ROBOT_RAW_STATS_FILENAME
+        gr00t_path = self.dataset_path / LE_ROBOT_STATS_FILENAME
+        candidate_paths = {
+            "raw": raw_path,
+            "gr00t": gr00t_path,
+        }
+        if source == "auto":
+            candidate_names = (
+                ["raw", "gr00t"]
+                if self._lerobot_version == "v3.0"
+                else ["gr00t", "raw"]
+            )
+        else:
+            candidate_names = [source]
+        rejection_reasons: list[str] = []
+
+        for candidate_name in candidate_names:
+            path = candidate_paths[candidate_name]
+            if not path.exists():
+                rejection_reasons.append(f"{path}: file does not exist")
+                continue
+            try:
+                with open(path, "r") as handle:
+                    statistics = json.load(handle)
+            except (OSError, json.JSONDecodeError) as exc:
+                rejection_reasons.append(f"{path}: could not load JSON: {exc}")
+                continue
+
+            statistics, quantiles_synthesized = self._complete_unused_lerobot_quantiles(
+                le_modality_meta,
+                statistics,
+            )
+            errors = self._validate_lerobot_statistics(
+                le_modality_meta,
+                statistics,
+                total_frames=total_frames,
+                require_frame_count=require_frame_count,
+            )
+            if errors:
+                rejection_reasons.append(f"{path}: " + "; ".join(errors))
+                continue
+
+            self._statistics_source_path = path
+            self._statistics_total_frames = total_frames
+            self._statistics_source_sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
+            self._statistics_effective_sha256 = hashlib.sha256(
+                json.dumps(
+                    statistics,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                ).encode("utf-8")
+            ).hexdigest()
+            self._statistics_quantiles_synthesized = quantiles_synthesized
+            self._statistics_scope = "full_dataset_catalog"
+            print(
+                "Using validated LeRobot statistics "
+                f"from {self._statistics_source_path} (total_frames={total_frames}, "
+                f"frame_count_required={require_frame_count}, "
+                f"quantiles_synthesized={quantiles_synthesized})"
+            )
+            return statistics
+
+        diagnostics = "\n  - ".join(rejection_reasons)
+        raise ValueError(
+            "No safe LeRobot statistics table is available for "
+            f"{self.dataset_name}. Refusing to train with unverifiable "
+            f"normalization.\n  - {diagnostics}"
+        )
 
     def _get_lerobot_info_meta(self) -> dict:
         """Get the metadata for the LeRobot dataset."""
@@ -1452,6 +1971,29 @@ class LeRobotSingleDataset(Dataset):
             return output, padding_positions.astype(bool, copy=False)
         return output
 
+    def _get_lerobot_v3_video_metadata(
+        self,
+        trajectory_id: int,
+        key: str,
+    ) -> tuple[str, dict[str, int | float]]:
+        original_key = self.lerobot_modality_meta.video[key].original_key
+        if original_key is None:
+            original_key = key
+        episode_meta = self.trajectory_ids_to_metadata[trajectory_id]
+        video_meta = episode_meta.get("videos", {}).get(original_key)
+        if not isinstance(video_meta, dict):
+            raise KeyError(
+                "LeRobot v3 episode metadata is missing camera binding "
+                f"videos/{original_key} for trajectory {trajectory_id}."
+            )
+        missing = {"chunk_index", "file_index", "from_timestamp"} - set(video_meta)
+        if missing:
+            raise KeyError(
+                "LeRobot v3 episode metadata has an incomplete camera binding for "
+                f"trajectory {trajectory_id}, camera {original_key!r}: missing {sorted(missing)}."
+            )
+        return original_key, video_meta
+
     def get_video_path(self, trajectory_id: int, key: str) -> Path:
         chunk_index = self.get_episode_chunk(trajectory_id)
         original_key = self.lerobot_modality_meta.video[key].original_key
@@ -1462,11 +2004,14 @@ class LeRobotSingleDataset(Dataset):
                 episode_chunk=chunk_index, episode_index=trajectory_id, video_key=original_key
             )
         elif self._lerobot_version == "v3.0":
-            episode_meta = self.trajectory_ids_to_metadata[trajectory_id]
+            original_key, video_meta = self._get_lerobot_v3_video_metadata(
+                trajectory_id,
+                key,
+            )
             video_filename = self.video_path_pattern.format(
                 video_key=original_key,
-                chunk_index=episode_meta["data/chunk_index"],
-                file_index=episode_meta["data/file_index"],
+                chunk_index=int(video_meta["chunk_index"]),
+                file_index=int(video_meta["file_index"]),
             )
         else:
             raise ValueError(f"Unsupported LeRobot version: {self._lerobot_version}")
@@ -1509,12 +2054,8 @@ class LeRobotSingleDataset(Dataset):
         # Get the corresponding video timestamps from the step indices
         video_timestamp = timestamp[step_indices]
         if self._lerobot_version == "v3.0":
-            episode_meta = self.trajectory_ids_to_metadata.get(trajectory_id, {})
-            from_timestamps = episode_meta.get("videos/from_timestamps", {})
-            original_video_key = self.lerobot_modality_meta.video[key].original_key
-            if original_video_key is None:
-                original_video_key = key
-            video_timestamp = video_timestamp + float(from_timestamps.get(original_video_key, 0.0))
+            _, video_meta = self._get_lerobot_v3_video_metadata(trajectory_id, key)
+            video_timestamp = video_timestamp + float(video_meta["from_timestamp"])
 
         return get_frames_by_timestamps(
             video_path.as_posix(),
@@ -1540,6 +2081,9 @@ class LeRobotSingleDataset(Dataset):
         assert "timestamp" in self.curr_traj_data.columns, f"No timestamp found in {trajectory_id=}"
         timestamp: np.ndarray = self.curr_traj_data["timestamp"].to_numpy()
         video_timestamp = timestamp[step_indices]
+        if self._lerobot_version == "v3.0":
+            _, video_meta = self._get_lerobot_v3_video_metadata(trajectory_id, key)
+            video_timestamp = video_timestamp + float(video_meta["from_timestamp"])
 
         return get_frames_by_timestamps(
             video_path.as_posix(),
@@ -1786,6 +2330,81 @@ class LeRobotSingleDataset(Dataset):
         print(f"Single dataset statistics saved to: {save_path}")
         print(f"Used action keys (reordered): {list(used_action_keys)}")
         print(f"Used state keys (reordered): {list(used_state_keys)}")
+
+    def dataset_provenance(self) -> dict:
+        """Return the exact input/statistics binding used by this dataset."""
+
+        info_path = self.dataset_path / LE_ROBOT_INFO_FILENAME
+        split_selection = getattr(self, "_episode_split_selection", None)
+        full_ids = np.asarray(
+            getattr(self, "_full_trajectory_ids", self.trajectory_ids),
+            dtype=np.int64,
+        )
+        full_lengths = np.asarray(
+            getattr(self, "_full_trajectory_lengths", self.trajectory_lengths),
+            dtype=np.int64,
+        )
+        return {
+            "dataset_name": self.dataset_name,
+            "dataset_path": str(self.dataset_path.resolve()),
+            "lerobot_version": self._lerobot_version,
+            "info_sha256": hashlib.sha256(info_path.read_bytes()).hexdigest(),
+            "full_catalog_episode_count": int(full_ids.size),
+            "full_catalog_frame_count": int(full_lengths.sum(dtype=np.int64)),
+            "selected_episode_count": int(len(self.trajectory_ids)),
+            "selected_frame_count": int(
+                np.asarray(self.trajectory_lengths, dtype=np.int64).sum(dtype=np.int64)
+            ),
+            # Backward-compatible alias; the explicit scope/count fields below
+            # remove the old ambiguity once a holdout split is active.
+            "total_frames": getattr(self, "_statistics_total_frames", None),
+            "statistics_frame_count": getattr(self, "_statistics_total_frames", None),
+            "statistics_scope": getattr(
+                self,
+                "_statistics_scope",
+                "unknown",
+            ),
+            "statistics_source_path": str(
+                getattr(self, "_statistics_source_path", "")
+            ),
+            "statistics_source_sha256": getattr(
+                self,
+                "_statistics_source_sha256",
+                None,
+            ),
+            "statistics_effective_sha256": getattr(
+                self,
+                "_statistics_effective_sha256",
+                None,
+            ),
+            "statistics_quantiles_synthesized": bool(
+                getattr(self, "_statistics_quantiles_synthesized", False)
+            ),
+            "frame_catalog_counts": getattr(
+                self,
+                "_dataset_catalog_counts",
+                None,
+            ),
+            "frame_catalog_fingerprint": getattr(
+                self,
+                "_dataset_catalog_fingerprint",
+                None,
+            ),
+            "episode_catalog_binding": getattr(
+                self,
+                "_episode_catalog_binding",
+                None,
+            ),
+            "episode_split": (
+                split_selection.provenance()
+                if split_selection is not None
+                else {
+                    "enabled": False,
+                    "normalization_statistics_scope": "full_dataset_catalog",
+                }
+            ),
+            "gpu_decode_frame_index_cache_version": GPU_DECODE_FRAME_INDEX_CACHE_DIRNAME,
+        }
 
 
 class CachedLeRobotSingleDataset(LeRobotSingleDataset):
@@ -2495,12 +3114,21 @@ class LeRobotMixtureDataset(Dataset):
                     continue
             if timestamp is None:
                 timestamp = dataset.curr_traj_data["timestamp"].to_numpy()
+            video_timestamps = np.asarray(timestamp[indices], dtype=np.float32)
+            if dataset._lerobot_version == "v3.0":
+                _, video_meta = dataset._get_lerobot_v3_video_metadata(
+                    trajectory_name,
+                    video_subkey,
+                )
+                video_timestamps = video_timestamps + np.float32(
+                    video_meta["from_timestamp"]
+                )
             specs.append(
                 {
                     "video_path": dataset.get_video_path(
                         trajectory_name, video_subkey
                     ).as_posix(),
-                    "timestamps": np.asarray(timestamp[indices], dtype=np.float32),
+                    "timestamps": video_timestamps,
                 }
             )
         return specs
@@ -3198,6 +3826,19 @@ class LeRobotMixtureDataset(Dataset):
         print(f"Merged dataset statistics saved to: {save_path}")
         print(f"Used action keys (reordered): {list(all_used_action_keys)}")
         print(f"Used state keys (reordered): {list(all_used_state_keys)}")
+
+    def save_dataset_provenance(self, save_path: Path | str) -> None:
+        """Persist source hashes/counts beside the merged checkpoint statistics."""
+
+        save_path = Path(save_path)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "schema_version": 1,
+            "datasets": [dataset.dataset_provenance() for dataset in self.datasets],
+        }
+        with open(save_path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, ensure_ascii=False, allow_nan=False)
+        print(f"Dataset provenance saved to: {save_path}")
 
     def _combine_modality_stats(self, modality_stats: dict) -> dict:
         """Backward compatibility wrapper."""
