@@ -168,13 +168,17 @@ export TORCHDYNAMO_DISABLE=1
 export VIDEO_BACKEND=pyav
 # Do not emit a batch-size dotlist override; the pinned config is authoritative.
 unset PER_DEVICE_BATCH_SIZE EPOCHS
-export MAX_TRAIN_STEPS=2500
+# Cross the checkpoint/evaluation boundary and require 50 subsequent optimizer
+# steps. This proves every rank, loader, optimizer, and scheduler continues
+# after both serialization and held-out inference instead of merely exiting at
+# the first checkpoint.
+export MAX_TRAIN_STEPS=2550
 export NUM_WARMUP_STEPS=300
 export SAVE_INTERVAL=2500
 # The immutable manifest now supplies a separate held-out loader. Evaluate the
 # clean initialization once (a fail-fast compatibility check and direct
-# learning baseline), then evaluate the same terminal boundary used by this
-# bounded pilot.
+# learning baseline), then evaluate the step-2500 checkpoint boundary. The
+# bounded pilot must continue through step 2550 afterward.
 export EVAL_INTERVAL=2500
 
 # The cloud service translates RESUME_CHECKPOINT into trainer dotlist options.
@@ -333,7 +337,7 @@ exec "${SCRIPT_DIR}/vlajepa_robot_ft_lerobot_magna_interventions_a100x8_qwen35_2
   --trainer.is_resume false \
   --trainer.resume_epoch null \
   --trainer.resume_step null \
-  --trainer.max_train_steps 2500 \
+  --trainer.max_train_steps 2550 \
   --trainer.save_interval 2500 \
   --trainer.checkpoint_max_to_keep 1 \
   --trainer.eval_interval 2500 \

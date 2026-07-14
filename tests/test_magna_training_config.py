@@ -163,7 +163,7 @@ def test_clean_pilot_pins_config_budget_and_clean_invariants(tmp_path):
     assert command[config_index + 1] == str(CONFIG_PATH)
 
     expected_pairs = {
-        "--trainer.max_train_steps": "2500",
+        "--trainer.max_train_steps": "2550",
         "--trainer.save_interval": "2500",
         "--trainer.checkpoint_max_to_keep": "1",
         "--trainer.eval_interval": "2500",

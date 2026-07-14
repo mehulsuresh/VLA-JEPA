@@ -220,7 +220,7 @@
       "formula": "per_device_batch_size * world_size * gradient_accumulation_steps",
       "gradient_accumulation_steps": 1,
       "launcher_path": "/home/mehul/work/vjepa/VLA-JEPA/scripts/vlajepa_robot_ft_lerobot_magna_clean_rtc0_pilot_a100x8.sh",
-      "launcher_sha256": "46296257f00d8074d327d84fd10b0d2ff67b87179446fc4b301f6877b2cf070c",
+      "launcher_sha256": "5d931d3d2938cfab2b3e91511912873146f631519b28a1c2cc1bd63eb56621dd",
       "per_device_batch_size": 12,
       "world_size": 8
     },

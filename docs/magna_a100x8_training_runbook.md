@@ -844,7 +844,8 @@ For this clean pilot, `RESUME_CHECKPOINT`, `ACCELERATE_BIN`,
 `STARVLA_HOLDOUT_PREFLIGHT_DRY_RUN` must all be absent. The pilot launcher
 pins RTC off, forbids a RealMan/VLA checkpoint load, evaluates the immutable
 holdout at step 0 and step 2,500, writes one recoverable `steps_2500`
-checkpoint, and skips the redundant final-model copy. Only after reviewing
+checkpoint, then requires all ranks to continue training through step 2,550.
+It skips the redundant final-model copy. Only after reviewing
 the step-0-to-step-2,500 heldout improvement should a separate full-run handoff
 select the generic interventions launcher and a new run ID.
 
