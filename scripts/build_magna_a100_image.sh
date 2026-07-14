@@ -37,10 +37,11 @@ env \
   INSTALL_DEEPSPEED="${INSTALL_DEEPSPEED:-0}" \
   INSTALL_MOGE="${INSTALL_MOGE:-1}" \
   INSTALL_FLASH_ATTN="${INSTALL_FLASH_ATTN:-1}" \
+  FLASH_ATTN_SPEC="${FLASH_ATTN_SPEC:-flash-attn==2.8.3.post1}" \
   FLASH_ATTN_CUDA_ARCH_LIST="${FLASH_ATTN_CUDA_ARCH_LIST:-8.0}" \
   FLASH_ATTN_MAX_JOBS="${FLASH_ATTN_MAX_JOBS:-64}" \
   FLASH_ATTN_NVCC_THREADS="${FLASH_ATTN_NVCC_THREADS:-1}" \
-  ./scripts/docker_build_training.sh 2>&1 | tee "${BUILD_LOG}"
+  ./scripts/docker_build_training.sh "$@" 2>&1 | tee "${BUILD_LOG}"
 pipeline_status=("${PIPESTATUS[@]}")
 set -e
 

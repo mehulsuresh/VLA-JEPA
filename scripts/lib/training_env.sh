@@ -2,11 +2,22 @@
 # Shared helpers for training launchers. This file is sourced by scripts/*.sh.
 
 starvla_detect_default_ifname() {
+  local detected_ifname=""
   if command -v ip >/dev/null 2>&1; then
-    ip route show default 2>/dev/null | awk 'NR==1 {print $5}'
-    return
+    detected_ifname="$(ip route show default 2>/dev/null | awk 'NR==1 {print $5}')"
+    if [[ -n "${detected_ifname}" ]]; then
+      printf '%s\n' "${detected_ifname}"
+      return
+    fi
   fi
-  for candidate in ens9 ens8 eth0 enp0s9; do
+  if [[ -r /proc/net/route ]]; then
+    detected_ifname="$(awk '$2 == "00000000" {print $1; exit}' /proc/net/route)"
+    if [[ -n "${detected_ifname}" ]]; then
+      printf '%s\n' "${detected_ifname}"
+      return
+    fi
+  fi
+  for candidate in ens9 ens8 eth0 enp0s9 enp0s12; do
     if [[ -d "/sys/class/net/${candidate}" ]]; then
       printf '%s\n' "${candidate}"
       return

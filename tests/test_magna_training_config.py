@@ -27,6 +27,7 @@ CLEAN_PILOT_PATH = (
 DOCKER_RUN_PATH = REPO_ROOT / "scripts/docker_run_training.sh"
 CLOUD_SERVICE_PATH = REPO_ROOT / "scripts/run_cloud_training_service.sh"
 IMAGE_BUILD_PATH = REPO_ROOT / "scripts/build_magna_a100_image.sh"
+TRAINING_ENV_PATH = REPO_ROOT / "scripts/lib/training_env.sh"
 
 
 def test_magna_production_config_contract():
@@ -427,7 +428,7 @@ def test_docker_launcher_forwards_generic_and_realman_data_roots():
 
 
 def test_cloud_service_runner_has_reproducible_run_guards():
-    for script_path in (CLOUD_SERVICE_PATH, IMAGE_BUILD_PATH):
+    for script_path in (CLOUD_SERVICE_PATH, IMAGE_BUILD_PATH, TRAINING_ENV_PATH):
         subprocess.run(["bash", "-n", str(script_path)], check=True)
 
     service = CLOUD_SERVICE_PATH.read_text(encoding="utf-8")
@@ -449,8 +450,14 @@ def test_cloud_service_runner_has_reproducible_run_guards():
 
     image_build = IMAGE_BUILD_PATH.read_text(encoding="utf-8")
     assert 'INSTALL_DEEPSPEED="${INSTALL_DEEPSPEED:-0}"' in image_build
+    assert 'FLASH_ATTN_SPEC="${FLASH_ATTN_SPEC:-flash-attn==2.8.3.post1}"' in image_build
     assert 'FLASH_ATTN_CUDA_ARCH_LIST="${FLASH_ATTN_CUDA_ARCH_LIST:-8.0}"' in image_build
+    assert './scripts/docker_build_training.sh "$@"' in image_build
     assert "Refusing to build the production image from a dirty worktree" in image_build
+
+    training_env = TRAINING_ENV_PATH.read_text(encoding="utf-8")
+    assert "/proc/net/route" in training_env
+    assert 'detected_ifname="$(awk' in training_env
 
 
 def test_cloud_service_runner_accepts_symlinked_run_source(tmp_path):

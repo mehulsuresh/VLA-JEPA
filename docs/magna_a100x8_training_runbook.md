@@ -6,9 +6,10 @@ Realman Magna intervention run. Do not start a production job until the exact
 config, measured smoke result, ETA, and backup plan have been reviewed with the
 user.
 
-Last full operational audit: **2026-07-12 03:20 UTC**. The immutable source,
-image, dataset, and run identities for the active job are recorded below. Live
-step and ETA values are snapshots; always refresh them before acting.
+Last full operational audit: **2026-07-14 21:07 UTC**. The immutable source,
+image, dataset, and run identities for the active pilot and prepared H100 host
+are recorded below. Live step and ETA values are snapshots; always refresh
+them before acting.
 
 ## How To Use And Improve This Runbook
 
@@ -108,51 +109,41 @@ Follow these invariants:
   hashes, launch environment, commands, log paths, run ID, current metrics,
   latest local and remote checkpoints, and remaining action.
 
-### Current Live Handoff Snapshot (2026-07-12 03:20 UTC)
+### Current Live Handoff Snapshot (2026-07-14 21:07 UTC)
 
 This snapshot records what was actually observed. It is not a substitute for
 the inspection command above. Replace the timestamp and volatile fields before
 every handoff; do not stack newer status paragraphs on top of stale ones.
 
-**Current state: production training is healthy, but durable backup is degraded
-because the mounted user gcloud credential requires reauthentication. Do not
-launch a second job or resume a checkpoint while `magna_train` or its training
-container is alive. Do not start a second uploader.**
+**Current state: the clean RTC-off A100 pilot is healthy and must not be
+interrupted. The H100 SM90 image and eight-GPU smoke gates passed, but the host
+is not production-ready until its metadata service account passes a GCS
+list/write/read/delete probe. Do not launch the full H100 run yet.**
 
 | Field | Observed value |
 | --- | --- |
-| Run ID | `magna_interventions_a100x8_qwen35_2b_full_18d_20260711_023223` |
-| Started | `2026-07-11T09:33:53Z` |
-| Runtime source at launch | `cc11e1506e46d7b05ca25bb8d1330c5a990cd89b` from the bind-mounted cloud checkout |
-| Dependency image | `sha256:633e1a2a28550726531771b0dc888a83531ec1f599ee17a678f96373b45b6ccc` |
-| Image build source | `f2aafad416bffc56132d1e806e860c19543d15e6` |
-| Source config SHA-256 | `68fb8ce40e4d0c79860694850333f082669786b0e78f93de01d12ee378a20c42` |
-| Resolved run config SHA-256 | `e3bc2dc364163c33d5330f170ac339dceeb50e93ab24eae80a651b3163609587` |
+| Pilot run ID | `magna_clean_v3_rtc0_pilot_a100x8_20260714_202446` |
+| Pilot runtime source | `/mnt/vla-jepa/src/run_worktrees/magna_clean_v3_rtc0_pilot_a100x8_20260714_202446` at `415f73289ded5746605de3d4f53bef4a4fc52c53` |
+| Pilot dependency image | `vla-jepa:py313-cu130-a100` (the previously validated SM80 image) |
+| Pilot contract | RTC fully disabled; AH50; global batch 96; 2,550 steps; heldout eval at steps 0 and 2,500; checkpoint at 2,500; mandatory continuation through 2,550 |
 | Dataset manifest SHA-256 | `02d062e4cc7535b9794cd804f30ea0093b0ce1b4937e64cfacb30c33bebcc49a` |
-| Step snapshot | 17,220 / 76,644 (22.47%); 1,653,120 physical samples; epoch 0.674 / 3 |
-| Throughput snapshot | 25.86 logged samples/s; 3.624 s median over the latest 100 steps |
-| ETA snapshot | Approximately 59.8 hours remaining; `2026-07-14T15:09:58Z` from the latest-100-step median |
-| Loss snapshot (latest / mean 100) | total `0.09402 / 0.09878`; action `0.01403 / 0.02152`; world model `0.75362 / 0.72806`; depth `0.28911 / 0.27804` |
-| Mask snapshot (latest / mean 100) | keep ratio `0.83333 / 0.87012`; all-zero ratio `0.16667 / 0.10417` |
-| LR snapshot | Action LR `9.1525e-5`; one peak at the intended step-3,000 warmup boundary followed by monotonic cosine decay. Resolved config records `_accelerate_step_scheduler_with_optimizer: false`. |
-| Latest checkpoint MAE | `0.067684` at `steps_15000`, down monotonically from `0.124961` at `steps_2500` |
-| Local checkpoints | `steps_10000`, `steps_12500`, and `steps_15000` |
-| Durable checkpoint state | Uploader logs confirm `steps_12500` as the latest successful upload. Based on successful uploads and retention pruning, GCS should contain `steps_7500`, `steps_10000`, and `steps_12500`; direct listing is blocked by the same expired credential. `steps_15000` is local-only and has failed repeated upload retries. |
-| Backup blocker | Both VM and local gcloud report `Reauthentication failed`; VM failures began at `2026-07-12T00:15Z`. Refresh `/mnt/vla-jepa/gcloud-config`; the existing uploader retries every 900 seconds and must not be duplicated. |
-| GCS destination | `gs://robotics-datasets-yonduai/gcloud/vla-jepa/checkpoints/magna_interventions_a100x8_qwen35_2b_full_18d_20260711_023223` |
-| Sessions | `magna_train`, `magna_uploader`, `magna_tensorboard`, `magna_tb_compare` |
-| Exact current service file | `/mnt/vla-jepa/logs/magna_interventions_a100x8_qwen35_2b_full_18d_20260711_023223.services.sh` |
-| Primary logs | `/mnt/vla-jepa/logs/magna_interventions_a100x8_qwen35_2b_full_18d_20260711_023223.log` and `/mnt/vla-jepa/logs/magna_interventions_a100x8_qwen35_2b_full_18d_20260711_023223.gcs_upload.log` |
-| Health snapshot | Restart count 0; no OOM, NCCL, decode, worker-exit, or non-finite errors; GPU memory 78,294-78,314 MiB; host RAM approximately 120 GiB used / 1.2 TiB available; no swap; approximately 2.8 TiB free |
+| Pilot step snapshot | 599 / 2,550; about 3.60 s/step; approximately 1 h 57 min remaining |
+| Step-0 heldout result | 96 episodes, 95 evaluable; normalized action MAE `0.942793846`, RMSE `1.181168795`, arm H20 MAE `0.926819802`, all-action H20 MAE `0.942663133` |
+| Pilot health | All eight ranks active; no OOM, NCCL, decode, worker-exit, or non-finite errors observed. TensorBoard events are still written although the optional viewer sidecar could not claim occupied port 6006. |
+| Pilot checkpoint state | No checkpoint is expected before step 2,500. Passing requires save, heldout eval, and another 50 optimizer steps; the pilot checkpoint is evidence only and must not seed the full run. |
+| Pilot logs | `/mnt/vla-jepa/logs/magna_clean_v3_rtc0_pilot_a100x8_20260714_202446.log` and `/mnt/vla-jepa/checkpoints/magna_clean_v3_rtc0_pilot_a100x8_20260714_202446/starvla/` |
+| H100 host | `reward-model-small` / `ornn-lab-h100-mega-useast5-01`; 8x H100 80 GB, full NVLink; checkout and immutable data/model caches verified at source `415f73289ded5746605de3d4f53bef4a4fc52c53` |
+| H100 image state | `vla-jepa:py313-cu130-h100-415f732`, image `sha256:43b83bcd5d222b1dc626f0fc222187be66c9654b0f8ba89e66df71df0f57f78a`; SM90 BF16 head-dimension-256 forward/backward passed, as did `378 passed, 3 skipped`, runtime preflight, and a direct dataset sample. |
+| H100 8-GPU smoke | `h100_batch12_smoke_415f732_20260714_r1` exited 0 after 10 RTC-off AH50 steps at batch 12/GPU (global 96). Steps 3-10: 2.1165 s median, 45.36 samples/s; peak allocated 59.74 GiB/GPU. No residual ranks/containers or error signatures. |
+| H100 backup blocker | Metadata identity `1098826917407-compute@developer.gserviceaccount.com` has `cloud-platform` scope but is denied `storage.objects.list` on `robotics-datasets-yonduai`. IAM and a list/write/read/delete probe are required before production. |
 
-The current run predates `scripts/run_cloud_training_service.sh`; its external
-service file is preserved above. New runs must use the committed service runner
-and an immutable per-run worktree with named containers so process ownership,
-source identity, and relaunch behavior are explicit. The shared cloud checkout
-may advance for documentation after launch; its current `HEAD` is therefore not
-evidence of the code already loaded by this active process.
+The active pilot uses a detached immutable per-run worktree. The shared
+Columbus checkout may advance after this handoff commit; do not update or
+remove the active pilot worktree. A future H100 full run must also use a new
+immutable worktree, run ID, and empty output directory.
 
-Verified node state:
+Historical A100 production baseline (2026-07-12; do not treat as current live
+state):
 
 ```text
 GCE machine type              a2-ultragpu-8g
@@ -207,9 +198,8 @@ The verified commit and image contain:
 - idempotent DataLoader teardown without calling Python 3.13's private
   `resource_tracker._stop()` while semaphore finalizers are still live.
 
-The current local audit passed `pytest tests -q` with `147 passed, 1 skipped`.
-The synchronized cloud checkout passed the same suite inside the final baked
-image, with GPU access disabled, at `146 passed, 2 skipped`. Use
+The 2026-07-14 local audit passed `pytest tests -q` with `380 passed, 1 skipped`.
+The H100 SM90 image passed the same suite at `378 passed, 3 skipped`. Use
 `pytest tests -q`; bare `pytest -q` also collects optional simulation packages
 that are not part of this training image. Rerun the current suite in every newly
 built image.
@@ -666,6 +656,60 @@ ssh "$HOST" '
 '
 ```
 
+### H100 Image Variant
+
+An SM80-only FlashAttention wheel from the A100 image is not valid evidence for
+an H100 run. Build a separate image for SM90 from the same clean runtime source.
+On `reward-model-small`, Docker daemon iptables management is disabled, so the
+build requires host networking for package resolution; this flag is for the
+build only and does not broaden the training container network contract.
+
+```bash
+ssh reward-model-small '
+  set -e
+  cd /mnt/vla-jepa/src/VLA-JEPA
+  test -z "$(git status --porcelain)"
+  SOURCE_SHORT="$(git rev-parse --short=12 HEAD)"
+  IMAGE="vla-jepa:py313-cu130-h100-${SOURCE_SHORT}" \
+  BUILD_LOG="/mnt/vla-jepa/logs/docker_build_h100_${SOURCE_SHORT}.log" \
+  BUILD_EXIT_FILE="/mnt/vla-jepa/logs/docker_build_h100_${SOURCE_SHORT}.exit" \
+  IMAGE_IDENTITY_FILE="/mnt/vla-jepa/logs/h100_image_identity_${SOURCE_SHORT}.txt" \
+  INSTALL_DEEPSPEED=0 \
+  INSTALL_MOGE=1 \
+  INSTALL_FLASH_ATTN=1 \
+  FLASH_ATTN_SPEC=flash-attn==2.8.3.post1 \
+  FLASH_ATTN_CUDA_ARCH_LIST=9.0 \
+  FLASH_ATTN_MAX_JOBS=64 \
+  FLASH_ATTN_NVCC_THREADS=2 \
+    ./scripts/build_magna_a100_image.sh --network=host
+'
+```
+
+Require exit zero and preserve the image identity and package inventory. Before
+any multi-GPU smoke, execute an actual BF16 FlashAttention forward/backward
+kernel with head dimension 256 and assert `torch.cuda.get_device_capability()`
+is `(9, 0)` and `flash_attn.__version__` is `2.8.3.post1`. Run the repository
+test suite and runtime/data preflight inside this exact image. The measured A100
+batch-12 ceiling does not transfer to H100: rerun a sustained eight-GPU batch-12
+smoke before estimating or approving the full run.
+
+The H100 host globally exports `HF_HUB_CACHE=/scratch/cache/huggingface/hub`.
+That shared cache is not the verified run cache. Set both
+`HF_HOME=/mnt/vla-jepa/hf` and `HF_HUB_CACHE=/mnt/vla-jepa/hf/hub` explicitly in
+every H100 preflight, smoke, launch environment, and service process. Require an
+offline `AutoConfig.from_pretrained("Qwen/Qwen3.5-2B")` lookup to pass before
+loading the model; setting `HF_HOME` alone does not override an already-defined
+`HF_HUB_CACHE`.
+
+The H100 host's routable interface is `enp0s12`, while the historical A100
+fallback is `ens8`. The training image does not include the `ip` command, so the
+shared training environment now also discovers the default route from
+`/proc/net/route`. Still set `NCCL_SOCKET_IFNAME=enp0s12` and
+`GLOO_SOCKET_IFNAME=enp0s12` explicitly in the H100 launch environment so the
+network identity is reviewable. A failed pre-fix smoke exited before step 1
+with `Bootstrap : no socket interface found`; the identical retry with these
+overrides completed all ten steps.
+
 ## 6. Preflight And Smoke Gates
 
 Run the runtime preflight and explicitly verify the native FlashAttention
@@ -848,6 +892,14 @@ checkpoint, then requires all ranks to continue training through step 2,550.
 It skips the redundant final-model copy. Only after reviewing
 the step-0-to-step-2,500 heldout improvement should a separate full-run handoff
 select the generic interventions launcher and a new run ID.
+
+The pilot's `steps_2500` checkpoint is evaluation evidence, not a warm start.
+Its 2,550-step scheduler is nearly exhausted and cannot preserve the intended
+full-run optimization schedule. The full H100 run must initialize again from
+the reviewed upstream Qwen/MoGe/V-JEPA weights, use a new run ID and empty run
+directory, and leave `RESUME_CHECKPOINT`, `resume_from_checkpoint`, and
+`trainer.pretrained_checkpoint` unset/null. Resume is reserved for continuing
+an interrupted checkpoint from that same full run.
 
 Add the exact final smoke run ID, exit code, throughput, peak memory, and tested
 backup destination to the preflight manifest before approval. The source config
@@ -1083,6 +1135,16 @@ in the mounted gcloud config, or attach durable checkpoint storage. Do not rely
 on a stop solely to change scopes; default stop behavior discards Local SSD,
 and Preview preservation still is not a backup.
 
+For `reward-model-small`, the metadata service account
+`1098826917407-compute@developer.gserviceaccount.com` already has the
+`cloud-platform` OAuth scope, but the 2026-07-14 probe was denied
+`storage.objects.list` on `robotics-datasets-yonduai`. Do not copy a human
+credential or private key to the host. Grant the approved service account the
+standard `roles/storage.objectAdmin` role on the approved bucket/prefix, or a
+least-privilege equivalent that permits list/get/create/delete, then run a
+list/write/read/delete probe from the H100 host. Until that probe succeeds, the
+host is staged but not production-ready and a full run must not start.
+
 The normal path is the `magna_uploader` service launched from `RUN_ENV_FILE`.
 For manual recovery only, invoke the same committed watcher with identical
 settings and first prove no uploader is already running:
@@ -1138,6 +1200,10 @@ path that the production run will use.
 | Checkpoint exists only on Local SSD | It is not durable. Wait for stability, verify uploader success, list/download it from GCS, and compare files before relying on it. |
 | Host uploader cannot write into a Docker-created run directory | Do not chmod or chown an active run tree. Stage launch/preflight files in `/mnt/vla-jepa/logs/run_metadata/<run-id>` and pass it as `EXTRA_METADATA_DIR`; merge it with readable trainer metadata during upload. |
 | GCS read works but writes fail | Check both IAM identity and OAuth scope. Use `cloud-platform` for a new VM or the approved mounted user credential; test write/read/delete. |
+| H100 image imports FlashAttention but kernels were built for A100 only | Build a distinct image with `FLASH_ATTN_CUDA_ARCH_LIST=9.0`; assert capability `(9, 0)` and run a BF16 head-dimension-256 forward/backward kernel before the eight-GPU smoke. |
+| H100 offline Qwen lookup ignores the copied cache | The host exports a shared `HF_HUB_CACHE`. Explicitly set `HF_HOME=/mnt/vla-jepa/hf` and `HF_HUB_CACHE=/mnt/vla-jepa/hf/hub` in the launch environment and prove an offline config lookup. |
+| H100 DDP fails before step 1 with `Bootstrap : no socket interface found` | Set `NCCL_SOCKET_IFNAME=enp0s12` and `GLOO_SOCKET_IFNAME=enp0s12`. Runtime source must include `/proc/net/route` discovery because the image lacks `ip` and the A100 fallback `ens8` does not exist on this host. |
+| A pilot checkpoint appears suitable for the full run | Do not warm-start from it. The bounded pilot has a nearly exhausted scheduler; start the full run from upstream initializations with a new run ID and empty directory. |
 | A user-authenticated uploader worked at launch but fails hours later | Inspect the uploader log and test `gcloud auth print-access-token`; an active uploader process is not proof of durable backup. Reauthenticate the same mounted config and let the single uploader retry. For unattended production, use a `cloud-platform`-scoped service account with least-privilege IAM instead of relying on human reauthentication. |
 | LR or action loss repeatedly falls and rises on multi-rank training | Inspect `lr_action_model` turning points and require `_accelerate_step_scheduler_with_optimizer: false` when the trainer calls `lr_scheduler.step()` itself. The old 8-rank LIBERO run advanced the scheduler eight times per optimizer step, compressing warmup from 3,000 to about 375 steps and producing repeated cosine cycles. |
 | TensorBoard curves from different runs appear misaligned | Compare on physical samples seen with `scripts/tensorboard_compare_samples.py`, not raw optimizer step. |
@@ -1205,3 +1271,4 @@ The detailed diff remains in Git history.
 | 2026-07-11 | Production launch and live TensorBoard comparison | Corrected runtime-source versus image identity, recorded the active run, added sample-aligned comparisons, and replaced stale launch-pending state. |
 | 2026-07-11 | Agent-to-agent operational audit | Added root agent routing; required clean committed source, immutable per-run worktrees, versioned non-secret launch environments, named containers, committed service/build runners, failure-path exit markers, content-aware metadata resynchronization, and mandatory continuous improvement. |
 | 2026-07-12 | Live learning-rate and backup audit | Verified the corrected one-cycle scheduler against the old 8x-stepped LIBERO trace; separated backup health from process health, required last-successful-upload verification, and prohibited unattended production from relying solely on a human credential. |
+| 2026-07-14 | RTC-off pilot and H100 staging | Added SM90 image/kernel/smoke gates, pinned the verified H100 Hugging Face cache and `enp0s12` NCCL/Gloo interface, made the image wrapper pin FlashAttention and forward build arguments, prohibited warm-starting the full run from the pilot checkpoint, and gated H100 production on service-account GCS list/write/read/delete access. |
