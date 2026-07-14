@@ -681,17 +681,47 @@ ssh reward-model-small '
   FLASH_ATTN_CUDA_ARCH_LIST=9.0 \
   FLASH_ATTN_MAX_JOBS=64 \
   FLASH_ATTN_NVCC_THREADS=2 \
+  INSTALL_FAST_LINEAR_ATTN=1 \
+  FAST_LINEAR_ATTN_SPEC="flash-linear-attention[cuda]==0.5.1" \
+  CAUSAL_CONV1D_SPEC=causal-conv1d==1.6.2.post1 \
+  FAST_LINEAR_ATTN_TRANSFORMERS_SPEC=transformers==5.13.1 \
+  FAST_LINEAR_ATTN_CUDA_ARCH_LIST=9.0 \
+  FAST_LINEAR_ATTN_MAX_JOBS=64 \
     ./scripts/build_magna_a100_image.sh --network=host
 '
 ```
 
+Fast linear attention remains off by default in both image build wrappers, so
+the A100 image contract is unchanged. Enabling it requires exact package pins,
+an explicit architecture, and a positive build-worker count. The image build
+forces a source build of `causal-conv1d` and fails if the pinned packages or
+their Qwen3.5 symbols cannot be imported.
+
 Require exit zero and preserve the image identity and package inventory. Before
-any multi-GPU smoke, execute an actual BF16 FlashAttention forward/backward
-kernel with head dimension 256 and assert `torch.cuda.get_device_capability()`
-is `(9, 0)` and `flash_attn.__version__` is `2.8.3.post1`. Run the repository
-test suite and runtime/data preflight inside this exact image. The measured A100
-batch-12 ceiling does not transfer to H100: rerun a sustained eight-GPU batch-12
-smoke before estimating or approving the full run.
+any multi-GPU smoke, execute both strict single-GPU probes in the exact image:
+
+```bash
+SOURCE_SHORT="$(git rev-parse --short=12 HEAD)"
+IMAGE="vla-jepa:py313-cu130-h100-${SOURCE_SHORT}" GPUS=0 MOUNT_GCLOUD=0 \
+  ./scripts/docker_run_training.sh \
+  python scripts/probe_qwen35_fast_linear_attention.py \
+    --expected-transformers-version 5.13.1 \
+    --expected-fla-version 0.5.1 \
+    --expected-causal-conv1d-version 1.6.2.post1 \
+    --expected-compute-capability 9.0
+```
+
+The fused-linear-attention probe must report exact versions, exact SM90, and a
+finite BF16 result. It exercises the production Qwen3.5-2B linear-attention
+dimensions through causal-conv1d forward/backward, chunked gated-delta
+forward/backward, fused RMSNorm-gating forward/backward, causal-conv update,
+and fused recurrent inference. An import-only pass is not a GPU gate.
+Separately execute the existing BF16 FlashAttention forward/backward kernel with
+head dimension 256 and assert `torch.cuda.get_device_capability()` is `(9, 0)`
+and `flash_attn.__version__` is `2.8.3.post1`. Run the repository test suite and
+runtime/data preflight inside this exact image. The measured A100 batch-12
+ceiling does not transfer to H100: rerun a sustained eight-GPU batch-12 smoke
+before estimating or approving the full run.
 
 The H100 host globally exports `HF_HUB_CACHE=/scratch/cache/huggingface/hub`.
 That shared cache is not the verified run cache. Set both
