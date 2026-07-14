@@ -48,6 +48,31 @@ If you explicitly want FlashAttention for an H100-only image:
 INSTALL_FLASH_ATTN=1 FLASH_ATTN_SPEC=flash-attn IMAGE=vla-jepa:h100-fa ./scripts/docker_build_training.sh
 ```
 
+Qwen3.5 fast linear attention is also off by default. An explicit Hopper build
+pins FLA, causal-conv1d, Transformers, TileLang, and TVM-FFI to exact versions:
+
+```bash
+INSTALL_FAST_LINEAR_ATTN=1 \
+FAST_LINEAR_ATTN_CUDA_ARCH_LIST=9.0 \
+IMAGE=vla-jepa:h100-fla \
+./scripts/docker_build_training.sh
+```
+
+The build imports every pinned runtime module and confirms that Transformers'
+Qwen3.5 implementation is bound to those fused functions. The final image runs
+a fail-closed `pip check`; when MoGe is installed, only its two known missing
+optional dependencies (`gradio` and `opencv-python`) are allowed, and every
+other diagnostic still fails the build. Before selecting the FLA image for
+training, run its probe on an H100. It includes a 65-token fused backward pass
+compared with a pure-PyTorch gated-delta recurrence, so it exercises the first
+64-token chunk boundary instead of accepting merely finite gradients:
+
+```bash
+./scripts/docker_run_training.sh \
+  python scripts/probe_qwen35_fast_linear_attention.py \
+    --expected-compute-capability 9.0
+```
+
 ## Fresh A2/A100 Node Bootstrap
 
 On a new GCP A2/A100 training VM, run the host bootstrap before cloning data or

@@ -4,9 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import importlib.metadata
 import json
 import math
+import subprocess
+import sys
 from types import ModuleType, SimpleNamespace
 from typing import Any
 
@@ -31,6 +34,18 @@ REQUIRED_MODELING_BINDINGS = (
     "fused_recurrent_gated_delta_rule",
     "FusedRMSNormGated",
 )
+KNOWN_MOGE_OPTIONAL_DEPENDENCY_FAILURES = frozenset(
+    {
+        "moge 2.0.0 requires gradio, which is not installed.",
+        "moge 2.0.0 requires opencv-python, which is not installed.",
+    }
+)
+PIP_CHECK_SUCCESS_LINE = "No broken requirements found."
+HOPPER_REFERENCE_SEQUENCE_LENGTH = 65
+HOPPER_REFERENCE_FORWARD_MAX_RELATIVE_L2 = 0.10
+HOPPER_REFERENCE_FORWARD_MIN_COSINE = 0.995
+HOPPER_REFERENCE_GRADIENT_MAX_RELATIVE_L2 = 0.20
+HOPPER_REFERENCE_GRADIENT_MIN_COSINE = 0.98
 
 
 def _parse_compute_capability(value: str) -> tuple[int, int]:
@@ -68,14 +83,93 @@ def _require_modeling_bindings(modeling: ModuleType | Any) -> dict[str, Any]:
     return {name: getattr(modeling, name) for name in REQUIRED_MODELING_BINDINGS}
 
 
+def _import_runtime_module(distribution: str, module_name: str) -> ModuleType:
+    try:
+        return importlib.import_module(module_name)
+    except Exception as exc:
+        raise RuntimeError(
+            f"{distribution} is installed but runtime module {module_name!r} failed to import: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+
+
+def _describe_import(module: ModuleType) -> dict[str, str | None]:
+    return {
+        "module": module.__name__,
+        "path": str(module.__file__) if getattr(module, "__file__", None) else None,
+    }
+
+
+def _validate_pip_check_result(
+    returncode: int,
+    stdout: str,
+    stderr: str,
+    *,
+    allow_known_moge_optional_dependencies: bool,
+) -> dict[str, Any]:
+    lines = [
+        line.strip()
+        for stream in (stdout, stderr)
+        for line in stream.splitlines()
+        if line.strip()
+    ]
+    allowed = (
+        KNOWN_MOGE_OPTIONAL_DEPENDENCY_FAILURES
+        if allow_known_moge_optional_dependencies
+        else frozenset()
+    )
+    ignored = sorted(line for line in lines if line in allowed)
+    unexpected = sorted(
+        line
+        for line in lines
+        if line not in allowed and line != PIP_CHECK_SUCCESS_LINE
+    )
+
+    if unexpected:
+        raise RuntimeError(
+            "pip check reported unapproved dependency failures: " + " | ".join(unexpected)
+        )
+    if returncode == 0:
+        if ignored:
+            raise RuntimeError(
+                "pip check returned success while reporting dependency failures: "
+                + " | ".join(ignored)
+            )
+    elif not ignored:
+        raise RuntimeError(
+            f"pip check exited {returncode} without an approved diagnostic"
+        )
+
+    return {
+        "status": "ok",
+        "pip_check_returncode": returncode,
+        "allowed_failures": ignored,
+    }
+
+
+def _run_python_dependency_check(
+    *, allow_known_moge_optional_dependencies: bool
+) -> dict[str, Any]:
+    result = subprocess.run(
+        [sys.executable, "-m", "pip", "check"],
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+    return _validate_pip_check_result(
+        result.returncode,
+        result.stdout,
+        result.stderr,
+        allow_known_moge_optional_dependencies=allow_known_moge_optional_dependencies,
+    )
+
+
 def _load_integrations(
     expected_fla_version: str,
     expected_causal_conv1d_version: str,
     expected_transformers_version: str,
     expected_tilelang_version: str,
     expected_tvm_ffi_version: str,
-    *,
-    require_transformers_bindings: bool,
 ):
     versions = {
         "flash-linear-attention": _require_exact_package_version(
@@ -95,11 +189,26 @@ def _load_integrations(
         ),
     }
 
-    from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
-    from fla.modules import FusedRMSNormGated
-    from fla.ops.gated_delta_rule import (
-        chunk_gated_delta_rule,
-        fused_recurrent_gated_delta_rule,
+    tvm_ffi_module = _import_runtime_module("apache-tvm-ffi", "tvm_ffi")
+    tilelang_module = _import_runtime_module("tilelang", "tilelang")
+    causal_conv1d_module = _import_runtime_module("causal-conv1d", "causal_conv1d")
+    fla_modules_module = _import_runtime_module("flash-linear-attention", "fla.modules")
+    fla_ops_module = _import_runtime_module(
+        "flash-linear-attention", "fla.ops.gated_delta_rule"
+    )
+    modeling_qwen3_5 = _import_runtime_module(
+        "transformers", "transformers.models.qwen3_5.modeling_qwen3_5"
+    )
+    configuration_qwen3_5 = _import_runtime_module(
+        "transformers", "transformers.models.qwen3_5.configuration_qwen3_5"
+    )
+
+    causal_conv1d_fn = getattr(causal_conv1d_module, "causal_conv1d_fn", None)
+    causal_conv1d_update = getattr(causal_conv1d_module, "causal_conv1d_update", None)
+    FusedRMSNormGated = getattr(fla_modules_module, "FusedRMSNormGated", None)
+    chunk_gated_delta_rule = getattr(fla_ops_module, "chunk_gated_delta_rule", None)
+    fused_recurrent_gated_delta_rule = getattr(
+        fla_ops_module, "fused_recurrent_gated_delta_rule", None
     )
 
     package_bindings = _require_modeling_bindings(
@@ -111,11 +220,11 @@ def _load_integrations(
             FusedRMSNormGated=FusedRMSNormGated,
         )
     )
-    if not require_transformers_bindings:
-        return versions, None, None, package_bindings
-
-    from transformers.models.qwen3_5 import modeling_qwen3_5
-    from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
+    Qwen3_5TextConfig = getattr(configuration_qwen3_5, "Qwen3_5TextConfig", None)
+    if not isinstance(Qwen3_5TextConfig, type):
+        raise RuntimeError(
+            "Transformers Qwen3.5 configuration module did not expose Qwen3_5TextConfig"
+        )
 
     bindings = _require_modeling_bindings(modeling_qwen3_5)
     mismatched = [
@@ -126,7 +235,13 @@ def _load_integrations(
             "Transformers Qwen3.5 bindings do not reference the installed fused packages: "
             + ", ".join(mismatched)
         )
-    return versions, modeling_qwen3_5, Qwen3_5TextConfig, bindings
+    imported_modules = {
+        "tilelang": _describe_import(tilelang_module),
+        "apache-tvm-ffi": _describe_import(tvm_ffi_module),
+        "transformers-qwen3.5-modeling": _describe_import(modeling_qwen3_5),
+        "transformers-qwen3.5-configuration": _describe_import(configuration_qwen3_5),
+    }
+    return versions, modeling_qwen3_5, Qwen3_5TextConfig, bindings, imported_modules
 
 
 def _require_finite(torch: Any, name: str, tensor: Any) -> None:
@@ -279,6 +394,197 @@ def _probe_training_kernels(
     return float(loss.detach().item())
 
 
+def _pytorch_gated_delta_rule_reference(
+    torch: Any,
+    q: Any,
+    k: Any,
+    v: Any,
+    g: Any,
+    beta: Any,
+) -> Any:
+    if q.ndim != 4 or k.shape != q.shape or v.ndim != 4:
+        raise RuntimeError("reference gate expects q/k/v tensors with [B, T, H, D] shape")
+    batch_size, sequence_length, key_heads, key_dim = q.shape
+    if tuple(v.shape[:2]) != (batch_size, sequence_length):
+        raise RuntimeError("reference gate q/k/v batch and sequence dimensions differ")
+    value_heads, value_dim = v.shape[2:]
+    if value_heads % key_heads:
+        raise RuntimeError("reference gate requires value heads divisible by key heads")
+    if tuple(g.shape) != (batch_size, sequence_length, value_heads):
+        raise RuntimeError("reference gate g shape does not match value heads")
+    if tuple(beta.shape) != (batch_size, sequence_length, value_heads):
+        raise RuntimeError("reference gate beta shape does not match value heads")
+
+    value_heads_per_key_head = value_heads // key_heads
+    q = q.repeat_interleave(value_heads_per_key_head, dim=2)
+    k = k.repeat_interleave(value_heads_per_key_head, dim=2)
+    q = q / torch.sqrt(torch.sum(q * q, dim=-1, keepdim=True) + 1e-6)
+    k = k / torch.sqrt(torch.sum(k * k, dim=-1, keepdim=True) + 1e-6)
+    scale = key_dim**-0.5
+    state = torch.zeros(
+        batch_size,
+        value_heads,
+        key_dim,
+        value_dim,
+        dtype=q.dtype,
+        device=q.device,
+    )
+    outputs = []
+    for step in range(sequence_length):
+        state = state * torch.exp(g[:, step, :, None, None])
+        predicted_value = torch.einsum("bhkv,bhk->bhv", state, k[:, step])
+        delta = beta[:, step, :, None] * (v[:, step] - predicted_value)
+        state = state + torch.einsum("bhk,bhv->bhkv", k[:, step], delta)
+        outputs.append(
+            scale * torch.einsum("bhkv,bhk->bhv", state, q[:, step])
+        )
+    return torch.stack(outputs, dim=1)
+
+
+def _tensor_reference_metrics(torch: Any, actual: Any, reference: Any) -> dict[str, float]:
+    actual = actual.detach().float()
+    reference = reference.detach().float()
+    difference = actual - reference
+    actual_norm = float(torch.linalg.vector_norm(actual).item())
+    reference_norm = float(torch.linalg.vector_norm(reference).item())
+    difference_norm = float(torch.linalg.vector_norm(difference).item())
+    denominator = max(reference_norm, 1e-12)
+    cosine_denominator = max(actual_norm * reference_norm, 1e-24)
+    cosine = float(torch.sum(actual * reference).item()) / cosine_denominator
+    return {
+        "relative_l2": difference_norm / denominator,
+        "cosine": cosine,
+        "max_abs": float(torch.max(torch.abs(difference)).item()),
+        "reference_norm": reference_norm,
+    }
+
+
+def _validate_reference_metrics(
+    name: str,
+    metrics: dict[str, float],
+    *,
+    max_relative_l2: float,
+    min_cosine: float,
+) -> None:
+    non_finite = [key for key, value in metrics.items() if not math.isfinite(value)]
+    if non_finite:
+        raise RuntimeError(
+            f"Hopper numerical reference metrics for {name} are non-finite: "
+            + ", ".join(non_finite)
+        )
+    if metrics["relative_l2"] > max_relative_l2 or metrics["cosine"] < min_cosine:
+        raise RuntimeError(
+            f"Hopper fused gradient/reference mismatch for {name}: "
+            f"relative_l2={metrics['relative_l2']:.6g} (max {max_relative_l2}), "
+            f"cosine={metrics['cosine']:.6g} (min {min_cosine})"
+        )
+
+
+def _probe_hopper_chunk_gradient_reference(
+    torch: Any,
+    chunk_gated_delta_rule: Any,
+    device: Any,
+) -> dict[str, dict[str, float]]:
+    # T=65 crosses the fused kernel's 64-token chunk boundary while keeping the
+    # pure-PyTorch recurrence small enough for an image/runtime preflight.
+    batch_size = 1
+    sequence_length = HOPPER_REFERENCE_SEQUENCE_LENGTH
+    heads = 2
+    key_dim = 8
+    value_dim = 8
+
+    torch.manual_seed(20260715)
+    torch.cuda.manual_seed_all(20260715)
+    q = torch.empty(
+        batch_size,
+        sequence_length,
+        heads,
+        key_dim,
+        device=device,
+        dtype=torch.bfloat16,
+    ).normal_(mean=0.0, std=0.2).requires_grad_(True)
+    k = torch.empty_like(q).normal_(mean=0.0, std=0.2).requires_grad_(True)
+    v = torch.empty(
+        batch_size,
+        sequence_length,
+        heads,
+        value_dim,
+        device=device,
+        dtype=torch.bfloat16,
+    ).normal_(mean=0.0, std=0.2).requires_grad_(True)
+    g = torch.empty(
+        batch_size,
+        sequence_length,
+        heads,
+        device=device,
+        dtype=torch.float32,
+    ).uniform_(-1.5, -0.1).requires_grad_(True)
+    beta = torch.empty(
+        batch_size,
+        sequence_length,
+        heads,
+        device=device,
+        dtype=torch.bfloat16,
+    ).uniform_(0.05, 0.95).requires_grad_(True)
+    fused_inputs = (q, k, v, g, beta)
+
+    fused_output, _ = chunk_gated_delta_rule(
+        *fused_inputs,
+        output_final_state=False,
+        use_qk_l2norm_in_kernel=True,
+    )
+    _require_finite(torch, "Hopper fused chunk output", fused_output)
+    upstream = torch.linspace(
+        -0.5,
+        0.5,
+        fused_output.numel(),
+        device=device,
+        dtype=torch.float32,
+    ).reshape(fused_output.shape)
+    fused_loss = torch.sum(fused_output.float() * upstream)
+    fused_gradients = torch.autograd.grad(fused_loss, fused_inputs)
+
+    reference_inputs = tuple(
+        tensor.detach().float().requires_grad_(True) for tensor in fused_inputs
+    )
+    reference_output = _pytorch_gated_delta_rule_reference(
+        torch, *reference_inputs
+    )
+    reference_loss = torch.sum(reference_output * upstream)
+    reference_gradients = torch.autograd.grad(reference_loss, reference_inputs)
+    torch.cuda.synchronize(device)
+
+    metrics = {
+        "output": _tensor_reference_metrics(torch, fused_output, reference_output),
+    }
+    for name, fused_gradient, reference_gradient in zip(
+        ("q_gradient", "k_gradient", "v_gradient", "g_gradient", "beta_gradient"),
+        fused_gradients,
+        reference_gradients,
+        strict=True,
+    ):
+        _require_finite(torch, f"Hopper fused {name}", fused_gradient)
+        _require_finite(torch, f"Hopper reference {name}", reference_gradient)
+        metrics[name] = _tensor_reference_metrics(
+            torch, fused_gradient, reference_gradient
+        )
+
+    _validate_reference_metrics(
+        "output",
+        metrics["output"],
+        max_relative_l2=HOPPER_REFERENCE_FORWARD_MAX_RELATIVE_L2,
+        min_cosine=HOPPER_REFERENCE_FORWARD_MIN_COSINE,
+    )
+    for name in ("q_gradient", "k_gradient", "v_gradient", "g_gradient", "beta_gradient"):
+        _validate_reference_metrics(
+            name,
+            metrics[name],
+            max_relative_l2=HOPPER_REFERENCE_GRADIENT_MAX_RELATIVE_L2,
+            min_cosine=HOPPER_REFERENCE_GRADIENT_MIN_COSINE,
+        )
+    return metrics
+
+
 def _run_kernel_probe(
     modeling: ModuleType,
     config_cls: type,
@@ -318,6 +624,9 @@ def _run_kernel_probe(
         loss = _probe_training_kernels(
             torch, layer, device, batch_size, sequence_length
         )
+        hopper_reference = _probe_hopper_chunk_gradient_reference(
+            torch, bindings["chunk_gated_delta_rule"], device
+        )
 
     if not math.isfinite(loss):
         raise RuntimeError(f"kernel probe returned non-finite loss {loss}")
@@ -331,15 +640,33 @@ def _run_kernel_probe(
         "sequence_length": sequence_length,
         "dtype": "bfloat16",
         "loss": loss,
+        "hopper_chunk_gradient_reference": hopper_reference,
     }
 
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
         "--imports-only",
         action="store_true",
-        help="verify exact package versions and package fast-path symbols without launching CUDA kernels",
+        help=(
+            "import every pinned runtime, validate Transformers Qwen3.5 fused bindings, "
+            "and skip CUDA kernels"
+        ),
+    )
+    mode.add_argument(
+        "--check-python-dependencies",
+        action="store_true",
+        help="run pip check through the fail-closed Docker dependency policy",
+    )
+    parser.add_argument(
+        "--allow-known-moge-optional-deps",
+        action="store_true",
+        help=(
+            "only in dependency-check mode, permit the exact missing gradio and "
+            "opencv-python diagnostics from the pinned MoGe package"
+        ),
     )
     parser.add_argument(
         "--expected-fla-version",
@@ -374,19 +701,39 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
-    args = _build_parser().parse_args()
-    versions, modeling, config_cls, bindings = _load_integrations(
+    parser = _build_parser()
+    args = parser.parse_args()
+    if args.allow_known_moge_optional_deps and not args.check_python_dependencies:
+        parser.error(
+            "--allow-known-moge-optional-deps requires --check-python-dependencies"
+        )
+    if args.check_python_dependencies:
+        print(
+            json.dumps(
+                _run_python_dependency_check(
+                    allow_known_moge_optional_dependencies=(
+                        args.allow_known_moge_optional_deps
+                    )
+                ),
+                indent=2,
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+        return 0
+
+    versions, modeling, config_cls, bindings, imported_modules = _load_integrations(
         args.expected_fla_version,
         args.expected_causal_conv1d_version,
         args.expected_transformers_version,
         args.expected_tilelang_version,
         args.expected_tvm_ffi_version,
-        require_transformers_bindings=not args.imports_only,
     )
     result: dict[str, Any] = {
         "status": "ok",
         "mode": "imports-only" if args.imports_only else "sm90-kernels",
         "versions": versions,
+        "runtime_imports": imported_modules,
         "transformers_bindings": list(bindings),
     }
     if not args.imports_only:

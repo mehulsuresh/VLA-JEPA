@@ -115,6 +115,195 @@ def test_probe_fails_closed_on_transformers_version_mismatch(monkeypatch):
         probe._require_exact_package_version("transformers", "5.13.1")
 
 
+def test_imports_only_loads_tilelang_tvm_ffi_and_qwen35_bindings(monkeypatch):
+    probe = _load_probe_module()
+    binding_values = {
+        name: (type(f"Binding_{name}", (), {}) if name == "FusedRMSNormGated" else lambda: None)
+        for name in probe.REQUIRED_MODELING_BINDINGS
+    }
+
+    class FakeQwenConfig:
+        pass
+
+    modules = {
+        "tilelang": SimpleNamespace(__name__="tilelang", __file__="/runtime/tilelang.py"),
+        "tvm_ffi": SimpleNamespace(__name__="tvm_ffi", __file__="/runtime/tvm_ffi.py"),
+        "causal_conv1d": SimpleNamespace(
+            __name__="causal_conv1d",
+            __file__="/runtime/causal_conv1d.py",
+            causal_conv1d_fn=binding_values["causal_conv1d_fn"],
+            causal_conv1d_update=binding_values["causal_conv1d_update"],
+        ),
+        "fla.modules": SimpleNamespace(
+            __name__="fla.modules",
+            __file__="/runtime/fla/modules.py",
+            FusedRMSNormGated=binding_values["FusedRMSNormGated"],
+        ),
+        "fla.ops.gated_delta_rule": SimpleNamespace(
+            __name__="fla.ops.gated_delta_rule",
+            __file__="/runtime/fla/ops/gated_delta_rule.py",
+            chunk_gated_delta_rule=binding_values["chunk_gated_delta_rule"],
+            fused_recurrent_gated_delta_rule=binding_values[
+                "fused_recurrent_gated_delta_rule"
+            ],
+        ),
+        "transformers.models.qwen3_5.modeling_qwen3_5": SimpleNamespace(
+            __name__="transformers.models.qwen3_5.modeling_qwen3_5",
+            __file__="/runtime/transformers/modeling_qwen3_5.py",
+            **binding_values,
+        ),
+        "transformers.models.qwen3_5.configuration_qwen3_5": SimpleNamespace(
+            __name__="transformers.models.qwen3_5.configuration_qwen3_5",
+            __file__="/runtime/transformers/configuration_qwen3_5.py",
+            Qwen3_5TextConfig=FakeQwenConfig,
+        ),
+    }
+    expected_versions = {
+        "flash-linear-attention": "0.5.1",
+        "causal-conv1d": "1.6.2.post1",
+        "transformers": "5.13.1",
+        "tilelang": "0.1.9",
+        "apache-tvm-ffi": "0.1.10",
+    }
+    imported = []
+
+    monkeypatch.setattr(
+        probe.importlib.metadata,
+        "version",
+        lambda distribution: expected_versions[distribution],
+    )
+
+    def fake_import(module_name):
+        imported.append(module_name)
+        return modules[module_name]
+
+    monkeypatch.setattr(probe.importlib, "import_module", fake_import)
+
+    versions, modeling, config_cls, bindings, import_report = probe._load_integrations(
+        "0.5.1", "1.6.2.post1", "5.13.1", "0.1.9", "0.1.10"
+    )
+
+    assert versions == expected_versions
+    assert config_cls is FakeQwenConfig
+    assert modeling is modules["transformers.models.qwen3_5.modeling_qwen3_5"]
+    assert bindings == binding_values
+    assert "tilelang" in imported
+    assert "tvm_ffi" in imported
+    assert "transformers.models.qwen3_5.modeling_qwen3_5" in imported
+    assert "transformers.models.qwen3_5.configuration_qwen3_5" in imported
+    assert import_report["tilelang"]["module"] == "tilelang"
+    assert import_report["apache-tvm-ffi"]["module"] == "tvm_ffi"
+
+
+def test_runtime_import_failure_names_distribution_and_module(monkeypatch):
+    probe = _load_probe_module()
+
+    def fail_import(_module_name):
+        raise ImportError("binary ABI mismatch")
+
+    monkeypatch.setattr(probe.importlib, "import_module", fail_import)
+    with pytest.raises(
+        RuntimeError,
+        match="apache-tvm-ffi.*'tvm_ffi'.*ImportError: binary ABI mismatch",
+    ):
+        probe._import_runtime_module("apache-tvm-ffi", "tvm_ffi")
+
+
+def test_pip_check_allows_only_exact_known_moge_optional_failures():
+    probe = _load_probe_module()
+    assert probe.KNOWN_MOGE_OPTIONAL_DEPENDENCY_FAILURES == frozenset(
+        {
+            "moge 2.0.0 requires gradio, which is not installed.",
+            "moge 2.0.0 requires opencv-python, which is not installed.",
+        }
+    )
+    known = "\n".join(sorted(probe.KNOWN_MOGE_OPTIONAL_DEPENDENCY_FAILURES))
+
+    result = probe._validate_pip_check_result(
+        1,
+        known,
+        "",
+        allow_known_moge_optional_dependencies=True,
+    )
+
+    assert result["status"] == "ok"
+    assert result["pip_check_returncode"] == 1
+    assert result["allowed_failures"] == sorted(
+        probe.KNOWN_MOGE_OPTIONAL_DEPENDENCY_FAILURES
+    )
+
+
+@pytest.mark.parametrize(
+    ("returncode", "stdout", "allow", "message"),
+    [
+        (
+            1,
+            "moge 2.0.0 requires gradio, which is not installed.\n"
+            "unrelated 1.0 requires missing-package, which is not installed.",
+            True,
+            "unapproved dependency failures",
+        ),
+        (
+            1,
+            "moge 2.0.0 requires gradio, which is not installed.",
+            False,
+            "unapproved dependency failures",
+        ),
+        (
+            0,
+            "moge 2.0.0 requires gradio, which is not installed.",
+            True,
+            "returned success while reporting dependency failures",
+        ),
+        (2, "", True, "without an approved diagnostic"),
+    ],
+)
+def test_pip_check_policy_fails_closed(returncode, stdout, allow, message):
+    probe = _load_probe_module()
+
+    with pytest.raises(RuntimeError, match=message):
+        probe._validate_pip_check_result(
+            returncode,
+            stdout,
+            "",
+            allow_known_moge_optional_dependencies=allow,
+        )
+
+
+def test_hopper_reference_metric_gate_rejects_wrong_gradients():
+    probe = _load_probe_module()
+    good = {"relative_l2": 0.03, "cosine": 0.999, "max_abs": 0.01, "reference_norm": 1.0}
+    probe._validate_reference_metrics(
+        "q_gradient", good, max_relative_l2=0.2, min_cosine=0.98
+    )
+
+    with pytest.raises(RuntimeError, match="q_gradient.*relative_l2"):
+        probe._validate_reference_metrics(
+            "q_gradient",
+            {**good, "relative_l2": 0.21},
+            max_relative_l2=0.2,
+            min_cosine=0.98,
+        )
+    with pytest.raises(RuntimeError, match="q_gradient.*cosine"):
+        probe._validate_reference_metrics(
+            "q_gradient",
+            {**good, "cosine": 0.97},
+            max_relative_l2=0.2,
+            min_cosine=0.98,
+        )
+
+
+def test_hopper_reference_crosses_chunk_boundary_and_is_in_kernel_probe():
+    probe = _load_probe_module()
+    source = PROBE_PATH.read_text(encoding="utf-8")
+
+    assert probe.HOPPER_REFERENCE_SEQUENCE_LENGTH == 65
+    assert "_pytorch_gated_delta_rule_reference" in source
+    assert "_probe_hopper_chunk_gradient_reference" in source
+    assert 'bindings["chunk_gated_delta_rule"]' in source
+    assert '"hopper_chunk_gradient_reference"' in source
+
+
 def test_probe_help_does_not_require_ml_runtime_imports():
     result = subprocess.run(
         ["python", str(PROBE_PATH), "--help"],
@@ -226,10 +415,16 @@ def test_dockerfile_forces_source_build_and_import_probe_when_enabled():
 
     assert "CAUSAL_CONV1D_FORCE_BUILD=TRUE" in dockerfile
     assert "PIP_NO_BINARY=causal-conv1d" in dockerfile
+    assert 'SHELL ["/bin/bash", "-Eeuo", "pipefail", "-c"]' in dockerfile
     assert "probe_qwen35_fast_linear_attention.py" in dockerfile
     assert "--imports-only" in dockerfile
     assert '"${FAST_LINEAR_ATTN_TVM_FFI_SPEC}" "${FAST_LINEAR_ATTN_TILELANG_SPEC}"' in dockerfile
-    assert "python -m pip check" in dockerfile
+    assert "python -m pip check" not in dockerfile
+    assert "--check-python-dependencies" in dockerfile
+    assert "--allow-known-moge-optional-deps" in dockerfile
+    assert dockerfile.index("python -m pip install -e .") < dockerfile.index(
+        "--check-python-dependencies"
+    )
     assert '--expected-transformers-version "${FAST_LINEAR_ATTN_TRANSFORMERS_SPEC##*==}"' in dockerfile
     assert 'INSTALL_FAST_LINEAR_ATTN="${INSTALL_FAST_LINEAR_ATTN:-0}"' in wrapper
     assert 'FAST_LINEAR_ATTN_TRANSFORMERS_SPEC="${FAST_LINEAR_ATTN_TRANSFORMERS_SPEC:-transformers==5.13.1}"' in wrapper
