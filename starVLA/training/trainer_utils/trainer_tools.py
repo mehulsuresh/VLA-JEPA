@@ -304,7 +304,12 @@ class TrainerUtils:
         if not dist.is_initialized() or dist.get_rank() == 0:
             print(f"📦 loading checkpoint: {checkpoint_path}")
         try:
-            checkpoint = torch.load(checkpoint_path, map_location="cpu")
+            if str(checkpoint_path).endswith(".safetensors"):
+                from safetensors.torch import load_file as load_safetensors_file
+
+                checkpoint = load_safetensors_file(str(checkpoint_path), device="cpu")
+            else:
+                checkpoint = torch.load(checkpoint_path, map_location="cpu")
         except Exception as e:
             raise RuntimeError(f"❌ loading checkpoint failed: {e}")
 
@@ -338,10 +343,12 @@ class TrainerUtils:
             except Exception as e:
                 model_cfg = getattr(model, "config", None)
                 incompatible_keys = model.load_state_dict(checkpoint, strict=False)
+                allowed_missing_keys = {"qwen_vl_interface.model.lm_head.weight"}
                 missing_keys = [
                     key
                     for key in incompatible_keys.missing_keys
-                    if not is_depth_teacher_aux_missing_key_allowed(model_cfg, key)
+                    if key not in allowed_missing_keys
+                    and not is_depth_teacher_aux_missing_key_allowed(model_cfg, key)
                 ]
                 unexpected_keys = [
                     key
