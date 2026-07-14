@@ -1,6 +1,8 @@
 import numpy as np
 import pytest
 
+from deployment.model_server.checkpoint_utils import build_policy_metadata
+
 from deployment.model_server.server_policy import (
     ActionGuardRetryPolicy,
     _expand_realman_policy_actions,
@@ -79,3 +81,65 @@ def test_action_guard_skips_lift_threshold_for_policy_that_does_not_control_lift
     assert reasons == []
     assert metrics["lift_is_policy_controlled"] is False
     assert metrics["tail_lift_mean_min"] is None
+
+
+def test_policy_metadata_describes_18d_realman_expansion_contract(tmp_path):
+    class Policy:
+        config = {
+            "run_id": "magna-test",
+            "datasets": {
+                "vla_data": {
+                    "data_mix": "magna_source_no_base_no_lift_interventions_v3",
+                    "action_type": "absolute_qpos",
+                    "resolution_size": 224,
+                    "video_resolution_size": 384,
+                    "with_state": True,
+                }
+            },
+            "framework": {
+                "name": "VLA_JEPA",
+                "action_model": {
+                    "action_dim": 18,
+                    "state_dim": 19,
+                    "action_horizon": 50,
+                    "future_action_window_size": 49,
+                    "num_inference_timesteps": 8,
+                },
+                "vj2_model": {"num_frames": 8},
+            },
+        }
+        norm_stats = {
+            "new_embodiment": {
+                "action": {"min": [-1.0] * 18, "max": [1.0] * 18},
+                "state": {"min": [-1.0] * 19, "max": [1.0] * 19},
+            }
+        }
+
+    metadata = build_policy_metadata(Policy(), tmp_path / "model.safetensors")
+
+    assert metadata["policy_action_names"][-2:] == ["head_joint_1_rad", "head_joint_2_rad"]
+    assert metadata["robot_action_dim"] == 22
+    assert metadata["realman_action_contract"] == {
+        "version": 1,
+        "policy_action_dim": 18,
+        "robot_action_dim": 22,
+        "omitted_robot_action_indices": [16, 17, 18, 21],
+        "base_velocity_source": "zero",
+        "lift_source": "measured_state",
+    }
+    assert metadata["realman_input_contract"] == {
+        "version": 1,
+        "payload_key": "qwen_frames",
+        "camera_order": ["head", "wrist_left", "wrist_right"],
+        "frame_shape": [3, 384, 384, 3],
+        "frame_size": 384,
+        "frame_dtype": "uint8",
+        "color_space": "RGB",
+        "transport_encoding": "msgpack_ndarray",
+        "client_resize": "opencv_inter_linear",
+        "model_preprocess": "qwen_tensor_fast_path",
+        "model_resolution_size": 224,
+        "state_shape": [1, 1, 19],
+        "state_dtype": "float32",
+        "state_normalized": True,
+    }

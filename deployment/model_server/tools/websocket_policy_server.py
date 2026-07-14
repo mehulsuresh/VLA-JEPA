@@ -125,17 +125,27 @@ class WebsocketPolicyServer:
                     "request_id": req_id,
                     "error": {"message": "Payload must be a dict", "payload_type": str(type(payload))},
                 }
-            if "batch_images" not in payload:
+            image_payload_keys = [key for key in ("batch_images", "qwen_frames") if key in payload]
+            if not image_payload_keys:
                 return {
                     "status": "error",
                     "ok": False,
                     "type": "inference_result",
                     "request_id": req_id,
-                    "error": {"message": "Payload must include `batch_images`"},
+                    "error": {"message": "Payload must include `batch_images` or `qwen_frames`"},
+                }
+            if len(image_payload_keys) != 1:
+                return {
+                    "status": "error",
+                    "ok": False,
+                    "type": "inference_result",
+                    "request_id": req_id,
+                    "error": {"message": "Payload must not include both `batch_images` and `qwen_frames`"},
                 }
             try:
                 infer_payload = dict(payload)
-                infer_payload["batch_images"] = image_tools.to_pil_preserve(infer_payload["batch_images"])
+                if "batch_images" in infer_payload:
+                    infer_payload["batch_images"] = image_tools.to_pil_preserve(infer_payload["batch_images"])
                 output_dict = self._policy.predict_action(**infer_payload)
                 if self._output_logger is not None:
                     try:

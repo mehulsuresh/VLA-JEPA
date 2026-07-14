@@ -6,10 +6,14 @@ from deployment.realman.pipeline import (
     REALMAN_ACTION_DIM,
     REALMAN_POLICY_ACTION_DIM_NO_BASE,
     REALMAN_POLICY_ACTION_DIM_NO_BASE_NO_LIFT,
+    REALMAN_POLICY_ACTION_NAMES_NO_BASE_NO_LIFT,
     REALMAN_STATE_DIM,
     build_policy_payload,
     expand_policy_action_to_robot_action,
+    realman_omitted_robot_action_indices,
+    realman_policy_action_names,
     split_action_vector,
+    validate_realman_policy_payload,
     validate_realman_server_metadata,
 )
 from deployment.realman.vr_teleop_bridge import (
@@ -45,9 +49,30 @@ class RealmanPipelineTest(unittest.TestCase):
             "q99": [1.0] * REALMAN_STATE_DIM,
         }
         payload = build_policy_payload(observation, "test", image_size=8, state_stats=stats)
-        self.assertEqual(len(payload["batch_images"][0]), 3)
-        self.assertEqual(payload["batch_images"][0][0].shape, (8, 8, 3))
+        self.assertEqual(np.asarray(payload["qwen_frames"]).shape, (1, 3, 8, 8, 3))
+        self.assertEqual(np.asarray(payload["qwen_frames"]).dtype, np.uint8)
         self.assertEqual(payload["state"].shape, (1, 1, REALMAN_STATE_DIM))
+        self.assertEqual(payload["state"].dtype, np.float32)
+
+    def test_policy_payload_matches_training_tensor_contract(self):
+        image = np.zeros((16, 16, 3), dtype=np.uint8)
+        observation = {
+            "observation.images.head": image,
+            "observation.images.wrist_left": image,
+            "observation.images.wrist_right": image,
+            "source.observation.state": np.zeros((REALMAN_STATE_DIM,), dtype=np.float32),
+        }
+        metadata = {
+            "video_resolution_size": 8,
+            "realman_input_contract": {
+                "payload_key": "qwen_frames",
+                "frame_size": 8,
+            },
+        }
+
+        payload = build_policy_payload(observation, "test", image_size=8)
+
+        validate_realman_policy_payload(payload, metadata)
 
     def test_validate_metadata(self):
         warnings = validate_realman_server_metadata(
@@ -58,6 +83,18 @@ class RealmanPipelineTest(unittest.TestCase):
             }
         )
         self.assertEqual(warnings, [])
+
+    def test_validate_metadata_rejects_non_absolute_action_checkpoint(self):
+        warnings = validate_realman_server_metadata(
+            {
+                "action_type": "delta_qpos",
+                "action_dim": REALMAN_POLICY_ACTION_DIM_NO_BASE_NO_LIFT,
+                "state_dim": REALMAN_STATE_DIM,
+            }
+        )
+
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("absolute_qpos", warnings[0])
 
     def test_validate_metadata_accepts_no_base_policy_action_dim(self):
         warnings = validate_realman_server_metadata(
@@ -95,6 +132,16 @@ class RealmanPipelineTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "requires the current measured lift_height_mm"):
             expand_policy_action_to_robot_action(policy_action)
+
+    def test_no_base_no_lift_contract_names_and_omitted_indices(self):
+        self.assertEqual(
+            realman_policy_action_names(REALMAN_POLICY_ACTION_DIM_NO_BASE_NO_LIFT),
+            REALMAN_POLICY_ACTION_NAMES_NO_BASE_NO_LIFT,
+        )
+        self.assertEqual(
+            realman_omitted_robot_action_indices(REALMAN_POLICY_ACTION_DIM_NO_BASE_NO_LIFT),
+            (16, 17, 18, 21),
+        )
 
     def test_vr_teleop_observation_adds_trained_source_state(self):
         state = np.arange(REALMAN_STATE_DIM + 2, dtype=np.float32)

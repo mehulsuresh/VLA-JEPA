@@ -1661,7 +1661,10 @@ class VLA_JEPA(baseframework):
         if isinstance(frames, torch.Tensor):
             tensor = frames
         else:
-            tensor = torch.from_numpy(np.ascontiguousarray(frames))
+            array = np.asarray(frames)
+            if not array.flags.c_contiguous or not array.flags.writeable:
+                array = np.array(array, copy=True, order="C")
+            tensor = torch.from_numpy(array)
         if tensor.ndim != 4:
             raise ValueError(f"Expected qwen_frames with shape [V,H,W,C] or [V,C,H,W], got {tuple(tensor.shape)}")
         if tensor.shape[-1] in {1, 3}:
@@ -2870,6 +2873,7 @@ class VLA_JEPA(baseframework):
     def predict_action(
         self,
         batch_images: Optional[List[List[Image.Image]]] = None,
+        qwen_frames: Optional[Sequence[np.ndarray | torch.Tensor]] = None,
         instructions: Optional[List[str]] = None,
         state: Optional[np.ndarray] = None,
         batch: Optional[dict | List[dict]] = None,
@@ -2879,7 +2883,9 @@ class VLA_JEPA(baseframework):
         Inference: single forward pass to predict future actions via flow matching.
 
         Args:
-            batch_images: List of samples; each sample is List[PIL.Image] (multi-view).
+            batch_images: Legacy image-processor input; each sample is a list of images.
+            qwen_frames: Training-aligned tensor input; one ``[V,H,W,C]`` or
+                ``[V,C,H,W]`` RGB frame tensor per sample.
             instructions: Natural language task instructions.
             state: Optional proprioceptive state.
             **kwargs: Reserved.
@@ -2887,6 +2893,11 @@ class VLA_JEPA(baseframework):
         Returns:
             dict with normalized_actions [B, T, action_dim] and embodied_action_tokens.
         """
+        if batch is not None and qwen_frames is not None:
+            raise ValueError("Pass either `batch` or `qwen_frames`, not both.")
+        if qwen_frames is not None and batch_images is not None:
+            raise ValueError("Pass either `qwen_frames` or `batch_images`, not both.")
+
         if batch is not None:
             if isinstance(batch, dict):
                 qwen_inputs = self._move_qwen_inputs(batch["qwen_inputs"])
@@ -2944,7 +2955,29 @@ class VLA_JEPA(baseframework):
                             prompt_replace_dict=prompt_replace_dict,
                             prompt_template=prompt_template,
                         )
+        elif qwen_frames is not None:
+            if instructions is None:
+                raise ValueError("`instructions` is required when `qwen_frames` is provided.")
+            if len(qwen_frames) != len(instructions):
+                raise ValueError(
+                    "Qwen frame/instruction batch mismatch: "
+                    f"got {len(qwen_frames)} frame samples and {len(instructions)} instructions."
+                )
+            prompt_replace_dict, prompt_template = self._resolve_qwen_prompt_args(
+                has_actions=True,
+                has_state=state is not None,
+            )
+            qwen_inputs = self._build_qwen_inputs_from_qwen_frames(
+                qwen_frame_batches=qwen_frames,
+                instructions=instructions,
+                has_actions=True,
+                has_state=state is not None,
+                prompt_replace_dict=prompt_replace_dict,
+                prompt_template=prompt_template,
+            )
         else:
+            if batch_images is None or instructions is None:
+                raise ValueError("`batch_images` and `instructions` are required for legacy image inference.")
             train_obs_image_size = getattr(self.config.datasets.vla_data, "image_size", None)
             if train_obs_image_size:
                 batch_images = resize_images(batch_images, target_size=train_obs_image_size)

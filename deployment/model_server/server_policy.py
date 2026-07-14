@@ -299,6 +299,9 @@ class PolicyOutputJsonlLogger:
         batch_images = payload.get("batch_images")
         if batch_images is not None:
             summary["batch_images"] = self._image_summary(batch_images, sequence_id=sequence_id)
+        qwen_frames = payload.get("qwen_frames")
+        if qwen_frames is not None:
+            summary["qwen_frames"] = self._image_summary(qwen_frames, sequence_id=sequence_id)
         return summary
 
     def _image_summary(self, batch_images: Any, *, sequence_id: int) -> dict[str, Any]:

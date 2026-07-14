@@ -3,6 +3,19 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from deployment.realman.pipeline import (
+    DEFAULT_QWEN_FRAME_SIZE,
+    QWEN_TENSOR_PAYLOAD_KEY,
+    REALMAN_ACTION_DIM,
+    REALMAN_ACTION_NAMES,
+    REALMAN_CAMERA_ORDER,
+    REALMAN_POLICY_ACTION_DIMS,
+    REALMAN_STATE_DIM,
+    REALMAN_STATE_NAMES,
+    realman_omitted_robot_action_indices,
+    realman_policy_action_names,
+)
+
 
 _CAMERA_ORDER_HINTS = {
     "trossen_subtask_combined": ["cam_high", "cam_left_wrist", "cam_right_wrist"],
@@ -185,4 +198,50 @@ def build_policy_metadata(policy, checkpoint_path: str | Path) -> dict[str, Any]
         "camera_order_hint": _CAMERA_ORDER_HINTS.get(data_mix),
         **norm_mode_hints,
     }
+    camera_order_hint = tuple(metadata.get("camera_order_hint") or ())
+    try:
+        action_dim = int(metadata.get("action_dim"))
+        state_dim = int(metadata.get("state_dim"))
+    except (TypeError, ValueError):
+        action_dim = state_dim = -1
+    if (
+        camera_order_hint == REALMAN_CAMERA_ORDER
+        and action_dim in REALMAN_POLICY_ACTION_DIMS
+        and state_dim == REALMAN_STATE_DIM
+    ):
+        omitted_indices = realman_omitted_robot_action_indices(action_dim)
+        qwen_frame_size = metadata.get("video_resolution_size") or DEFAULT_QWEN_FRAME_SIZE
+        qwen_resolution_size = metadata.get("resolution_size")
+        metadata.update(
+            {
+                "policy_action_names": list(realman_policy_action_names(action_dim)),
+                "state_names": list(REALMAN_STATE_NAMES),
+                "robot_action_dim": REALMAN_ACTION_DIM,
+                "robot_action_names": list(REALMAN_ACTION_NAMES),
+                "realman_action_contract": {
+                    "version": 1,
+                    "policy_action_dim": action_dim,
+                    "robot_action_dim": REALMAN_ACTION_DIM,
+                    "omitted_robot_action_indices": list(omitted_indices),
+                    "base_velocity_source": "policy" if action_dim == REALMAN_ACTION_DIM else "zero",
+                    "lift_source": "measured_state" if 21 in omitted_indices else "policy",
+                },
+                "realman_input_contract": {
+                    "version": 1,
+                    "payload_key": QWEN_TENSOR_PAYLOAD_KEY,
+                    "camera_order": list(REALMAN_CAMERA_ORDER),
+                    "frame_shape": [len(REALMAN_CAMERA_ORDER), int(qwen_frame_size), int(qwen_frame_size), 3],
+                    "frame_size": int(qwen_frame_size),
+                    "frame_dtype": "uint8",
+                    "color_space": "RGB",
+                    "transport_encoding": "msgpack_ndarray",
+                    "client_resize": "opencv_inter_linear",
+                    "model_preprocess": "qwen_tensor_fast_path",
+                    "model_resolution_size": int(qwen_resolution_size) if qwen_resolution_size is not None else None,
+                    "state_shape": [1, 1, state_dim],
+                    "state_dtype": "float32",
+                    "state_normalized": True,
+                },
+            }
+        )
     return metadata

@@ -1,86 +1,148 @@
-# Realman Policy Runner
+# Realman VLA-JEPA Deployment
 
-This runner targets the `ogrealman_source_v3` checkpoint schema:
+The production path has one policy process on the GPU workstation and one
+hardware-owning process on the robot:
 
-- images: `observation.images.head`, `observation.images.wrist_left`, `observation.images.wrist_right`
-- state: `source.observation.state`, 19 dims
-- action: `source.action`, 22 dims
-
-Start the generic policy server:
-
-```bash
-cd /home/mehul/work/vjepa/VLA-JEPA
-python deployment/model_server/server_policy.py \
-  --ckpt_path checkpoints/robot_ft_lerobot_ogrealman_source_qwen35_08b_lora_moge_h50_b9_20260605_203520/final_model \
-  --port 10093 \
-  --use_bf16
+```text
+GPU workstation                                Realman robot
+server_policy.py (WebSocket :10093) <-------- robot_unified_teleop.py
+  VLA-JEPA checkpoint                           cameras + measured state
+  normalized 18D action chunk                   safety limits + action execution
+                                                 optional dataset recording
 ```
 
-Validate the server metadata:
+Do not run a second standalone robot adapter beside `robot_unified_teleop.py`.
+The unified process must remain the sole owner of cameras, arms, grippers, head,
+base, lift, takeover, and dataset recording.
+
+## Current Magna Contract
+
+The Magna checkpoint uses:
+
+- cameras, in order: `head`, `wrist_left`, `wrist_right`
+- state: 19D `source.observation.state`
+- model action: 18D absolute joint targets
+- action horizon: 50
+- model action layout: 16 arm/gripper values followed by two head values
+- robot command: 22D
+- deployment expansion: insert zero base velocity at `16:19` and preserve the
+  measured lift height at index `21`
+- prompt: `reach into the bin, lift the chain, put it in the jig, then remove it
+  from the jig and put it in the other bin`
+
+The policy server reports this layout in `realman_action_contract`; the robot
+client must reject incompatible action/state dimensions or non-absolute actions.
+
+The image/state wire contract is also explicit in `realman_input_contract`:
+
+- the robot captures the same `640x480` color streams used for data collection
+- BGR camera buffers are converted to RGB before policy preprocessing
+- each view is resized to `384x384` with OpenCV `INTER_LINEAR`, matching the
+  production dataloader
+- the three views are sent losslessly as msgpack NumPy `uint8` arrays with shape
+  `[B, 3, 384, 384, 3]`
+- the server routes `qwen_frames` through the same Qwen tensor fast path used in
+  training, including its bilinear `384 -> 224` model resize
+- normalized state is finite `float32` with shape `[B, 1, 19]`
+
+Do not pass `--policy-image-size` for the normal Realman path. The robot reads
+the required `384` frame size from checkpoint metadata and rejects mismatches.
+
+## Start The Local Server
+
+An interval checkpoint only needs `model.safetensors`. Keep the run-level
+`config.yaml` and `dataset_statistics.json` above its `checkpoints/` directory:
+
+```text
+checkpoints/<run-id>/
+  config.yaml
+  dataset_statistics.json
+  checkpoints/steps_<N>/model.safetensors
+```
+
+Start the server from the repository root. Training-only V-JEPA and MoGe
+backbones are skipped by default. The action-output guard is enabled unless
+`--disable_action_guard` is explicitly supplied:
 
 ```bash
-python deployment/realman/run_realman_policy.py \
+conda run -n vla-jepa-py313-min --no-capture-output \
+  python deployment/model_server/server_policy.py \
+  --ckpt_path checkpoints/<run-id>/checkpoints/steps_<N> \
+  --host 0.0.0.0 \
+  --port 10093 \
+  --use_bf16 \
+  --policy_output_log_path logs/realman_vlajepa_server.jsonl \
+  --policy_input_image_dir logs/realman_vlajepa_inputs
+```
+
+Validate metadata without touching the robot:
+
+```bash
+conda run -n vla-jepa-py313-min --no-capture-output \
+  python deployment/realman/run_realman_policy.py \
   --host 127.0.0.1 \
   --port 10093 \
   --check-only \
   --print-metadata
 ```
 
-Run one dry inference from an `.npz` observation containing the three image arrays and a 19-dim state:
+## Robot-Side Dry Run
+
+Use the native VLA-JEPA transport, `realman`. `openpi` and
+`--policy-server-address tcp://...` select a different ZMQ protocol and must not
+be used for this server.
+
+First request one action chunk without actuating or recording:
 
 ```bash
-python deployment/realman/run_realman_policy.py \
-  --host 127.0.0.1 \
-  --port 10093 \
-  --observation-npz /path/to/realman_observation.npz \
-  --log-path /tmp/realman_policy.jsonl
+python robot_unified_teleop.py \
+  --policy-server-kind realman \
+  --policy-host 192.168.10.223 \
+  --policy-port 10093 \
+  --policy-instruction "reach into the bin, lift the chain, put it in the jig, then remove it from the jig and put it in the other bin" \
+  --policy-autostart \
+  --policy-dry-run \
+  --no-policy-record-dataset \
+  --policy-num-steps 1 \
+  --policy-fps 20 \
+  --policy-chunk-size 1 \
+  --policy-max-live-chunk-size 1 \
+  --policy-log-path logs/vlajepa_unified_policy_dry_run.jsonl
 ```
 
-For live hardware, pass a small adapter factory:
+Inspect both workstation and robot JSONL logs. Confirm three fresh, correctly
+ordered camera frames; a finite in-range 19D state; an 18D model output; a 22D
+expanded robot command; exactly zero base velocity; and unchanged measured lift.
+`--policy-dry-run` also disables policy-completion and shutdown safe-parking, so
+the validation run must not actuate any subsystem.
+
+The robot JSONL entry includes `policy_input` with frame/state shapes and dtypes.
+The workstation JSONL records per-view hashes and optional PNG paths, normalized
+state values, output tensors, and action-guard acceptance/retry details.
+
+## Guarded Live Rollout
+
+Begin with one action per replan. Keep operator takeover available:
 
 ```bash
-python deployment/realman/run_realman_policy.py \
-  --host 127.0.0.1 \
-  --port 10093 \
-  --robot-module my_realman_adapter:create_robot \
-  --num-steps 100 \
-  --chunk-size 1 \
-  --live \
-  --log-path /tmp/realman_policy_live.jsonl
+python robot_unified_teleop.py \
+  --policy-server-kind realman \
+  --policy-host 192.168.10.223 \
+  --policy-port 10093 \
+  --policy-instruction "reach into the bin, lift the chain, put it in the jig, then remove it from the jig and put it in the other bin" \
+  --policy-autostart \
+  --policy-live \
+  --policy-fps 20 \
+  --policy-chunk-size 1 \
+  --policy-max-live-chunk-size 1 \
+  --policy-record-dataset \
+  --policy-log-path logs/vlajepa_unified_policy.jsonl
 ```
 
-The adapter object must provide `capture_observation()` and may provide `connect()`,
-`disconnect()`, and `send_action(...)`. By default, live actions are sent as a split
-dictionary with arm, gripper, base, head, and lift fields. Use `--send-format vector`
-to send the raw 22-dim vector instead.
+Only increase both chunk settings to `20` after reviewing the dry run and the
+single-step rollout. A chunk of 20 executes 20 predicted absolute targets at
+20 Hz before replanning from a fresh observation.
 
-## Yondu VR Teleop Bridge
-
-The lightweight Realman bridge reuses the data-collection stack from
-`YonduAI/yondu-vr-teleop`:
-
-- observations come from `realman_lerobot.realman_robot.RealmanRobot.capture_observation()`
-- RGB frames come from the same shared-memory `LocalRgbFrameSource` used by recording
-- policy actions go back through `RealmanRobot.send_action()`, which sends arm joints,
-  grippers, base velocity, head joints, and lift height through the teleop session
-
-The teleop camera pipeline must already be publishing RGB shared-memory frames for
-`head,left,right`, just like during collection. Point the bridge at the teleop repo:
-
-```bash
-export YONDU_VR_TELEOP_ROOT=/path/to/yondu-vr-teleop
-```
-
-Then run the policy against the robot:
-
-```bash
-python deployment/realman/run_realman_teleop_policy.py \
-  --host 127.0.0.1 \
-  --port 10093 \
-  --num-steps 100 \
-  --chunk-size 1 \
-  --log-path /tmp/realman_policy_live.jsonl
-```
-
-The wrapper defaults to `--live` with confirmation before each replan. Add
-`--no-confirm-each-replan` only after checking the first few actions.
+The older `run_realman_policy.py` hardware-adapter mode remains useful for
+offline `.npz` tests, but the unified teleop path above is the supported live
+deployment path.

@@ -9,12 +9,20 @@ import numpy as np
 from deployment.trossen.pipeline import (
     DEFAULT_IMAGE_SIZE,
     DEFAULT_NORM_MODE,
+    coerce_rgb_uint8,
     continuous_normalize,
     resize_for_training,
 )
 
 
 REALMAN_CAMERA_ORDER = ("head", "wrist_left", "wrist_right")
+DEFAULT_QWEN_FRAME_SIZE = 384
+QWEN_TENSOR_PAYLOAD_KEY = "qwen_frames"
+
+MAGNA_DEFAULT_INSTRUCTION = (
+    "reach into the bin, lift the chain, put it in the jig, then remove it from "
+    "the jig and put it in the other bin"
+)
 
 REALMAN_ACTION_NAMES = (
     "left_joint_0",
@@ -75,6 +83,33 @@ REALMAN_POLICY_ACTION_DIMS = (
     REALMAN_POLICY_ACTION_DIM_NO_BASE_NO_LIFT,
 )
 
+
+def realman_policy_action_names(action_dim: int) -> tuple[str, ...]:
+    """Return the model-side action layout for a supported Realman checkpoint."""
+    layouts = {
+        REALMAN_ACTION_DIM: REALMAN_ACTION_NAMES,
+        REALMAN_POLICY_ACTION_DIM_NO_BASE: REALMAN_POLICY_ACTION_NAMES_NO_BASE,
+        REALMAN_POLICY_ACTION_DIM_NO_BASE_NO_LIFT: REALMAN_POLICY_ACTION_NAMES_NO_BASE_NO_LIFT,
+    }
+    try:
+        return layouts[int(action_dim)]
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Unsupported Realman policy action dim {action_dim!r}; expected one of "
+            f"{REALMAN_POLICY_ACTION_DIMS}."
+        ) from exc
+
+
+def realman_omitted_robot_action_indices(action_dim: int) -> tuple[int, ...]:
+    """Return 22D robot-command indices not predicted by the policy."""
+    action_dim = int(action_dim)
+    realman_policy_action_names(action_dim)
+    if action_dim == REALMAN_ACTION_DIM:
+        return ()
+    if action_dim == REALMAN_POLICY_ACTION_DIM_NO_BASE:
+        return (16, 17, 18)
+    return (16, 17, 18, 21)
+
 _IMAGE_KEY_ALIASES = {
     "head": (
         "observation.images.head",
@@ -126,6 +161,13 @@ def _lookup_observation_value(observation: dict[str, Any], aliases: Iterable[str
     raise KeyError(f"None of the observation keys are present: {list(aliases)}")
 
 
+def _coerce_realman_rgb_uint8(image: Any) -> np.ndarray:
+    rgb = coerce_rgb_uint8(image)
+    if str(getattr(image, "_yondu_color_space", "")).strip().lower() == "bgr":
+        rgb = rgb[:, :, ::-1]
+    return np.ascontiguousarray(rgb, dtype=np.uint8)
+
+
 def extract_ordered_images(
     observation: dict[str, Any],
     camera_order: Iterable[str] = REALMAN_CAMERA_ORDER,
@@ -140,7 +182,7 @@ def extract_ordered_images(
         except KeyError:
             missing.append(camera_name)
             continue
-        images.append(resize_for_training(image, image_size=image_size))
+        images.append(resize_for_training(_coerce_realman_rgb_uint8(image), image_size=image_size))
 
     if missing:
         raise KeyError(
@@ -149,6 +191,43 @@ def extract_ordered_images(
             f"{ {name: _IMAGE_KEY_ALIASES.get(name, (name,)) for name in missing} }"
         )
     return images
+
+
+def resize_for_qwen_tensor_path(image: Any, image_size: int = DEFAULT_QWEN_FRAME_SIZE) -> np.ndarray:
+    """Match the CPU resize performed by the production training dataloader."""
+    import cv2
+
+    size = int(image_size)
+    if size <= 0:
+        raise ValueError(f"Qwen tensor frame size must be positive, got {image_size!r}.")
+    rgb = _coerce_realman_rgb_uint8(image)
+    resized = cv2.resize(rgb, (size, size), interpolation=cv2.INTER_LINEAR)
+    return np.ascontiguousarray(resized, dtype=np.uint8)
+
+
+def extract_ordered_qwen_frames(
+    observation: dict[str, Any],
+    camera_order: Iterable[str] = REALMAN_CAMERA_ORDER,
+    image_size: int = DEFAULT_QWEN_FRAME_SIZE,
+) -> np.ndarray:
+    frames: list[np.ndarray] = []
+    missing: list[str] = []
+    for camera_name in camera_order:
+        aliases = _IMAGE_KEY_ALIASES.get(camera_name, (camera_name,))
+        try:
+            image = _lookup_observation_value(observation, aliases)
+        except KeyError:
+            missing.append(camera_name)
+            continue
+        frames.append(resize_for_qwen_tensor_path(image, image_size=image_size))
+
+    if missing:
+        raise KeyError(
+            "Observation is missing Realman camera(s) "
+            f"{missing}. Expected aliases: "
+            f"{ {name: _IMAGE_KEY_ALIASES.get(name, (name,)) for name in missing} }"
+        )
+    return np.ascontiguousarray(np.stack(frames, axis=0), dtype=np.uint8)
 
 
 def extract_state_vector(observation: dict[str, Any]) -> np.ndarray:
@@ -176,19 +255,78 @@ def build_policy_payload(
     observation: dict[str, Any],
     instruction: str,
     camera_order: Iterable[str] = REALMAN_CAMERA_ORDER,
-    image_size: int = DEFAULT_IMAGE_SIZE,
+    image_size: int = DEFAULT_QWEN_FRAME_SIZE,
     state_stats: dict[str, Any] | None = None,
     state_norm_mode: str | None = None,
 ) -> dict[str, Any]:
     state = extract_state_vector(observation)
     if state_stats is not None:
         state = continuous_normalize(state, state_stats, mode=state_norm_mode or DEFAULT_NORM_MODE)
-    images = extract_ordered_images(observation, camera_order=camera_order, image_size=image_size)
+    frames = extract_ordered_qwen_frames(observation, camera_order=camera_order, image_size=image_size)
     return {
-        "batch_images": [images],
+        QWEN_TENSOR_PAYLOAD_KEY: [frames],
         "instructions": [instruction],
-        "state": state[None, None, :],
+        "state": np.ascontiguousarray(state[None, None, :], dtype=np.float32),
     }
+
+
+def resolve_qwen_frame_size(metadata: dict[str, Any], explicit_size: int | None = None) -> int:
+    contract = metadata.get("realman_input_contract") or {}
+    configured_size = contract.get("frame_size", metadata.get("video_resolution_size"))
+    try:
+        expected_size = int(configured_size)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Server metadata does not define a valid Realman Qwen frame size.") from exc
+    if expected_size <= 0:
+        raise ValueError(f"Server reports invalid Realman Qwen frame size {expected_size}.")
+
+    if explicit_size is not None and int(explicit_size) > 0 and int(explicit_size) != expected_size:
+        raise ValueError(
+            f"Requested image size {int(explicit_size)} does not match the checkpoint's "
+            f"training-aligned Qwen frame size {expected_size}."
+        )
+    return expected_size
+
+
+def validate_realman_policy_payload(
+    payload: dict[str, Any],
+    metadata: dict[str, Any],
+    *,
+    require_normalized_bounds: bool = True,
+) -> None:
+    contract = metadata.get("realman_input_contract") or {}
+    payload_key = str(contract.get("payload_key") or QWEN_TENSOR_PAYLOAD_KEY)
+    if payload_key != QWEN_TENSOR_PAYLOAD_KEY:
+        raise ValueError(
+            f"Unsupported Realman payload key {payload_key!r}; expected {QWEN_TENSOR_PAYLOAD_KEY!r}."
+        )
+    if payload_key not in payload:
+        raise KeyError(f"Policy payload is missing `{payload_key}`.")
+
+    frame_size = resolve_qwen_frame_size(metadata)
+    frames = np.asarray(payload[payload_key])
+    expected_shape = (1, len(REALMAN_CAMERA_ORDER), frame_size, frame_size, 3)
+    if frames.shape != expected_shape:
+        raise ValueError(f"Qwen frame shape is {frames.shape}, expected {expected_shape}.")
+    if frames.dtype != np.uint8:
+        raise ValueError(f"Qwen frame dtype is {frames.dtype}, expected uint8.")
+
+    instructions = payload.get("instructions")
+    if not isinstance(instructions, (list, tuple)) or len(instructions) != 1:
+        raise ValueError("Policy payload must contain exactly one instruction.")
+    if not isinstance(instructions[0], str) or not instructions[0].strip():
+        raise ValueError("Policy instruction must be a non-empty string.")
+
+    state = np.asarray(payload.get("state"))
+    expected_state_shape = (1, 1, REALMAN_STATE_DIM)
+    if state.shape != expected_state_shape:
+        raise ValueError(f"Policy state shape is {state.shape}, expected {expected_state_shape}.")
+    if state.dtype != np.float32:
+        raise ValueError(f"Policy state dtype is {state.dtype}, expected float32.")
+    if not np.all(np.isfinite(state)):
+        raise ValueError("Policy state contains NaN or Inf.")
+    if require_normalized_bounds and np.any(np.abs(state) > 1.00001):
+        raise ValueError("Normalized policy state contains values outside [-1, 1].")
 
 
 def validate_realman_server_metadata(
@@ -196,8 +334,9 @@ def validate_realman_server_metadata(
     *,
     expected_action_dim: int | Iterable[int] | None = REALMAN_POLICY_ACTION_DIMS,
     expected_state_dim: int = REALMAN_STATE_DIM,
-    expected_action_type: str | None = None,
+    expected_action_type: str | None = "absolute_qpos",
     expected_camera_order: Iterable[str] = REALMAN_CAMERA_ORDER,
+    require_input_contract: bool = False,
 ) -> list[str]:
     warnings: list[str] = []
     if expected_action_type is not None and metadata.get("action_type") != expected_action_type:
@@ -233,12 +372,59 @@ def validate_realman_server_metadata(
             f"Server reports state_dim={metadata.get('state_dim')}, expected {expected_state_dim}."
         )
 
+    reported_action_names = metadata.get("policy_action_names")
+    if action_dim_ok and reported_action_names is not None:
+        expected_names = realman_policy_action_names(int(reported_action_dim))
+        if tuple(reported_action_names) != expected_names:
+            warnings.append(
+                "Server policy_action_names do not match the reported Realman "
+                f"action_dim={reported_action_dim}."
+            )
+
+    robot_action_dim = metadata.get("robot_action_dim")
+    if robot_action_dim is not None and int(robot_action_dim) != REALMAN_ACTION_DIM:
+        warnings.append(
+            f"Server reports robot_action_dim={robot_action_dim}, expected {REALMAN_ACTION_DIM}."
+        )
+
     camera_hint = metadata.get("camera_order_hint")
     if camera_hint is not None and list(camera_hint) != list(expected_camera_order):
         warnings.append(
             f"Server camera hint {camera_hint} does not match Realman camera order "
             f"{list(expected_camera_order)}."
         )
+
+    input_contract = metadata.get("realman_input_contract")
+    if require_input_contract and not isinstance(input_contract, dict):
+        warnings.append("Server metadata does not include `realman_input_contract`.")
+    elif isinstance(input_contract, dict):
+        expected_contract_values = {
+            "payload_key": QWEN_TENSOR_PAYLOAD_KEY,
+            "camera_order": list(expected_camera_order),
+            "frame_dtype": "uint8",
+            "color_space": "RGB",
+            "transport_encoding": "msgpack_ndarray",
+            "client_resize": "opencv_inter_linear",
+            "model_preprocess": "qwen_tensor_fast_path",
+            "state_shape": [1, 1, expected_state_dim],
+            "state_dtype": "float32",
+            "state_normalized": True,
+        }
+        for key, expected in expected_contract_values.items():
+            if input_contract.get(key) != expected:
+                warnings.append(
+                    f"Server realman_input_contract.{key}={input_contract.get(key)!r}, expected {expected!r}."
+                )
+        expected_frame_size = metadata.get("video_resolution_size")
+        if expected_frame_size is not None:
+            try:
+                frame_size_ok = int(input_contract.get("frame_size")) == int(expected_frame_size)
+            except (TypeError, ValueError):
+                frame_size_ok = False
+            if not frame_size_ok:
+                warnings.append(
+                    "Server realman_input_contract.frame_size does not match video_resolution_size."
+                )
     return warnings
 
 

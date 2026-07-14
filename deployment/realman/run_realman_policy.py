@@ -23,7 +23,8 @@ from deployment.trossen.pipeline import (
     resolve_state_stats,
 )
 from deployment.realman.pipeline import (
-    DEFAULT_IMAGE_SIZE,
+    DEFAULT_QWEN_FRAME_SIZE,
+    MAGNA_DEFAULT_INSTRUCTION,
     REALMAN_ACTION_DIM,
     REALMAN_ACTION_NAMES,
     REALMAN_CAMERA_ORDER,
@@ -35,17 +36,16 @@ from deployment.realman.pipeline import (
     extract_state_vector,
     json_safe,
     load_observation_npz,
+    resolve_qwen_frame_size,
     split_action_chunk,
     split_action_vector,
     validate_realman_server_metadata,
+    validate_realman_policy_payload,
     write_jsonl,
 )
 
 
-DEFAULT_INSTRUCTION = (
-    "reach into the bin, pickup the metal chain with both hands, place it on the jig "
-    "and align the corners to fit into the recessed channel."
-)
+DEFAULT_INSTRUCTION = MAGNA_DEFAULT_INSTRUCTION
 
 
 def build_argparser() -> argparse.ArgumentParser:
@@ -54,7 +54,15 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--port", type=int, default=10093)
     parser.add_argument("--instruction", type=str, default=DEFAULT_INSTRUCTION)
     parser.add_argument("--unnorm-key", type=str, default=None)
-    parser.add_argument("--image-size", type=int, default=DEFAULT_IMAGE_SIZE)
+    parser.add_argument(
+        "--image-size",
+        type=int,
+        default=0,
+        help=(
+            "Training-side Qwen frame size. Default 0 reads the required value from server metadata "
+            f"({DEFAULT_QWEN_FRAME_SIZE} for current Realman checkpoints)."
+        ),
+    )
     parser.add_argument("--fps", type=float, default=10.0)
     parser.add_argument("--num-steps", type=int, default=1)
     parser.add_argument("--chunk-size", type=int, default=1)
@@ -152,6 +160,7 @@ def _infer_once(
         state_stats=state_stats,
         state_norm_mode=state_norm_mode,
     )
+    validate_realman_policy_payload(payload, client.get_server_metadata())
     started = time.perf_counter()
     response = client.infer(payload)
     latency_ms = (time.perf_counter() - started) * 1000.0
@@ -281,7 +290,7 @@ def main(args: argparse.Namespace) -> None:
     if args.print_metadata:
         print(json.dumps(json_safe(metadata), indent=2))
 
-    warnings = validate_realman_server_metadata(metadata)
+    warnings = validate_realman_server_metadata(metadata, require_input_contract=True)
     for warning in warnings:
         logging.warning(warning)
     if warnings and not args.allow_metadata_mismatch:
@@ -297,6 +306,7 @@ def main(args: argparse.Namespace) -> None:
         state_stats = None
     action_norm_mode = resolve_norm_mode(metadata, "action", args.action_norm_mode)
     state_norm_mode = resolve_norm_mode(metadata, "state", args.state_norm_mode)
+    args.image_size = resolve_qwen_frame_size(metadata, args.image_size)
 
     action_horizon = int(metadata["action_horizon"])
     if int(metadata["action_dim"]) not in REALMAN_POLICY_ACTION_DIMS or int(metadata["state_dim"]) != REALMAN_STATE_DIM:
