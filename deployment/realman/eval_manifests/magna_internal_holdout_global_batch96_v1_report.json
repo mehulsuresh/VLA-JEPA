@@ -1222,8 +1222,8 @@
     "holdout": {
       "deltas_vs_full": {
         "full_valid_frame_fraction": 0.9006271476402256,
-        "mean_episode_length_delta_frames": 56.838369963369814,
-        "mean_episode_length_delta_percent": 3.7958802002044933,
+        "mean_episode_length_delta_frames": 50.588369963369814,
+        "mean_episode_length_delta_percent": 3.3784816846142762,
         "source_cohort_episode_fraction": {
           "base_cleaned_v5": {
             "delta_percentage_points": -0.5341880341880323,
@@ -1246,16 +1246,14 @@
             "split_fraction": 0.020833333333333332
           }
         },
-        "valid_frame_fraction": 0.9174687005710302,
-        "valid_frame_fraction_delta_percentage_points": 1.6841552930804693
+        "valid_frame_fraction": 0.9305940620710075,
+        "valid_frame_fraction_delta_percentage_points": 2.996691443078192
       },
       "episode_count": 96,
       "episode_valid_fraction": {
-        "all_invalid_episode_count": 1,
-        "all_invalid_episode_ids": [
-          955
-        ],
-        "all_valid_episode_count": 64,
+        "all_invalid_episode_count": 0,
+        "all_invalid_episode_ids": [],
+        "all_valid_episode_count": 65,
         "all_valid_episode_ids": [
           16,
           37,
@@ -1318,30 +1316,31 @@
           1364,
           1382,
           1411,
+          1440,
           1445,
           1453,
           1509
         ],
         "max": 1.0,
-        "mean": 0.9543832586906061,
-        "min": 0.0,
+        "mean": 0.9647999253572728,
+        "min": 0.4962172647914646,
         "mixed_episode_count": 31
       },
-      "frame_count": 149204,
+      "frame_count": 148604,
       "length": {
         "count": 96,
-        "frames": 149204,
+        "frames": 148604,
         "max": 6605,
-        "mean": 1554.2083333333333,
+        "mean": 1547.9583333333333,
         "min": 366,
         "q01": 461.0,
         "q10": 653.0,
         "q25": 784.0,
         "q50": 1115.0,
-        "q75": 1548.5,
+        "q75": 1529.5,
         "q90": 3290.0,
         "q99": 5735.749999999997,
-        "std": 1319.7155621309296
+        "std": 1319.010123766009
       },
       "source_cohort_episode_counts": {
         "base_cleaned_v5": 84,
@@ -1350,7 +1349,7 @@
         "v6_latest_append": 2
       },
       "source_cohort_frame_counts": {
-        "base_cleaned_v5": 109942,
+        "base_cleaned_v5": 109342,
         "intervention_append_20260701_to_20260709": 31552,
         "intervention_append_20260709_to_20260710": 4756,
         "v6_latest_append": 2954
@@ -1360,38 +1359,38 @@
         "1": 940,
         "11": 2285,
         "2": 12900,
-        "3": 7585,
-        "4": 7565,
-        "5": 9345,
-        "6": 51979,
-        "7": 3027
+        "3": 7045,
+        "4": 7205,
+        "5": 9375,
+        "6": 51659,
+        "7": 3617
       },
       "task_id_frame_counts": {
-        "-1": 102229,
+        "-1": 100229,
         "0": 36413,
         "11": 64,
         "2": 1583,
         "3": 1110,
         "4": 490,
-        "5": 1479,
-        "6": 5385,
-        "7": 451
+        "5": 1827,
+        "6": 5800,
+        "7": 1088
       },
       "valid_state_frame_counts": {
-        "0": 12314,
-        "1": 136890
+        "0": 10314,
+        "1": 138290
       },
       "valid_state_source_frame_counts": {
-        "0": 81394,
-        "1": 62670,
+        "0": 82794,
+        "1": 60670,
         "2": 5140
       }
     },
     "train": {
       "deltas_vs_full": {
         "full_valid_frame_fraction": 0.9006271476402256,
-        "mean_episode_length_delta_frames": -3.5385755619220163,
-        "mean_episode_length_delta_percent": -0.23631938989601142,
+        "mean_episode_length_delta_frames": -3.149470503556131,
+        "mean_episode_length_delta_percent": -0.21033349009271785,
         "source_cohort_episode_fraction": {
           "base_cleaned_v5": {
             "delta_percentage_points": 0.03325684259536388,
@@ -1414,12 +1413,12 @@
             "split_fraction": 0.020103761348897537
           }
         },
-        "valid_frame_fraction": 0.8995362684763281,
-        "valid_frame_fraction_delta_percentage_points": -0.10908791638974957
+        "valid_frame_fraction": 0.8986944075052689,
+        "valid_frame_fraction_delta_percentage_points": -0.19327401349567008
       },
       "episode_count": 1542,
       "episode_valid_fraction": {
-        "all_invalid_episode_count": 23,
+        "all_invalid_episode_count": 24,
         "all_invalid_episode_ids": [
           73,
           293,
@@ -1428,6 +1427,7 @@
           543,
           846,
           879,
+          955,
           1126,
           1151,
           1233,
@@ -1445,7 +1445,7 @@
           1600,
           1619
         ],
-        "all_valid_episode_count": 1026,
+        "all_valid_episode_count": 1025,
         "all_valid_episode_ids": [
           0,
           2,
@@ -2424,7 +2424,6 @@
           1437,
           1438,
           1439,
-          1440,
           1441,
           1442,
           1444,
@@ -2475,25 +2474,25 @@
           1594
         ],
         "max": 1.0,
-        "mean": 0.9417334682563281,
+        "mean": 0.9410849598257184,
         "min": 0.0,
         "mixed_episode_count": 493
       },
-      "frame_count": 2303488,
+      "frame_count": 2304088,
       "length": {
         "count": 1542,
-        "frames": 2303488,
+        "frames": 2304088,
         "max": 13664,
-        "mean": 1493.8313878080414,
+        "mean": 1494.2204928664073,
         "min": 90,
         "q01": 436.41,
         "q10": 618.0,
         "q25": 795.0,
         "q50": 1130.0,
-        "q75": 1645.75,
+        "q75": 1652.75,
         "q90": 2810.4000000000024,
         "q99": 6731.769999999975,
-        "std": 1234.973393056287
+        "std": 1235.0382879303672
       },
       "source_cohort_episode_counts": {
         "base_cleaned_v5": 1358,
@@ -2502,7 +2501,7 @@
         "v6_latest_append": 31
       },
       "source_cohort_frame_counts": {
-        "base_cleaned_v5": 1718528,
+        "base_cleaned_v5": 1719128,
         "intervention_append_20260701_to_20260709": 387285,
         "intervention_append_20260709_to_20260710": 140927,
         "v6_latest_append": 56748
@@ -2513,16 +2512,16 @@
         "10": 170,
         "11": 37090,
         "2": 218556,
-        "3": 182908,
-        "4": 129001,
-        "5": 155767,
-        "6": 826801,
-        "7": 92471,
+        "3": 183448,
+        "4": 129361,
+        "5": 155737,
+        "6": 827121,
+        "7": 91881,
         "8": 330,
         "9": 80
       },
       "task_id_frame_counts": {
-        "-1": 1510955,
+        "-1": 1512955,
         "0": 531161,
         "1": 1260,
         "10": 603,
@@ -2530,32 +2529,32 @@
         "2": 26977,
         "3": 22132,
         "4": 12301,
-        "5": 34096,
-        "6": 122888,
-        "7": 36935,
+        "5": 33748,
+        "6": 122473,
+        "7": 36298,
         "8": 370,
         "9": 387
       },
       "valid_state_frame_counts": {
-        "0": 231417,
-        "1": 2072071
+        "0": 233417,
+        "1": 2070671
       },
       "valid_state_source_frame_counts": {
-        "0": 1257032,
-        "1": 979092,
+        "0": 1255632,
+        "1": 981092,
         "2": 67364
       }
     }
   },
   "manifest_path": "/home/mehul/work/vjepa/VLA-JEPA/deployment/realman/eval_manifests/magna_internal_holdout_global_batch96_v1.json",
-  "manifest_sha256": "293e2d263ccbf48b49816d873a0f3445222cd76939eb8bac960a570a3f85c51a",
+  "manifest_sha256": "e065228039adc849032ecf6afe6297e5c5813b68e77629d65df6c00828fe811c",
   "schema_version": 1,
   "selection": {
     "eligibility": {
       "action_horizon": 50,
       "action_max_offset": 49,
       "action_min_offset": 0,
-      "eligible_episode_count": 1638,
+      "eligible_episode_count": 1614,
       "evaluation_video_offsets": [
         0
       ],
@@ -2566,8 +2565,129 @@
         "vj_video_target_shift_steps": 2
       },
       "full_complete_episode_count": 1638,
-      "ineligible_episode_count": 0,
-      "ineligible_episodes": [],
+      "ineligible_episode_count": 24,
+      "ineligible_episodes": [
+        {
+          "episode_id": 73,
+          "length": 1615,
+          "reason": "no structurally unpadded action window has a supervised element under valid_state sustained-invalid-prefix masking"
+        },
+        {
+          "episode_id": 293,
+          "length": 669,
+          "reason": "no structurally unpadded action window has a supervised element under valid_state sustained-invalid-prefix masking"
+        },
+        {
+          "episode_id": 314,
+          "length": 812,
+          "reason": "no structurally unpadded action window has a supervised element under valid_state sustained-invalid-prefix masking"
+        },
+        {
+          "episode_id": 409,
+          "length": 840,
+          "reason": "no structurally unpadded action window has a supervised element under valid_state sustained-invalid-prefix masking"
+        },
+        {
+          "episode_id": 543,
+          "length": 1235,
+          "reason": "no structurally unpadded action window has a supervised element under valid_state sustained-invalid-prefix masking"
+        },
+        {
+          "episode_id": 846,
+          "length": 958,
+          "reason": "no structurally unpadded action window has a supervised element under valid_state sustained-invalid-prefix masking"
+        },
+        {
+          "episode_id": 879,
+          "length": 521,
+          "reason": "no structurally unpadded action window has a supervised element under valid_state sustained-invalid-prefix masking"
+        },
+        {
+          "episode_id": 955,
+          "length": 2000,
+          "reason": "no structurally unpadded action window has a supervised element under valid_state sustained-invalid-prefix masking"
+        },
+        {
+          "episode_id": 1126,
+          "length": 502,
+          "reason": "no structurally unpadded action window has a supervised element under valid_state sustained-invalid-prefix masking"
+        },
+        {
+          "episode_id": 1151,
+          "length": 528,
+          "reason": "no structurally unpadded action window has a supervised element under valid_state sustained-invalid-prefix masking"
+        },
+        {
+          "episode_id": 1233,
+          "length": 5200,
+          "reason": "no structurally unpadded action window has a supervised element under valid_state sustained-invalid-prefix masking"
+        },
+        {
+          "episode_id": 1249,
+          "length": 2420,
+          "reason": "no structurally unpadded action window has a supervised element under valid_state sustained-invalid-prefix masking"
+        },
+        {
+          "episode_id": 1275,
+          "length": 4800,
+          "reason": "no structurally unpadded action window has a supervised element under valid_state sustained-invalid-prefix masking"
+        },
+        {
+          "episode_id": 1278,
+          "length": 2660,
+          "reason": "no structurally unpadded action window has a supervised element under valid_state sustained-invalid-prefix masking"
+        },
+        {
+          "episode_id": 1280,
+          "length": 3860,
+          "reason": "no structurally unpadded action window has a supervised element under valid_state sustained-invalid-prefix masking"
+        },
+        {
+          "episode_id": 1342,
+          "length": 1540,
+          "reason": "no structurally unpadded action window has a supervised element under valid_state sustained-invalid-prefix masking"
+        },
+        {
+          "episode_id": 1381,
+          "length": 720,
+          "reason": "no structurally unpadded action window has a supervised element under valid_state sustained-invalid-prefix masking"
+        },
+        {
+          "episode_id": 1397,
+          "length": 660,
+          "reason": "no structurally unpadded action window has a supervised element under valid_state sustained-invalid-prefix masking"
+        },
+        {
+          "episode_id": 1414,
+          "length": 553,
+          "reason": "no structurally unpadded action window has a supervised element under valid_state sustained-invalid-prefix masking"
+        },
+        {
+          "episode_id": 1433,
+          "length": 1260,
+          "reason": "no structurally unpadded action window has a supervised element under valid_state sustained-invalid-prefix masking"
+        },
+        {
+          "episode_id": 1473,
+          "length": 1288,
+          "reason": "no structurally unpadded action window has a supervised element under valid_state sustained-invalid-prefix masking"
+        },
+        {
+          "episode_id": 1568,
+          "length": 1153,
+          "reason": "no structurally unpadded action window has a supervised element under valid_state sustained-invalid-prefix masking"
+        },
+        {
+          "episode_id": 1600,
+          "length": 813,
+          "reason": "no structurally unpadded action window has a supervised element under valid_state sustained-invalid-prefix masking"
+        },
+        {
+          "episode_id": 1619,
+          "length": 90,
+          "reason": "no structurally unpadded action window has a supervised element under valid_state sustained-invalid-prefix masking"
+        }
+      ],
       "minimum_episode_length": 50,
       "observation_mode": "deployment_action_current_qwen_rgb_v1",
       "qwen_observation_frame_index": "current",
@@ -2578,7 +2698,7 @@
       ]
     },
     "holdout_episode_count": 96,
-    "holdout_frame_count": 149204,
+    "holdout_frame_count": 148604,
     "minimum_selected_episode_length": 366,
     "selected_episode_ids_in_rank_order": [
       244,
@@ -2636,7 +2756,6 @@
       713,
       159,
       770,
-      955,
       1080,
       631,
       305,
@@ -2676,7 +2795,8 @@
       439,
       816,
       989,
-      936
+      936,
+      1440
     ],
     "selected_episode_ids_sorted": [
       16,
@@ -2735,7 +2855,6 @@
       888,
       915,
       936,
-      955,
       962,
       983,
       989,
@@ -2763,6 +2882,7 @@
       1364,
       1382,
       1411,
+      1440,
       1445,
       1453,
       1478,
@@ -2929,7 +3049,6 @@
         888,
         915,
         936,
-        955,
         962,
         983,
         989,
@@ -2956,14 +3075,15 @@
         1341,
         1364,
         1382,
-        1411
+        1411,
+        1440
       ]
     },
     "train_episode_count": 1542,
-    "train_frame_count": 2303488
+    "train_frame_count": 2304088
   },
   "statistics": {
-    "frame_count": 2303488,
+    "frame_count": 2304088,
     "image_statistics_included": false,
     "image_statistics_note": "Image tensors use fixed model preprocessing; no dataset image statistics are consumed by the state/action normalizer.",
     "numeric_columns": [
@@ -2984,5 +3104,5 @@
     "scope": "train_split_only"
   },
   "statistics_path": "/home/mehul/work/vjepa/VLA-JEPA/deployment/realman/eval_manifests/artifacts/magna_internal_holdout_global_batch96_v1_train_stats.json",
-  "statistics_sha256": "a5ebd2fa7caee19f36c81be097b18004911bd12affb67045db938736e4553170"
+  "statistics_sha256": "d4b0a6e796f28b48c53f56e87254bd85f90b167ff0c0f540750decb8b29de333"
 }

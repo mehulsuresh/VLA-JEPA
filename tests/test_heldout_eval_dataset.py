@@ -5,16 +5,39 @@ import numpy as np
 import pandas as pd
 import pytest
 import torch
+from torch.utils.data import BatchSampler, SequentialSampler
+from accelerate.data_loader import BatchSamplerShard
 from omegaconf import OmegaConf
 
 from starVLA.dataloader import _build_eval_lerobot_data_cfg
 from starVLA.dataloader.gr00t_lerobot.datasets import LeRobotMixtureDataset
 from starVLA.dataloader.heldout_eval import (
     DeterministicHeldoutEvalDataset,
+    _candidate_control_diagnostics,
     load_evaluation_sampling_contract,
     required_window_offsets,
     validate_global_eval_observation_count,
 )
+
+
+class _SplitSelection(SimpleNamespace):
+    def provenance(self):
+        return {
+            "manifest_path": "/fixture/split.json",
+            "manifest_sha256": "1" * 64,
+            "role": self.role,
+            "selected_episode_count": len(self.selected_episode_ids),
+            "selected_episode_set_sha256": "2" * 64,
+            "selected_frame_count": 200,
+            "train_episode_count": 10,
+            "train_episode_set_sha256": "3" * 64,
+            "train_frame_count": 1000,
+            "holdout_episode_count": len(self.selected_episode_ids),
+            "holdout_episode_set_sha256": "2" * 64,
+            "full_catalog_sha256": "4" * 64,
+            "train_statistics_path": "/fixture/train_stats.json",
+            "train_statistics_sha256": "5" * 64,
+        }
 
 
 class _EpisodeDataset:
@@ -46,7 +69,7 @@ class _EpisodeDataset:
             "action_validity_positive_is_valid": True,
             "action_validity_invalid_run_length": 3,
         }
-        self._episode_split_selection = SimpleNamespace(
+        self._episode_split_selection = _SplitSelection(
             role="eval",
             selected_episode_ids=(7, 9),
         )
@@ -69,6 +92,83 @@ class _EpisodeDataset:
         self.parquet_cache_close_count += 1
         self.curr_traj_id = None
         self.curr_traj_data = None
+
+
+class _FocusedEpisodeDataset(_EpisodeDataset):
+    def __init__(self):
+        super().__init__()
+        self.trajectory_lengths = np.asarray([70, 70], dtype=np.int64)
+        self.all_steps = [
+            (episode_id, step)
+            for episode_id in self.trajectory_ids.tolist()
+            for step in range(70)
+        ]
+        self.modality_keys = {
+            "video": ["video.cam"],
+            "state": ["state.source"],
+            "action": ["action.source_controls"],
+            "language": ["language.task"],
+        }
+        self.delta_indices = {
+            "video.cam": np.asarray([0]),
+            "state.source": np.asarray([0]),
+            "action.source_controls": np.arange(50, dtype=np.int64),
+            "language.task": np.asarray([0]),
+        }
+        self.lerobot_modality_meta = SimpleNamespace(
+            action={
+                "source_controls": SimpleNamespace(
+                    original_key="source.action", start=0, end=18
+                )
+            },
+            state={
+                "source": SimpleNamespace(
+                    original_key="source.observation.state", start=0, end=19
+                )
+            },
+        )
+        self.metadata = SimpleNamespace(
+            modalities=SimpleNamespace(
+                action={
+                    "source_controls": SimpleNamespace(shape=(18,))
+                }
+            ),
+            statistics=SimpleNamespace(
+                action={
+                    "source_controls": SimpleNamespace(
+                        min=np.zeros(18, dtype=np.float32),
+                        max=np.ones(18, dtype=np.float32),
+                    )
+                }
+            )
+        )
+        self.transforms = None
+        self._frames = {}
+        for episode_id, stage in ((7, 2), (9, 3)):
+            actions = np.ones((70, 18), dtype=np.float32)
+            states = np.ones((70, 19), dtype=np.float32)
+            # Every possible focused candidate near this event sees a genuine
+            # open->close transition in its first ten targets.
+            actions[8:, [7, 15]] = 0.0
+            states[8:, [7, 15]] = 0.0
+            self._frames[episode_id] = pd.DataFrame(
+                {
+                    "valid_state": np.ones(70, dtype=np.float32),
+                    "subtask_index": np.full(70, stage, dtype=np.int64),
+                    "source.action": list(actions),
+                    "source.observation.state": list(states),
+                }
+            )
+
+
+def _focused_mixture():
+    mixture = object.__new__(LeRobotMixtureDataset)
+    mixture.datasets = [_FocusedEpisodeDataset()]
+    mixture.video_target_shift_steps = 0
+    mixture.video_frame_stride = 1
+    mixture.use_action_validity_prefix_mask = True
+    mixture.action_validity_invalid_run_length = 3
+    return mixture
 
 
 def _mixture():
@@ -204,6 +304,86 @@ def test_eval_loader_generator_is_dedicated(tmp_path):
     assert torch.equal(torch.random.get_rng_state(), global_state)
 
 
+def test_legacy_underfilled_audit_excludes_zero_valid_without_replacement(
+    tmp_path,
+):
+    dataset = DeterministicHeldoutEvalDataset.from_manifest(
+        _mixture(),
+        _manifest(tmp_path),
+        action_dim=2,
+        legacy_underfilled_eval=True,
+        legacy_excluded_zero_valid_episode_ids=(9,),
+    )
+
+    assert dataset.original_manifest_observation_count == 2
+    assert len(dataset) == 1
+    assert [item.episode_id for item in dataset.heldout_window_references] == [7]
+    report = dataset.sampling_report()
+    assert report["production_valid"] is False
+    assert report["checkpoint_selection_eligible"] is False
+    assert report["zero_valid_action_episodes"] == []
+    assert report["legacy_underfilled_holdout"] == {
+        "enabled": True,
+        "original_manifest_observation_count": 2,
+        "evaluated_observation_count": 1,
+        "excluded_zero_valid_episodes": [
+            {
+                "dataset_name": "fixture",
+                "episode_id": 9,
+                "base_index": next(
+                    item.base_index
+                    for item in DeterministicHeldoutEvalDataset.from_manifest(
+                        _mixture(), _manifest(tmp_path), action_dim=2
+                    ).heldout_window_references
+                    if item.episode_id == 9
+                ),
+                "reason": (
+                    "no structurally valid window has a supervised action element"
+                ),
+            }
+        ],
+        "replacement_episode_ids": [],
+        "no_replacement_no_training_leak": True,
+        "reason": (
+            "Historical checkpoint audit only: the frozen original holdout "
+            "contained zero-supervision episodes."
+        ),
+    }
+
+    with pytest.raises(ValueError, match="exclude exactly the explicit"):
+        DeterministicHeldoutEvalDataset.from_manifest(
+            _mixture(),
+            _manifest(tmp_path),
+            action_dim=2,
+            legacy_underfilled_eval=True,
+            legacy_excluded_zero_valid_episode_ids=(7,),
+        )
+
+
+def test_legacy_95_view_distributed_sharding_never_pads_or_duplicates():
+    source = list(range(95))
+    global_batch_sampler = BatchSampler(
+        SequentialSampler(source), batch_size=12, drop_last=False
+    )
+    rank_batches = [
+        list(
+            BatchSamplerShard(
+                global_batch_sampler,
+                num_processes=8,
+                process_index=rank,
+                split_batches=False,
+                even_batches=False,
+            )
+        )
+        for rank in range(8)
+    ]
+
+    assert all(len(batches) == 1 for batches in rank_batches)
+    visited = [index for batches in rank_batches for batch in batches for index in batch]
+    assert sorted(visited) == source
+    assert len(visited) == len(set(visited)) == 95
+
+
 def test_sampling_is_uniform_over_all_nonzero_valid_unpadded_candidates(tmp_path):
     mixture = _mixture()
     alternating = (np.arange(100) % 2 == 0).astype(np.float32)
@@ -265,3 +445,83 @@ def test_eval_cache_config_is_independent_and_capped_at_one():
     assert eval_cfg.lerobot_v3_parquet_cache_size == 1
     assert train_cfg.lerobot_v3_parquet_cache_size == 5
     assert eval_cfg.video_target_shift_steps == train_cfg.video_target_shift_steps == 2
+
+
+def test_focused_view_is_deterministic_manifest_bound_and_h10_transition_rich(
+    tmp_path,
+):
+    manifest = _manifest(tmp_path, action_max=49)
+    first = DeterministicHeldoutEvalDataset.from_manifest(
+        _focused_mixture(),
+        manifest,
+        action_dim=18,
+        focused_subtasks=(2, 3),
+    )
+    second = DeterministicHeldoutEvalDataset.from_manifest(
+        _focused_mixture(),
+        manifest,
+        action_dim=18,
+        focused_subtasks=(2, 3),
+    )
+
+    focused = first.make_focused_view()
+    second_focused = second.make_focused_view()
+    assert focused.heldout_window_references == (
+        second_focused.heldout_window_references
+    )
+    assert focused.heldout_window_digest == second_focused.heldout_window_digest
+    assert {item.episode_id for item in focused.heldout_window_references} == {7, 9}
+    assert all(
+        item.open_to_close_transitions_h10 > 0
+        for item in focused.heldout_window_references
+    )
+    report = focused.sampling_report()
+    assert report["view"] == "focused"
+    assert report["observation_count"] == 2
+    assert report["open_to_close_transition_count_h10"] >= 2
+    assert report["open_to_close_transition_window_count_h10"] == 2
+    assert report["close_to_open_transition_window_count_h10"] == 0
+    assert report["subtask_evaluable_observation_counts"] == {"2": 1, "3": 1}
+    assert report["subtask_action_timestep_counts_by_horizon"]["10"] == {
+        "2": 10,
+        "3": 10,
+    }
+    assert report["subtask_valid_action_element_counts_by_horizon"]["10"] == {
+        "2": 180,
+        "3": 180,
+    }
+    # Creating the focused view does not alter the original unbiased references.
+    assert first.heldout_eval_view == "unbiased"
+    assert first.heldout_window_references != focused.heldout_window_references
+
+
+def test_focused_movement_diagnostics_mirror_float16_packed_targets():
+    mixture = _focused_mixture()
+    dataset = mixture.datasets[0]
+    frame = dataset._frames[7]
+    actions = np.full((70, 18), 0.1, dtype=np.float32)
+    states = np.full((70, 19), 0.1, dtype=np.float32)
+
+    # In float32 this first delta exceeds the threshold, but the target's
+    # float16 wire/storage value falls just below it.  The second movement stays
+    # above threshold and proves the reported denominator uses its packed value.
+    actions[0, 0] = np.float32(0.12001)
+    actions[1, 1] = np.float32(0.12345)
+    frame["source.action"] = list(actions)
+    frame["source.observation.state"] = list(states)
+
+    diagnostic = _candidate_control_diagnostics(
+        mixture=mixture,
+        dataset=dataset,
+        episode_id=7,
+        candidates=(0,),
+        action_dim=18,
+        movement_threshold=0.02,
+    )[0]
+
+    packed_moving_target = np.float16(actions[1, 1]).astype(np.float32)
+    expected_hold_abs = abs(float(packed_moving_target) - 0.1)
+    assert diagnostic.arm_movement_elements_h10 == 1
+    assert diagnostic.arm_movement_hold_abs_h10 == pytest.approx(
+        expected_hold_abs
+    )

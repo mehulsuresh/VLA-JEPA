@@ -6,7 +6,7 @@
       "full_catalog_sha256": "55683290d81c66a51d9fb2250b0c8461ae93f90b30f1b5db2a82e19a6d463cb5",
       "full_episode_count": 1638,
       "full_frame_count": 2452692,
-      "holdout_catalog_sha256": "30f884226d530ee9f5d470173302a393757f5588ac608c4e6b3b198965f3d225",
+      "holdout_catalog_sha256": "f4cfad74df52fc1f144f1f494f793bd92cf873bcc08613d8d0473572f95a34ef",
       "holdout_episode_count": 96,
       "holdout_episode_indices": [
         16,
@@ -65,7 +65,6 @@
         888,
         915,
         936,
-        955,
         962,
         983,
         989,
@@ -93,6 +92,7 @@
         1364,
         1382,
         1411,
+        1440,
         1445,
         1453,
         1478,
@@ -106,18 +106,18 @@
         1566,
         1622
       ],
-      "holdout_frame_count": 149204,
+      "holdout_frame_count": 148604,
       "info_sha256": "e3c8e4d04611546b9c026022ccb1c37b21d6aa746e039a435e487317aecd0111",
       "lerobot_version": "v3.0",
-      "train_catalog_sha256": "3090f03c48aa94e3108ead3f591c3c8c8924313d7b9a6eac559d5943681ccbe0",
+      "train_catalog_sha256": "0a55f1602f10bcb817e7f0554fbbeab64490830715f90abe10261f3352f11d7c",
       "train_episode_count": 1542,
       "train_episode_selection": {
         "kind": "complement_of_holdout"
       },
-      "train_frame_count": 2303488,
+      "train_frame_count": 2304088,
       "train_statistics": {
-        "catalog_sha256": "3090f03c48aa94e3108ead3f591c3c8c8924313d7b9a6eac559d5943681ccbe0",
-        "frame_count": 2303488,
+        "catalog_sha256": "0a55f1602f10bcb817e7f0554fbbeab64490830715f90abe10261f3352f11d7c",
+        "frame_count": 2304088,
         "image_statistics_included": false,
         "numeric_columns": [
           "action",
@@ -135,7 +135,7 @@
           "valid_state_source"
         ],
         "path": "artifacts/magna_internal_holdout_global_batch96_v1_train_stats.json",
-        "sha256": "a5ebd2fa7caee19f36c81be097b18004911bd12affb67045db938736e4553170"
+        "sha256": "d4b0a6e796f28b48c53f56e87254bd85f90b167ff0c0f540750decb8b29de333"
       }
     }
   ],
@@ -168,7 +168,7 @@
       "action_horizon": 50,
       "action_max_offset": 49,
       "action_min_offset": 0,
-      "eligible_episode_count": 1638,
+      "eligible_episode_count": 1614,
       "evaluation_video_offsets": [
         0
       ],
@@ -179,8 +179,129 @@
         "vj_video_target_shift_steps": 2
       },
       "full_complete_episode_count": 1638,
-      "ineligible_episode_count": 0,
-      "ineligible_episodes": [],
+      "ineligible_episode_count": 24,
+      "ineligible_episodes": [
+        {
+          "episode_id": 73,
+          "length": 1615,
+          "reason": "no structurally unpadded action window has a supervised element under valid_state sustained-invalid-prefix masking"
+        },
+        {
+          "episode_id": 293,
+          "length": 669,
+          "reason": "no structurally unpadded action window has a supervised element under valid_state sustained-invalid-prefix masking"
+        },
+        {
+          "episode_id": 314,
+          "length": 812,
+          "reason": "no structurally unpadded action window has a supervised element under valid_state sustained-invalid-prefix masking"
+        },
+        {
+          "episode_id": 409,
+          "length": 840,
+          "reason": "no structurally unpadded action window has a supervised element under valid_state sustained-invalid-prefix masking"
+        },
+        {
+          "episode_id": 543,
+          "length": 1235,
+          "reason": "no structurally unpadded action window has a supervised element under valid_state sustained-invalid-prefix masking"
+        },
+        {
+          "episode_id": 846,
+          "length": 958,
+          "reason": "no structurally unpadded action window has a supervised element under valid_state sustained-invalid-prefix masking"
+        },
+        {
+          "episode_id": 879,
+          "length": 521,
+          "reason": "no structurally unpadded action window has a supervised element under valid_state sustained-invalid-prefix masking"
+        },
+        {
+          "episode_id": 955,
+          "length": 2000,
+          "reason": "no structurally unpadded action window has a supervised element under valid_state sustained-invalid-prefix masking"
+        },
+        {
+          "episode_id": 1126,
+          "length": 502,
+          "reason": "no structurally unpadded action window has a supervised element under valid_state sustained-invalid-prefix masking"
+        },
+        {
+          "episode_id": 1151,
+          "length": 528,
+          "reason": "no structurally unpadded action window has a supervised element under valid_state sustained-invalid-prefix masking"
+        },
+        {
+          "episode_id": 1233,
+          "length": 5200,
+          "reason": "no structurally unpadded action window has a supervised element under valid_state sustained-invalid-prefix masking"
+        },
+        {
+          "episode_id": 1249,
+          "length": 2420,
+          "reason": "no structurally unpadded action window has a supervised element under valid_state sustained-invalid-prefix masking"
+        },
+        {
+          "episode_id": 1275,
+          "length": 4800,
+          "reason": "no structurally unpadded action window has a supervised element under valid_state sustained-invalid-prefix masking"
+        },
+        {
+          "episode_id": 1278,
+          "length": 2660,
+          "reason": "no structurally unpadded action window has a supervised element under valid_state sustained-invalid-prefix masking"
+        },
+        {
+          "episode_id": 1280,
+          "length": 3860,
+          "reason": "no structurally unpadded action window has a supervised element under valid_state sustained-invalid-prefix masking"
+        },
+        {
+          "episode_id": 1342,
+          "length": 1540,
+          "reason": "no structurally unpadded action window has a supervised element under valid_state sustained-invalid-prefix masking"
+        },
+        {
+          "episode_id": 1381,
+          "length": 720,
+          "reason": "no structurally unpadded action window has a supervised element under valid_state sustained-invalid-prefix masking"
+        },
+        {
+          "episode_id": 1397,
+          "length": 660,
+          "reason": "no structurally unpadded action window has a supervised element under valid_state sustained-invalid-prefix masking"
+        },
+        {
+          "episode_id": 1414,
+          "length": 553,
+          "reason": "no structurally unpadded action window has a supervised element under valid_state sustained-invalid-prefix masking"
+        },
+        {
+          "episode_id": 1433,
+          "length": 1260,
+          "reason": "no structurally unpadded action window has a supervised element under valid_state sustained-invalid-prefix masking"
+        },
+        {
+          "episode_id": 1473,
+          "length": 1288,
+          "reason": "no structurally unpadded action window has a supervised element under valid_state sustained-invalid-prefix masking"
+        },
+        {
+          "episode_id": 1568,
+          "length": 1153,
+          "reason": "no structurally unpadded action window has a supervised element under valid_state sustained-invalid-prefix masking"
+        },
+        {
+          "episode_id": 1600,
+          "length": 813,
+          "reason": "no structurally unpadded action window has a supervised element under valid_state sustained-invalid-prefix masking"
+        },
+        {
+          "episode_id": 1619,
+          "length": 90,
+          "reason": "no structurally unpadded action window has a supervised element under valid_state sustained-invalid-prefix masking"
+        }
+      ],
       "minimum_episode_length": 50,
       "observation_mode": "deployment_action_current_qwen_rgb_v1",
       "qwen_observation_frame_index": "current",
@@ -190,10 +311,10 @@
         0
       ]
     },
-    "eligible_episode_policy": "complete episodes with at least one structurally unpadded deployment-observation/action window",
+    "eligible_episode_policy": "complete episodes with at least one structurally unpadded deployment-observation/action window containing at least one supervised action element under the training validity mask",
     "holdout_count_derivation": {
       "config_path": "/home/mehul/work/vjepa/VLA-JEPA/scripts/config/vlajepa_robot_ft_lerobot_magna_interventions_a100x8_qwen35_2b_full_moge_vitb_vjepa_large.yaml",
-      "config_sha256": "e3001d37b131a00e7cada4281c49ac7a1c1bb25300f4d3be7e9824753ef6c2d5",
+      "config_sha256": "95b729eee581c83547cc576b3cbbe38a6bb726f06132d791079bc9a6fe04c315",
       "effective_global_batch_size": 96,
       "evaluation_structural_window": {
         "action_horizon": 50,
@@ -291,7 +412,6 @@
       713,
       159,
       770,
-      955,
       1080,
       631,
       305,
@@ -331,7 +451,8 @@
       439,
       816,
       989,
-      936
+      936,
+      1440
     ],
     "selected_ranking_sha256": [
       "001b70977fd30ac318f60bd998a4430232adfe0af73aabb450a90c027fa4c9f3",
@@ -389,7 +510,6 @@
       "08fd3894e08082c0bddae9b7522ad9ef2caea1b3cbb84bc81247bf35be9d1745",
       "0928968e39dd52e724efd150d674be1d88f3588683f78f5cddb9c67bdfe12c33",
       "093a5d3db31ada872d68028700767ebd4e73c175b5b25cbb4ec4e40a7fd0bfaa",
-      "093e9facff476ef9269cf34ae7506cd1f9cd136fc3201f3cd227d27fed2b87c3",
       "09505865a8b8d2953399cc01ba653e9aec0faee24a8bad5b98f77a2c8b4536f9",
       "097d7d44e78659de9d80ee8931d7ee4e68f7cd859a6946eef3a2fd6685a11803",
       "09b149b63f4d83cb6bb93c43223189cb3b33c74aca42dde53fd47064dca4c0e9",
@@ -429,7 +549,8 @@
       "0fb40df61cb6c214c4adea89611e4375cbb80645b38abefbbb7e498d654aa162",
       "0fcd794350ca6832097ea8e9a62d83626af410075454899802cf434e758acbdb",
       "0ff3b76548646060c05f581e1cf3912d7cd18d77cf7c1b25bc33c19dda9b12b5",
-      "102157d7d714e5473a9aa68a22f386bfe418f055c10e15a697410568c5bdd463"
+      "102157d7d714e5473a9aa68a22f386bfe418f055c10e15a697410568c5bdd463",
+      "1099e4ac5706d1df9e1be4e11db639bc833370003b956dc6bc8806253ee5a108"
     ],
     "tie_breaker": "episode_id_ascending"
   },

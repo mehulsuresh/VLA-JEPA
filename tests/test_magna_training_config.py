@@ -1,4 +1,5 @@
 import fcntl
+import hashlib
 import json
 import os
 import shlex
@@ -27,6 +28,7 @@ CLEAN_PILOT_PATH = (
 DOCKER_RUN_PATH = REPO_ROOT / "scripts/docker_run_training.sh"
 CLOUD_SERVICE_PATH = REPO_ROOT / "scripts/run_cloud_training_service.sh"
 IMAGE_BUILD_PATH = REPO_ROOT / "scripts/build_magna_a100_image.sh"
+CHECKPOINT_EVAL_PATH = REPO_ROOT / "scripts/eval_magna_checkpoint_a100x8.sh"
 TRAINING_ENV_PATH = REPO_ROOT / "scripts/lib/training_env.sh"
 
 
@@ -66,6 +68,9 @@ def test_magna_production_config_contract():
     split_manifest_path = REPO_ROOT / data_cfg.episode_split_manifest
     assert split_manifest_path.is_file()
     split_manifest = json.loads(split_manifest_path.read_text(encoding="utf-8"))
+    assert split_manifest["selection"]["holdout_count_derivation"][
+        "config_sha256"
+    ] == hashlib.sha256(CONFIG_PATH.read_bytes()).hexdigest()
     assert split_manifest["evaluation_sampling"]["algorithm"] == (
         "nonzero_valid_unpadded_uniform_v1"
     )
@@ -97,7 +102,33 @@ def test_magna_production_config_contract():
     assert cfg.trainer.step_scheduler_with_optimizer is False
     assert cfg.trainer.allow_training_stream_eval is False
     assert cfg.trainer.eval_interval == cfg.trainer.save_interval == 2500
-    assert cfg.trainer.best_metric_name == "heldout_eval_normalized_arm_mae_h20"
+    assert cfg.trainer.eval_before_train is True
+    assert cfg.trainer.heldout_focused_eval_enabled is True
+    assert list(cfg.trainer.heldout_focused_eval_required_subtasks) == [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+    ]
+    assert (
+        cfg.trainer.heldout_focused_eval_transition_coverage_horizon == 10
+    )
+    assert cfg.trainer.heldout_focused_eval_min_open_to_close_transitions == 16
+    assert cfg.trainer.heldout_focused_eval_min_close_to_open_transitions == 16
+    assert cfg.trainer.heldout_focused_eval_min_open_to_close_windows == 16
+    assert cfg.trainer.heldout_focused_eval_min_close_to_open_windows == 16
+    assert cfg.trainer.heldout_focused_eval_min_arm_movement_elements_h10 > 0
+    assert cfg.trainer.heldout_focused_eval_min_arm_movement_hold_abs_h10 > 0
+    assert cfg.trainer.gradient_accumulation_steps == 1
+    assert cfg.trainer.eval_only is False
+    assert cfg.trainer.eval_only_untrained_initialization is False
+    assert cfg.trainer.eval_only_legacy_underfilled_holdout is False
+    assert list(cfg.trainer.eval_only_legacy_excluded_zero_valid_episode_ids) == []
+    assert cfg.trainer.best_metric_name == (
+        "heldout_focused_eval_task_failure_score_h10"
+    )
 
 
 def test_magna_mixture_and_launcher_route_to_production_config():
@@ -108,6 +139,21 @@ def test_magna_mixture_and_launcher_route_to_production_config():
     launcher = LAUNCHER_PATH.read_text(encoding="utf-8")
     assert CONFIG_PATH.name in launcher
     assert "vlajepa_robot_ft_libero_plus_a100x8_qwen3_full_moge_vitb_vjepa_large.sh" in launcher
+
+
+def test_checkpoint_eval_wrapper_is_true_eval_only_and_supports_frozen_legacy_manifest():
+    script = CHECKPOINT_EVAL_PATH.read_text(encoding="utf-8")
+    assert os.access(CHECKPOINT_EVAL_PATH, os.X_OK)
+    assert "--trainer.eval_only true" in script
+    assert "STEP0_INIT" in script
+    assert "SOURCE_RUN_CONFIG" in script
+    assert "--trainer.eval_source_training_config_sha256" in script
+    assert "--trainer.eval_only_untrained_initialization true" in script
+    assert "--trainer.resume_load_optimizer_state false" in script
+    assert "LEGACY_ORIGINAL_MANIFEST" in script
+    assert "--datasets.vla_data.episode_split_manifest" in script
+    assert "--trainer.eval_only_legacy_underfilled_holdout true" in script
+    assert "--trainer.eval_only_legacy_excluded_zero_valid_episode_ids \"[955]\"" in script
 
 
 def _clean_pilot_dry_run(tmp_path, *args, extra_env=None):

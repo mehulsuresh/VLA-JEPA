@@ -240,6 +240,35 @@ def test_generator_ranks_only_structurally_evaluable_episodes(tmp_path: Path):
     assert 0 not in manifest["datasets"][0]["holdout_episode_indices"]
 
 
+def test_supervision_eligibility_rejects_all_masked_episode(tmp_path: Path):
+    root = tmp_path / "dataset"
+    episodes, data = _write_fixture(root, [5, 5, 5])
+    data.loc[data["episode_index"] == 1, "valid_state"] = 0
+    data.to_parquet(root / "data/chunk-000/file-000.parquet", index=False)
+
+    eligible, reasons = holdout._supervised_window_eligibility(
+        root,
+        episodes,
+        data_cfg={
+            "use_action_validity_prefix_mask": True,
+            "action_validity_label_key": "valid_state",
+            "action_validity_positive_is_valid": True,
+            "action_validity_invalid_run_length": 3,
+            "delete_pause_frame": False,
+        },
+        structural_window={
+            "minimum_episode_length": 3,
+            "required_min_offset": 0,
+            "required_max_offset": 2,
+            "action_min_offset": 0,
+            "action_max_offset": 2,
+        },
+    )
+
+    assert eligible.tolist() == [True, False, True]
+    assert "no structurally unpadded action window" in reasons[1]
+
+
 def test_existing_artifacts_reuse_and_tamper_or_partial_fail(tmp_path: Path):
     root = tmp_path / "dataset"
     _write_fixture(root, [5, 6, 7, 8, 9])
@@ -281,7 +310,7 @@ def test_catalog_completeness_rejects_noncontiguous_frames(tmp_path: Path):
         holdout._verify_complete_catalog(root, episodes, fps=20.0)
 
 
-def test_real_magna_deployment_action_window_keeps_short_episode_1619():
+def test_real_magna_structural_window_admits_but_supervision_excludes_1619():
     repo_root = Path(__file__).resolve().parents[1]
     dataset_root = Path(
         "/home/mehul/work/reward_model_small/magna_training_data_with_interventions"
@@ -321,3 +350,14 @@ def test_real_magna_deployment_action_window_keeps_short_episode_1619():
         full_catalog_sha256="b" * 64,
     )
     assert 1619 in [row["episode_id"] for row in ranked]
+
+    config_payload = yaml.safe_load(config.read_text(encoding="utf-8"))
+    supervised_eligible, reasons = holdout._supervised_window_eligibility(
+        dataset_root,
+        episodes,
+        data_cfg=config_payload["datasets"]["vla_data"],
+        structural_window=batch["evaluation_structural_window"],
+    )
+    position = int(np.flatnonzero(episodes["episode_index"].to_numpy() == 1619)[0])
+    assert not bool(supervised_eligible[position])
+    assert "no structurally unpadded action window" in reasons[1619]

@@ -276,6 +276,7 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets", model=None, *, mode: st
             video_frame_stride=vla_dataset_cfg.get("video_frame_stride", 1),
         )
         loader_generator = None
+        focused_eval_dataset = None
         batch_size = int(vla_dataset_cfg.per_device_batch_size)
         if is_eval:
             from starVLA.dataloader.heldout_eval import (
@@ -283,22 +284,85 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets", model=None, *, mode: st
                 validate_global_eval_observation_count,
             )
 
+            focused_eval_enabled = bool(
+                cfg.trainer.get("heldout_focused_eval_enabled", False)
+            )
+            legacy_underfilled_eval = bool(
+                cfg.trainer.get("eval_only_legacy_underfilled_holdout", False)
+            )
+            legacy_excluded_ids = tuple(
+                int(value)
+                for value in cfg.trainer.get(
+                    "eval_only_legacy_excluded_zero_valid_episode_ids", ()
+                )
+            )
+            if legacy_underfilled_eval and not bool(
+                cfg.trainer.get("eval_only", False)
+            ):
+                raise ValueError(
+                    "Legacy underfilled holdout mode is restricted to eval-only."
+                )
+            focused_subtasks = (
+                tuple(
+                    int(value)
+                    for value in cfg.trainer.get(
+                        "heldout_focused_eval_required_subtasks",
+                        (2, 3, 4, 5, 6, 7),
+                    )
+                )
+                if focused_eval_enabled
+                else None
+            )
             vla_dataset = build_heldout_eval_dataset(
                 vla_dataset,
                 manifest_path=vla_dataset_cfg.episode_split_manifest,
                 action_dim=int(cfg.framework.action_model.action_dim),
+                focused_subtasks=focused_subtasks,
+                movement_threshold=float(
+                    cfg.trainer.get("heldout_eval_movement_threshold", 0.02)
+                ),
+                legacy_underfilled_eval=legacy_underfilled_eval,
+                legacy_excluded_zero_valid_episode_ids=legacy_excluded_ids,
             )
             gradient_accumulation_steps = max(
                 1, int(cfg.trainer.get("gradient_accumulation_steps", 1))
             )
             world_size = _distributed_world_size()
-            validate_global_eval_observation_count(
-                holdout_episode_count=len(vla_dataset),
+            expected_global_observations = validate_global_eval_observation_count(
+                holdout_episode_count=(
+                    vla_dataset.original_manifest_observation_count
+                    if legacy_underfilled_eval
+                    else len(vla_dataset)
+                ),
                 per_device_batch_size=int(vla_dataset_cfg.per_device_batch_size),
                 world_size=world_size,
                 gradient_accumulation_steps=gradient_accumulation_steps,
             )
+            if legacy_underfilled_eval and len(vla_dataset) != (
+                expected_global_observations - len(legacy_excluded_ids)
+            ):
+                raise ValueError(
+                    "Legacy heldout audit cardinality must equal the original "
+                    "effective global batch minus explicit zero-valid exclusions."
+                )
             loader_generator = vla_dataset.make_torch_generator()
+            if focused_eval_enabled:
+                focused_eval_dataset = vla_dataset.make_focused_view()
+                if legacy_underfilled_eval:
+                    if len(focused_eval_dataset) != len(vla_dataset):
+                        raise ValueError(
+                            "Legacy focused/unbiased eval views must have equal "
+                            "underfilled cardinality."
+                        )
+                else:
+                    validate_global_eval_observation_count(
+                        holdout_episode_count=len(focused_eval_dataset),
+                        per_device_batch_size=int(
+                            vla_dataset_cfg.per_device_batch_size
+                        ),
+                        world_size=world_size,
+                        gradient_accumulation_steps=gradient_accumulation_steps,
+                    )
             logger.info(
                 "Heldout checkpoint eval: "
                 f"{len(vla_dataset)} episodes, one deterministic window/episode, "
@@ -306,13 +370,27 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets", model=None, *, mode: st
                 f"distributed_microbatches={gradient_accumulation_steps}, "
                 f"window_selection_sha256={vla_dataset.heldout_window_digest}"
             )
+            if focused_eval_dataset is not None:
+                focused_report = focused_eval_dataset.sampling_report()
+                logger.info(
+                    "Focused heldout checkpoint eval: "
+                    f"{len(focused_eval_dataset)} episodes, one deterministic "
+                    "H10 transition/stage-focused window per episode, "
+                    f"window_selection_sha256="
+                    f"{focused_eval_dataset.heldout_window_digest}, "
+                    f"open_to_close_h10="
+                    f"{focused_report['open_to_close_transition_count_h10']}, "
+                    f"close_to_open_h10="
+                    f"{focused_report['close_to_open_transition_count_h10']}"
+                )
             sampling_report = vla_dataset.sampling_report()
             zero_valid_episodes = sampling_report["zero_valid_action_episodes"]
             if zero_valid_episodes:
-                logger.warning(
-                    "Heldout episodes forwarded but excluded from action metrics "
-                    "because every structurally valid window has zero supervised "
-                    f"action elements: {zero_valid_episodes}"
+                raise ValueError(
+                    "Every manifest-heldout episode must contribute supervised "
+                    "action elements so each eval view remains one full effective "
+                    "global batch. Episodes with no evaluable structural window: "
+                    f"{zero_valid_episodes}"
                 )
         if bool(vla_dataset_cfg.get("gpu_video_decode_on_rank", False)):
             logger.info(
@@ -374,6 +452,14 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets", model=None, *, mode: st
             )
 
         vla_train_dataloader = DataLoader(**loader_kwargs)
+        focused_eval_dataloader = None
+        if focused_eval_dataset is not None:
+            focused_loader_kwargs = dict(loader_kwargs)
+            focused_loader_kwargs["dataset"] = focused_eval_dataset
+            focused_loader_kwargs["generator"] = (
+                focused_eval_dataset.make_torch_generator()
+            )
+            focused_eval_dataloader = DataLoader(**focused_loader_kwargs)
         if not dist.is_initialized() or dist.get_rank() == 0:
             output_dir = _resolve_output_dir(cfg)
             if output_dir is not None:
@@ -382,9 +468,15 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets", model=None, *, mode: st
                     vla_dataset.save_sampling_report(
                         output_dir / "heldout_eval_windows.json"
                     )
+                    if focused_eval_dataset is not None:
+                        focused_eval_dataset.save_sampling_report(
+                            output_dir / "heldout_focused_eval_windows.json"
+                        )
                 else:
                     vla_dataset.save_dataset_statistics(output_dir / "dataset_statistics.json")
                     vla_dataset.save_dataset_provenance(output_dir / "dataset_provenance.json")
+        if focused_eval_dataloader is not None:
+            return vla_train_dataloader, focused_eval_dataloader
         return vla_train_dataloader
     elif normalized_mode != "train":
         raise ValueError(

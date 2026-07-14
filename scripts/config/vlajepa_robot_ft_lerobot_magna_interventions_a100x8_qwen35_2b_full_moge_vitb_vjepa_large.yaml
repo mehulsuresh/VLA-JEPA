@@ -4,6 +4,8 @@
 # - Clean autonomous baseline: no privileged RTC prefix or local-stage prompt.
 # - LeRobot v3 statistics must carry the exact current frame count.
 # - valid_state builds a sustained-invalid-prefix action loss mask; RABC is off.
+# - Checkpoint eval keeps an unbiased global batch plus a separate H10
+#   transition/stage-focused global batch; both remain manifest holdout-only.
 run_id: robot_ft_lerobot_magna_interventions_a100x8_qwen35_2b_full_moge_vitb_vjepa_large
 run_root_dir: /mnt/vla-jepa/checkpoints
 seed: 42
@@ -193,8 +195,22 @@ trainer:
   eval_interval: 2500
   checkpoint_max_to_keep: 3
   save_best_only: false
-  best_metric_name: heldout_eval_normalized_arm_mae_h20
+  # Lower is better: 1 - min(grasp-recall, release-recall) / (1 + arm
+  # movement-MAE/no-op-hold-MAE). If either direction is ignored, arm motion
+  # alone cannot improve this selection score below 1.
+  best_metric_name: heldout_focused_eval_task_failure_score_h10
   best_metric_mode: min
+  heldout_eval_movement_threshold: 0.02
+  heldout_focused_eval_enabled: true
+  heldout_focused_eval_required_subtasks: [2, 3, 4, 5, 6, 7]
+  heldout_focused_eval_min_evaluable_observations_per_subtask: 5
+  heldout_focused_eval_transition_coverage_horizon: 10
+  heldout_focused_eval_min_arm_movement_elements_h10: 1000
+  heldout_focused_eval_min_arm_movement_hold_abs_h10: 50.0
+  heldout_focused_eval_min_open_to_close_transitions: 16
+  heldout_focused_eval_min_close_to_open_transitions: 16
+  heldout_focused_eval_min_open_to_close_windows: 16
+  heldout_focused_eval_min_close_to_open_windows: 16
   learning_rate:
     base: 2.0e-05
     qwen_vl_interface: 1.0e-05
@@ -216,7 +232,7 @@ trainer:
   logging_frequency: 10
   progress_eta_window: 50
   progress_eta_warmup_steps: 10
-  eval_before_train: false
+  eval_before_train: true
   allow_training_stream_eval: false
   gradient_clipping: 1.0
   gradient_accumulation_steps: 1
@@ -234,6 +250,10 @@ trainer:
     fused: true
 
   is_resume: false
+  eval_only: false
+  eval_only_untrained_initialization: false
+  eval_only_legacy_underfilled_holdout: false
+  eval_only_legacy_excluded_zero_valid_episode_ids: []
   resume_epoch: null
   resume_step: null
   enable_gradient_checkpointing: true

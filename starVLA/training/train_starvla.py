@@ -18,6 +18,7 @@ import argparse
 from contextlib import contextmanager
 import ctypes
 import gc
+import hashlib
 import math
 import json
 import os
@@ -79,7 +80,7 @@ import yaml
 from accelerate import Accelerator, DeepSpeedPlugin
 from accelerate.logging import get_logger
 from accelerate.tracking import LoggerType
-from accelerate.utils import DistributedDataParallelKwargs, set_seed
+from accelerate.utils import DistributedDataParallelKwargs, gather_object, set_seed
 from omegaconf import OmegaConf
 from tqdm import tqdm
 from transformers import AutoProcessor, get_scheduler
@@ -820,27 +821,46 @@ def prepare_data(cfg, accelerator, output_dir, model=None) -> Tuple[DataLoader, 
 
 
 def prepare_heldout_eval_data(cfg, accelerator, output_dir, model=None):
-    """Build a separate manifest-selected checkpoint-evaluation loader.
+    """Build separate manifest-selected checkpoint-evaluation loader views.
 
     Presence of ``episode_split_manifest`` enables the heldout path.  The same
     config is passed with ``mode="eval"`` so the dataset layer selects complete
     holdout episodes while loading only the manifest-bound train statistics.
+    The optional focused view shares only the already-independent eval dataset
+    readers and adds one effective global forward batch per evaluation.
     """
 
     del output_dir  # The dataloader resolves the run output path from ``cfg``.
     vla_dataset_cfg = cfg.datasets.vla_data
     if not vla_dataset_cfg.get("episode_split_manifest", None):
-        return None
+        return None, None
+    legacy_underfilled_eval = bool(
+        cfg.trainer.get("eval_only_legacy_underfilled_holdout", False)
+    )
+    if legacy_underfilled_eval:
+        if not bool(cfg.trainer.get("eval_only", False)):
+            raise ValueError(
+                "Legacy underfilled holdout mode is forbidden during training."
+            )
+        # 95 historical holdouts cannot be evenly divided across eight ranks.
+        # Padding would duplicate one episode and invalidate the audit.
+        accelerator.dataloader_config.even_batches = False
     from starVLA.dataloader import build_dataloader
 
-    vla_eval_dataloader = build_dataloader(
+    eval_loaders = build_dataloader(
         cfg=cfg,
         dataset_py=vla_dataset_cfg.dataset_py,
         model=model,
         mode="eval",
     )
     accelerator.dataloader_config.dispatch_batches = False
-    return vla_eval_dataloader
+    if isinstance(eval_loaders, tuple):
+        if len(eval_loaders) != 2:
+            raise RuntimeError(
+                "Heldout eval loader builder returned an invalid loader bundle."
+            )
+        return eval_loaders
+    return eval_loaders, None
 
 
 def _find_sampler(obj, visited: set[int] | None = None):
@@ -1262,6 +1282,197 @@ def setup_optimizer_and_scheduler(model, cfg) -> Tuple[torch.optim.Optimizer, to
     return optimizer, lr_scheduler
 
 
+def _heldout_loader_report(loader, *, label: str) -> dict | None:
+    if loader is None:
+        return None
+    dataset = getattr(loader, "dataset", loader)
+    report_fn = getattr(dataset, "sampling_report", None)
+    if not callable(report_fn):
+        raise ValueError(
+            f"{label} loader dataset must expose its immutable sampling_report()."
+        )
+    report = report_fn()
+    if not isinstance(report, Mapping):
+        raise ValueError(f"{label} sampling_report() must return a mapping.")
+    return dict(report)
+
+
+def _heldout_report_subtask_counts(
+    report: Mapping | None,
+) -> tuple[dict[int, int], dict[int, int]]:
+    if report is None:
+        return {}, {}
+    counts = {
+        int(key): int(value)
+        for key, value in report.get("subtask_observation_counts", {}).items()
+    }
+    evaluable = {
+        int(key): int(value)
+        for key, value in report.get(
+            "subtask_evaluable_observation_counts", {}
+        ).items()
+    }
+    return counts, evaluable
+
+
+def _heldout_report_action_subtask_counts(
+    report: Mapping | None,
+    *,
+    horizon: int,
+    field: str,
+) -> dict[int, int]:
+    if report is None:
+        return {}
+    by_horizon = report.get(field, {})
+    if not isinstance(by_horizon, Mapping):
+        raise ValueError(f"Heldout sampling report field {field!r} must be a mapping.")
+    raw_counts = by_horizon.get(str(int(horizon)), {})
+    if not isinstance(raw_counts, Mapping):
+        raise ValueError(
+            f"Heldout sampling report {field!r} h{int(horizon)} must be a mapping."
+        )
+    return {int(key): int(value) for key, value in raw_counts.items()}
+
+
+def _validate_heldout_report_coverage(
+    report: Mapping,
+    *,
+    expected_observations: int,
+    required_subtasks: Sequence[int],
+    minimum_per_subtask: int,
+    label: str,
+    allow_legacy_underfilled: bool = False,
+) -> None:
+    observations = int(report["observation_count"])
+    split_provenance = report.get("episode_split_provenance")
+    if not isinstance(split_provenance, list) or not split_provenance:
+        raise ValueError(f"{label} lacks episode split/statistics provenance.")
+    sha_fields = (
+        "manifest_sha256",
+        "selected_episode_set_sha256",
+        "train_episode_set_sha256",
+        "holdout_episode_set_sha256",
+        "full_catalog_sha256",
+        "train_statistics_sha256",
+    )
+    for entry in split_provenance:
+        if not isinstance(entry, Mapping) or not str(
+            entry.get("dataset_name", "")
+        ):
+            raise ValueError(f"{label} has malformed split provenance.")
+        for field in sha_fields:
+            value = entry.get(field)
+            if (
+                not isinstance(value, str)
+                or len(value) != 64
+                or any(character not in "0123456789abcdef" for character in value)
+            ):
+                raise ValueError(
+                    f"{label} split provenance has invalid {field}."
+                )
+        if str(entry.get("role", "")).lower() not in {
+            "eval",
+            "evaluation",
+            "val",
+            "validation",
+            "test",
+            "holdout",
+        }:
+            raise ValueError(f"{label} split provenance is not holdout-role data.")
+    if sum(
+        int(entry.get("selected_episode_count", -1))
+        for entry in split_provenance
+    ) != int(expected_observations):
+        raise ValueError(
+            f"{label} split provenance does not bind the original effective "
+            "global batch cardinality."
+        )
+    if allow_legacy_underfilled:
+        legacy = report.get("legacy_underfilled_holdout")
+        if (
+            report.get("production_valid") is not False
+            or report.get("checkpoint_selection_eligible") is not False
+            or not isinstance(legacy, Mapping)
+            or legacy.get("enabled") is not True
+            or legacy.get("no_replacement_no_training_leak") is not True
+            or legacy.get("replacement_episode_ids") != []
+        ):
+            raise ValueError(
+                f"{label} legacy audit lacks explicit production-invalid, "
+                "no-replacement evidence."
+            )
+        excluded = legacy.get("excluded_zero_valid_episodes", [])
+        if not isinstance(excluded, list) or not excluded:
+            raise ValueError(f"{label} legacy audit has no explicit exclusions.")
+        if (
+            int(legacy.get("original_manifest_observation_count", -1))
+            != int(expected_observations)
+            or int(legacy.get("evaluated_observation_count", -1))
+            != observations
+            or observations != int(expected_observations) - len(excluded)
+        ):
+            raise ValueError(
+                f"{label} legacy audit cardinality is not exactly original minus "
+                "explicit exclusions."
+            )
+    elif observations != int(expected_observations):
+        raise ValueError(
+            f"{label} sampling report must contain exactly one effective global "
+            f"training batch: report={observations}, expected={expected_observations}."
+        )
+    subtask_counts, evaluable_counts = _heldout_report_subtask_counts(report)
+    if sum(subtask_counts.values()) != observations:
+        raise ValueError(
+            f"Every {label} observation must carry one integer subtask label: "
+            f"labeled={sum(subtask_counts.values())}, observations={observations}."
+        )
+    expected_evaluable = int(report["action_evaluable_observation_count"])
+    zero_valid_episodes = report.get("zero_valid_action_episodes", [])
+    if expected_evaluable != observations or zero_valid_episodes:
+        raise ValueError(
+            f"{label} must keep all {observations} episode windows action-evaluable; "
+            f"evaluable={expected_evaluable}, zero-valid={zero_valid_episodes}."
+        )
+    if sum(evaluable_counts.values()) != expected_evaluable:
+        raise ValueError(
+            f"{label} per-subtask evaluable coverage does not match its global "
+            "evaluable-observation count."
+        )
+    if int(minimum_per_subtask) <= 0:
+        raise ValueError(f"{label} minimum per-subtask coverage must be positive.")
+    insufficient = {
+        int(subtask): evaluable_counts.get(int(subtask), 0)
+        for subtask in required_subtasks
+        if evaluable_counts.get(int(subtask), 0) < int(minimum_per_subtask)
+    }
+    if insufficient:
+        raise ValueError(
+            f"{label} has insufficient action-evaluable coverage for required "
+            f"subtasks (minimum={minimum_per_subtask}): {insufficient}."
+        )
+    if required_subtasks:
+        action_timestep_counts = _heldout_report_action_subtask_counts(
+            report,
+            horizon=10,
+            field="subtask_action_timestep_counts_by_horizon",
+        )
+        valid_element_counts = _heldout_report_action_subtask_counts(
+            report,
+            horizon=10,
+            field="subtask_valid_action_element_counts_by_horizon",
+        )
+        if sum(action_timestep_counts.values()) != observations * 10:
+            raise ValueError(
+                f"{label} must carry one per-action subtask label at every H10 "
+                "target timestep."
+            )
+        if not valid_element_counts or sum(valid_element_counts.values()) <= 0:
+            raise ValueError(
+                f"{label} has no H10 valid-action element coverage by target-step "
+                "subtask."
+            )
+
+
 class VLATrainer(TrainerUtils):
     def __init__(
         self,
@@ -1272,11 +1483,13 @@ class VLATrainer(TrainerUtils):
         lr_scheduler,
         accelerator,
         vla_eval_dataloader=None,
+        vla_focused_eval_dataloader=None,
     ):
         self.config = cfg
         self.model = model
         self.vla_train_dataloader = vla_train_dataloader
         self.vla_eval_dataloader = vla_eval_dataloader
+        self.vla_focused_eval_dataloader = vla_focused_eval_dataloader
         self.optimizer = optimizer
         self.lr_scheduler = lr_scheduler
         self.accelerator = accelerator
@@ -1290,61 +1503,273 @@ class VLATrainer(TrainerUtils):
         self.best_metric_name = str(self.config.trainer.get("best_metric_name", "mae_score"))
         self.best_metric_mode = str(self.config.trainer.get("best_metric_mode", "min")).lower()
         self.best_metric_value = None
+        self.loaded_checkpoint_path: str | None = None
+        self.legacy_underfilled_eval = bool(
+            self.config.trainer.get(
+                "eval_only_legacy_underfilled_holdout", False
+            )
+        )
+        if self.legacy_underfilled_eval and not bool(
+            self.config.trainer.get("eval_only", False)
+        ):
+            raise ValueError(
+                "Legacy underfilled holdout mode cannot initialize a trainer."
+            )
         self._warned_missing_best_metric = False
         self._warned_training_stream_eval_disabled = False
 
-        if self.vla_eval_dataloader is not None:
-            shared_dataset_ids = _collect_dataset_object_ids(
-                self.vla_train_dataloader
-            ) & _collect_dataset_object_ids(self.vla_eval_dataloader)
-            if shared_dataset_ids:
+        if self.vla_focused_eval_dataloader is not None and self.vla_eval_dataloader is None:
+            raise ValueError("Focused heldout eval requires the unbiased heldout loader.")
+        if bool(
+            self.config.trainer.get("heldout_focused_eval_enabled", False)
+        ) != (self.vla_focused_eval_dataloader is not None):
+            raise ValueError(
+                "trainer.heldout_focused_eval_enabled must exactly match focused "
+                "loader construction; refusing to silently omit the coverage gate."
+            )
+        training_dataset_ids = _collect_dataset_object_ids(
+            self.vla_train_dataloader
+        )
+        for label, loader in (
+            ("Heldout evaluation", self.vla_eval_dataloader),
+            ("Focused heldout evaluation", self.vla_focused_eval_dataloader),
+        ):
+            if loader is not None and (
+                training_dataset_ids & _collect_dataset_object_ids(loader)
+            ):
                 raise ValueError(
-                    "Heldout evaluation must use a separately constructed dataset/loader; "
-                    "it shares dataset objects with the training loader."
+                    f"{label} must use dataset objects independent of training."
                 )
-            from starVLA.dataloader.heldout_eval import sampling_seed_from_dataset
 
-            self.heldout_eval_seed = sampling_seed_from_dataset(
-                getattr(self.vla_eval_dataloader, "dataset", self.vla_eval_dataloader),
-                default=int(self.config.get("seed", 0)),
-            )
-            eval_dataset = getattr(
-                self.vla_eval_dataloader,
+        from starVLA.dataloader.heldout_eval import sampling_seed_from_dataset
+
+        self.heldout_eval_seed = sampling_seed_from_dataset(
+            getattr(self.vla_eval_dataloader, "dataset", self.vla_eval_dataloader),
+            default=int(self.config.get("seed", 0)),
+        )
+        self.heldout_focused_eval_seed = sampling_seed_from_dataset(
+            getattr(
+                self.vla_focused_eval_dataloader,
                 "dataset",
-                self.vla_eval_dataloader,
-            )
-            report_fn = getattr(eval_dataset, "sampling_report", None)
-            if not callable(report_fn):
-                raise ValueError(
-                    "Heldout eval loader dataset must expose its immutable sampling_report()."
-                )
-            self.heldout_eval_sampling_report = report_fn()
-            self.heldout_eval_expected_valid_elements = int(
+                self.vla_focused_eval_dataloader,
+            ),
+            default=self.heldout_eval_seed,
+        )
+        self.heldout_eval_sampling_report = _heldout_loader_report(
+            self.vla_eval_dataloader,
+            label="Heldout eval",
+        )
+        self.heldout_focused_eval_sampling_report = _heldout_loader_report(
+            self.vla_focused_eval_dataloader,
+            label="Focused heldout eval",
+        )
+        self.heldout_eval_subtask_counts, (
+            self.heldout_eval_evaluable_subtask_counts
+        ) = _heldout_report_subtask_counts(self.heldout_eval_sampling_report)
+        self.heldout_focused_eval_subtask_counts, (
+            self.heldout_focused_eval_evaluable_subtask_counts
+        ) = _heldout_report_subtask_counts(
+            self.heldout_focused_eval_sampling_report
+        )
+        self.heldout_eval_expected_valid_elements = (
+            None
+            if self.heldout_eval_sampling_report is None
+            else int(
                 self.heldout_eval_sampling_report["valid_action_element_count"]
             )
-            self.heldout_eval_expected_valid_observations = int(
+        )
+        self.heldout_eval_expected_valid_observations = (
+            None
+            if self.heldout_eval_sampling_report is None
+            else int(
                 self.heldout_eval_sampling_report[
                     "action_evaluable_observation_count"
                 ]
             )
-        else:
-            self.heldout_eval_seed = int(self.config.get("seed", 0))
-            self.heldout_eval_sampling_report = None
-            self.heldout_eval_expected_valid_elements = None
-            self.heldout_eval_expected_valid_observations = None
+        )
+        self.heldout_focused_eval_expected_valid_elements = (
+            None
+            if self.heldout_focused_eval_sampling_report is None
+            else int(
+                self.heldout_focused_eval_sampling_report[
+                    "valid_action_element_count"
+                ]
+            )
+        )
+        self.heldout_focused_eval_expected_valid_observations = (
+            None
+            if self.heldout_focused_eval_sampling_report is None
+            else int(
+                self.heldout_focused_eval_sampling_report[
+                    "action_evaluable_observation_count"
+                ]
+            )
+        )
 
         # training status tracking
         self.completed_steps = 0
         self.total_batch_size = self._calculate_total_batch_size()
         if self.heldout_eval_sampling_report is not None:
-            report_observations = int(
-                self.heldout_eval_sampling_report["observation_count"]
+            _validate_heldout_report_coverage(
+                self.heldout_eval_sampling_report,
+                expected_observations=self.total_batch_size,
+                required_subtasks=tuple(
+                    int(value)
+                    for value in self.config.trainer.get(
+                        "heldout_eval_required_subtasks", ()
+                    )
+                ),
+                minimum_per_subtask=int(
+                    self.config.trainer.get(
+                        "heldout_eval_min_evaluable_observations_per_subtask", 1
+                    )
+                ),
+                label="Heldout eval",
+                allow_legacy_underfilled=self.legacy_underfilled_eval,
             )
-            if report_observations != self.total_batch_size:
+        if self.heldout_focused_eval_sampling_report is not None:
+            if (
+                self.heldout_focused_eval_sampling_report.get(
+                    "episode_split_provenance"
+                )
+                != self.heldout_eval_sampling_report.get(
+                    "episode_split_provenance"
+                )
+            ):
                 raise ValueError(
-                    "Heldout eval sampling report must contain exactly one effective "
-                    f"global training batch: report={report_observations}, "
-                    f"expected={self.total_batch_size}."
+                    "Focused and unbiased heldout views must bind the identical "
+                    "manifest, episode split, catalog, and train statistics."
+                )
+            _validate_heldout_report_coverage(
+                self.heldout_focused_eval_sampling_report,
+                expected_observations=self.total_batch_size,
+                required_subtasks=tuple(
+                    int(value)
+                    for value in self.config.trainer.get(
+                        "heldout_focused_eval_required_subtasks",
+                        (2, 3, 4, 5, 6, 7),
+                    )
+                ),
+                minimum_per_subtask=int(
+                    self.config.trainer.get(
+                        "heldout_focused_eval_min_evaluable_observations_per_subtask",
+                        1,
+                    )
+                ),
+                label="Focused heldout eval",
+                allow_legacy_underfilled=self.legacy_underfilled_eval,
+            )
+            focused_transition_horizon = int(
+                self.config.trainer.get(
+                    "heldout_focused_eval_transition_coverage_horizon", 10
+                )
+            )
+            if focused_transition_horizon != 10:
+                raise ValueError(
+                    "The deterministic focused selector is explicitly H10; "
+                    "trainer.heldout_focused_eval_transition_coverage_horizon "
+                    "must equal 10."
+                )
+            minimum_open_to_close = int(
+                self.config.trainer.get(
+                    "heldout_focused_eval_min_open_to_close_transitions", 1
+                )
+            )
+            minimum_close_to_open = int(
+                self.config.trainer.get(
+                    "heldout_focused_eval_min_close_to_open_transitions", 1
+                )
+            )
+            minimum_open_to_close_windows = int(
+                self.config.trainer.get(
+                    "heldout_focused_eval_min_open_to_close_windows", 1
+                )
+            )
+            minimum_close_to_open_windows = int(
+                self.config.trainer.get(
+                    "heldout_focused_eval_min_close_to_open_windows", 1
+                )
+            )
+            minimum_arm_movement_elements = int(
+                self.config.trainer.get(
+                    "heldout_focused_eval_min_arm_movement_elements_h10", 1
+                )
+            )
+            minimum_arm_movement_hold_abs = float(
+                self.config.trainer.get(
+                    "heldout_focused_eval_min_arm_movement_hold_abs_h10",
+                    1.0e-12,
+                )
+            )
+            if any(
+                value < 0
+                for value in (
+                    minimum_open_to_close,
+                    minimum_close_to_open,
+                    minimum_open_to_close_windows,
+                    minimum_close_to_open_windows,
+                    minimum_arm_movement_elements,
+                )
+            ) or (
+                not math.isfinite(minimum_arm_movement_hold_abs)
+                or minimum_arm_movement_hold_abs < 0
+            ):
+                raise ValueError(
+                    "Focused heldout movement and transition minimums must be "
+                    "finite and non-negative."
+                )
+            report_open_to_close = int(
+                self.heldout_focused_eval_sampling_report.get(
+                    "open_to_close_transition_count_h10", 0
+                )
+            )
+            report_close_to_open = int(
+                self.heldout_focused_eval_sampling_report.get(
+                    "close_to_open_transition_count_h10", 0
+                )
+            )
+            report_open_to_close_windows = int(
+                self.heldout_focused_eval_sampling_report.get(
+                    "open_to_close_transition_window_count_h10", 0
+                )
+            )
+            report_close_to_open_windows = int(
+                self.heldout_focused_eval_sampling_report.get(
+                    "close_to_open_transition_window_count_h10", 0
+                )
+            )
+            report_arm_movement_elements = int(
+                self.heldout_focused_eval_sampling_report.get(
+                    "arm_movement_element_count_h10", 0
+                )
+            )
+            report_arm_movement_hold_abs = float(
+                self.heldout_focused_eval_sampling_report.get(
+                    "arm_movement_hold_abs_sum_h10", 0.0
+                )
+            )
+            if (
+                report_open_to_close < minimum_open_to_close
+                or report_close_to_open < minimum_close_to_open
+                or report_open_to_close_windows < minimum_open_to_close_windows
+                or report_close_to_open_windows < minimum_close_to_open_windows
+                or report_arm_movement_elements < minimum_arm_movement_elements
+                or report_arm_movement_hold_abs < minimum_arm_movement_hold_abs
+            ):
+                raise ValueError(
+                    "Focused heldout selection fails configured H10 movement/"
+                    "transition coverage: arm_movement_elements="
+                    f"{report_arm_movement_elements}/"
+                    f"{minimum_arm_movement_elements}, arm_movement_hold_abs="
+                    f"{report_arm_movement_hold_abs}/"
+                    f"{minimum_arm_movement_hold_abs}, open_to_close_events="
+                    f"{report_open_to_close}/"
+                    f"{minimum_open_to_close}, close_to_open="
+                    f"{report_close_to_open}/{minimum_close_to_open}, "
+                    f"open_to_close_windows={report_open_to_close_windows}/"
+                    f"{minimum_open_to_close_windows}, close_to_open_windows="
+                    f"{report_close_to_open_windows}/"
+                    f"{minimum_close_to_open_windows}."
                 )
         self.train_start_time = time.perf_counter()
         self.progress_eta_window = max(int(self.config.trainer.get("progress_eta_window", 50)), 1)
@@ -1503,6 +1928,129 @@ class VLATrainer(TrainerUtils):
             return float(value)
         return None
 
+    def _prepare_heldout_loaders_with_accelerator(self) -> None:
+        for attribute, label in (
+            ("vla_eval_dataloader", "unbiased"),
+            ("vla_focused_eval_dataloader", "focused"),
+        ):
+            eval_loader = getattr(self, attribute)
+            if eval_loader is None:
+                continue
+            eval_loader = self.accelerator.prepare(eval_loader)
+            setattr(self, attribute, eval_loader)
+            expected_eval_microbatches = max(
+                1, int(self.config.trainer.get("gradient_accumulation_steps", 1))
+            )
+            actual_eval_microbatches = len(eval_loader)
+            if actual_eval_microbatches != expected_eval_microbatches:
+                raise RuntimeError(
+                    f"Prepared {label} heldout eval loader must expose one local "
+                    "microbatch per gradient-accumulation step: "
+                    f"got {actual_eval_microbatches}, expected "
+                    f"{expected_eval_microbatches}."
+                )
+            logger.info(
+                f"Prepared {label} heldout eval loader with "
+                f"{actual_eval_microbatches} local microbatch(es) per checkpoint eval"
+            )
+
+    def prepare_checkpoint_evaluation(self) -> None:
+        """Prepare only model + heldout views and load a checkpoint model."""
+
+        initialization_eval = bool(
+            self.config.trainer.get(
+                "eval_only_untrained_initialization", False
+            )
+        )
+        if self.vla_eval_dataloader is None or self.vla_focused_eval_dataloader is None:
+            raise ValueError(
+                "trainer.eval_only requires both unbiased and focused heldout views."
+            )
+        if self.vla_train_dataloader is not None or self.optimizer is not None:
+            raise ValueError(
+                "Eval-only preparation refuses a training dataloader or optimizer."
+            )
+        checkpoint_path = (
+            self.config.get("resume_from_checkpoint", None)
+            or self.config.trainer.get("resume_from_checkpoint", None)
+        )
+        is_resume = bool(self.config.trainer.get("is_resume", False))
+        if initialization_eval:
+            if is_resume or checkpoint_path:
+                raise ValueError(
+                    "Untrained-initialization eval cannot resume from a checkpoint."
+                )
+        elif not is_resume or not checkpoint_path:
+            raise ValueError(
+                "Checkpoint eval-only requires trainer.is_resume=true and "
+                "resume_from_checkpoint."
+            )
+        if bool(self.config.trainer.get("resume_load_optimizer_state", True)):
+            raise ValueError(
+                "trainer.eval_only requires trainer.resume_load_optimizer_state=false."
+            )
+        self.eval_source_training_config_evidence = (
+            self._eval_source_training_config_evidence()
+        )
+
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        seed = self.config.seed + rank if hasattr(self.config, "seed") else rank + 3047
+        set_seed(seed)
+        if initialization_eval:
+            pretrained_checkpoint = self.config.trainer.get(
+                "pretrained_checkpoint", None
+            )
+            if pretrained_checkpoint:
+                reload_modules = self.config.trainer.get(
+                    "reload_modules", None
+                )
+                self.model = self.load_pretrained_backbones(
+                    self.model,
+                    pretrained_checkpoint,
+                    reload_modules=reload_modules,
+                )
+        freeze_modules = self.config.trainer.get("freeze_modules", None)
+        self.model = self.freeze_backbones(
+            self.model,
+            freeze_modules=freeze_modules,
+        )
+        if hasattr(self.model, "refresh_runtime_caches"):
+            self.model.refresh_runtime_caches()
+        if hasattr(self.model, "validate_runtime_feature_state"):
+            self.model.validate_runtime_feature_state()
+
+        self.model = self.accelerator.prepare(self.model)
+        self._prepare_heldout_loaders_with_accelerator()
+        self._prefetch_model = self.accelerator.unwrap_model(self.model)
+        self._init_checkpointing()
+        if initialization_eval:
+            if self.loaded_checkpoint_path is not None or self.completed_steps != 0:
+                raise RuntimeError(
+                    "Untrained-initialization eval unexpectedly loaded a checkpoint."
+                )
+        elif self.loaded_checkpoint_path is None:
+            raise RuntimeError("Eval-only preparation did not load its checkpoint.")
+
+    def evaluate_checkpoint_only(self) -> dict:
+        """Evaluate one loaded checkpoint and exit without a training iterator."""
+
+        initialization_eval = bool(
+            self.config.trainer.get(
+                "eval_only_untrained_initialization", False
+            )
+        )
+        if self.loaded_checkpoint_path is None and not initialization_eval:
+            raise RuntimeError("No checkpoint is loaded for eval-only execution.")
+        metrics = self.eval_heldout_action_model({})
+        metrics["epoch"] = 0.0
+        metrics["samples_seen"] = 0.0
+        if self.accelerator.is_main_process:
+            logger.info(
+                f"Eval-only checkpoint metrics at step {self.completed_steps}: {metrics}"
+            )
+        distributed_wait(self.accelerator)
+        return metrics
+
     def prepare_training(self):
         rank = dist.get_rank() if dist.is_initialized() else 0
         seed = self.config.seed + rank if hasattr(self.config, "seed") else rank + 3047
@@ -1557,29 +2105,9 @@ class VLATrainer(TrainerUtils):
         )
         if self.accelerator.is_main_process:
             logger.info("Step 0 debug: accelerator.prepare returned")
-        if self.vla_eval_dataloader is not None:
-            # Prepare the independent loader only after the model/train objects.
-            # With split_batches=false, Accelerate assigns distinct local
-            # microbatches to ranks without padding because the manifest count
-            # is an exact effective global batch.
-            self.vla_eval_dataloader = self.accelerator.prepare(
-                self.vla_eval_dataloader
-            )
-            expected_eval_microbatches = max(
-                1, int(self.config.trainer.get("gradient_accumulation_steps", 1))
-            )
-            actual_eval_microbatches = len(self.vla_eval_dataloader)
-            if actual_eval_microbatches != expected_eval_microbatches:
-                raise RuntimeError(
-                    "Prepared heldout eval loader must expose exactly one local "
-                    "microbatch per gradient-accumulation step: "
-                    f"got {actual_eval_microbatches}, expected "
-                    f"{expected_eval_microbatches}."
-                )
-            logger.info(
-                "Prepared independent heldout eval loader with "
-                f"{actual_eval_microbatches} local microbatch(es) per checkpoint eval"
-            )
+        # Prepare each independent view only after model/train objects. Each
+        # view is exactly one effective global training batch.
+        self._prepare_heldout_loaders_with_accelerator()
         self._validate_prepared_dataloader()
         if self.accelerator.is_main_process:
             logger.info("Step 0 debug: prepared dataloader validated")
@@ -1667,6 +2195,9 @@ class VLATrainer(TrainerUtils):
 
     def _load_checkpoint(self, checkpoint_path):
         """load checkpoint"""
+        checkpoint_path = str(Path(checkpoint_path).expanduser().resolve())
+        if not Path(checkpoint_path).is_dir():
+            raise FileNotFoundError(f"Checkpoint directory does not exist: {checkpoint_path}")
         load_optimizer_state = bool(self.config.trainer.get("resume_load_optimizer_state", True))
         if load_optimizer_state:
             self.accelerator.load_state(checkpoint_path)
@@ -1732,6 +2263,7 @@ class VLATrainer(TrainerUtils):
                     f"Unable to fast-forward lr scheduler to resumed step {self.completed_steps}: {exc}"
                 )
         resume_mode = "full_state" if load_optimizer_state else "model_only"
+        self.loaded_checkpoint_path = checkpoint_path
         self.accelerator.print(f"Resumed from checkpoint ({resume_mode}): {checkpoint_path}")
 
     def _save_checkpoint(self):
@@ -1804,6 +2336,11 @@ class VLATrainer(TrainerUtils):
                 logger.warning(f"Unable to prune old checkpoint `{path}`: {exc}")
 
     def _should_save_checkpoint(self, step_metrics: dict) -> bool:
+        if getattr(self, "legacy_underfilled_eval", False):
+            raise RuntimeError(
+                "Legacy underfilled audit metrics are forbidden from checkpoint "
+                "selection."
+            )
         if not bool(self.config.trainer.get("save_best_only", False)):
             return True
 
@@ -2289,6 +2826,41 @@ class VLATrainer(TrainerUtils):
             ]
         return examples
 
+    @staticmethod
+    def _heldout_metadata_array(examples, key: str) -> np.ndarray | None:
+        if isinstance(examples, Mapping):
+            value = examples.get(key)
+            return None if value is None else VLATrainer._eval_numpy(value)
+        if isinstance(examples, Sequence) and not isinstance(examples, (str, bytes)):
+            if not examples or any(
+                not isinstance(example, Mapping) or key not in example
+                for example in examples
+            ):
+                return None
+            return np.asarray(
+                [VLATrainer._eval_numpy(example[key]) for example in examples]
+            )
+        return None
+
+    def _eval_action_groups(self, action_dim: int) -> dict[str, tuple[int, ...]]:
+        groups: dict[str, tuple[int, ...]] = {
+            "all_action": tuple(range(int(action_dim)))
+        }
+        arm_dimensions = self._eval_arm_dimensions(action_dim)
+        if arm_dimensions is not None:
+            groups["arm"] = arm_dimensions
+        if int(action_dim) in {18, 19, 22}:
+            groups["gripper"] = (7, 15)
+            if int(action_dim) in {18, 19}:
+                groups["head"] = (16, 17)
+                if int(action_dim) == 19:
+                    groups["lift"] = (18,)
+            else:
+                groups["base"] = (16, 17, 18)
+                groups["head"] = (19, 20)
+                groups["lift"] = (21,)
+        return groups
+
     def _eval_arm_dimensions(self, action_dim: int) -> tuple[int, ...] | None:
         configured = self.config.trainer.get(
             "heldout_eval_arm_dimensions",
@@ -2324,13 +2896,20 @@ class VLATrainer(TrainerUtils):
         expected_valid_observations: int | None = None,
         expected_valid_elements: int | None = None,
         require_heldout_indices: bool = False,
+        sampling_report: Mapping | None = None,
+        evaluation_seed: int | None = None,
+        transition_coverage_horizon: int | None = None,
+        minimum_open_to_close_transitions: int = 0,
+        minimum_close_to_open_transitions: int = 0,
+        minimum_open_to_close_windows: int = 0,
+        minimum_close_to_open_windows: int = 0,
+        minimum_arm_movement_elements: int = 0,
+        minimum_arm_movement_hold_abs: float = 0.0,
     ) -> dict:
-        """Run deterministic deployment-style diffusion on one eval pass."""
+        """Run deterministic deployment-style diffusion and control diagnostics."""
 
         infer_model = self.accelerator.unwrap_model(self.model)
         module_modes = [(module, bool(module.training)) for module in infer_model.modules()]
-        # This is deliberately the same action-model setting embedded in the
-        # checkpoint and used by deployment, not a trainer-only DDIM override.
         num_inference_timesteps = int(
             self.config.framework.action_model.get("num_inference_timesteps", 8)
         )
@@ -2339,24 +2918,85 @@ class VLATrainer(TrainerUtils):
                 "framework.action_model.num_inference_timesteps must be positive "
                 "for heldout checkpoint evaluation."
             )
+        movement_threshold = float(
+            self.config.trainer.get("heldout_eval_movement_threshold", 0.02)
+        )
+        if not math.isfinite(movement_threshold) or movement_threshold < 0:
+            raise ValueError(
+                "trainer.heldout_eval_movement_threshold must be finite and "
+                "non-negative."
+            )
 
-        local_abs_sum = 0.0
-        local_sq_sum = 0.0
-        local_element_count = 0.0
-        local_observation_count = 0
-        local_valid_observation_count = 0
-        local_heldout_indices: list[int] = []
         requested_prefix_horizons = (1, 5, 10, 20, 50)
-        prefix_abs_sums: dict[int, float] = {}
-        prefix_element_counts: dict[int, float] = {}
-        prefix_arm_abs_sums: dict[int, float] = {}
-        prefix_arm_element_counts: dict[int, float] = {}
-        arm_dimensions: tuple[int, ...] | None = None
+        subtask_counts, evaluable_subtask_counts = _heldout_report_subtask_counts(
+            sampling_report
+        )
+        report_action_subtasks: set[int] = set()
+        if sampling_report is not None:
+            for counts in sampling_report.get(
+                "subtask_action_timestep_counts_by_horizon", {}
+            ).values():
+                if isinstance(counts, Mapping):
+                    report_action_subtasks.update(int(key) for key in counts)
+        expected_subtasks = tuple(
+            sorted(set(subtask_counts) | report_action_subtasks)
+        )
+        local_heldout_indices: list[int] = []
         action_shape: tuple[int, int] | None = None
+        action_groups: dict[str, tuple[int, ...]] = {}
+        available_prefix_horizons: tuple[int, ...] = ()
+        control_metadata_seen: bool | None = None
+
+        totals = {
+            "abs_sum": 0.0,
+            "sq_sum": 0.0,
+            "element_count": 0.0,
+            "observations": 0.0,
+            "valid_observations": 0.0,
+        }
+        group_stats: dict[tuple[int, str], dict[str, float]] = {}
+        subtask_stats: dict[tuple[int, int, str], dict[str, float]] = {}
+        subtask_observations = {subtask: 0.0 for subtask in expected_subtasks}
+        subtask_valid_observations = {
+            subtask: 0.0 for subtask in expected_subtasks
+        }
+        subtask_action_timesteps: dict[tuple[int, int], float] = {}
+        gripper_stats: dict[int, dict[str, float]] = {}
+
+        def _new_group_stats() -> dict[str, float]:
+            return {
+                "policy_abs": 0.0,
+                "count": 0.0,
+                "hold_abs": 0.0,
+                "movement_policy_abs": 0.0,
+                "movement_hold_abs": 0.0,
+                "movement_count": 0.0,
+                "direction_correct": 0.0,
+            }
+
+        def _new_gripper_stats() -> dict[str, float]:
+            return {
+                "target_close": 0.0,
+                "target_open": 0.0,
+                "predicted_close": 0.0,
+                "true_close": 0.0,
+                "true_open": 0.0,
+                "open_to_close": 0.0,
+                "open_to_close_correct": 0.0,
+                "close_to_open": 0.0,
+                "close_to_open_correct": 0.0,
+                "open_to_close_windows": 0.0,
+                "close_to_open_windows": 0.0,
+            }
+
         try:
             infer_model.eval()
             with _isolated_evaluation_rng(
-                getattr(self, "heldout_eval_seed", 0),
+                int(
+                    getattr(self, "heldout_eval_seed", 0)
+                    if evaluation_seed is None
+                    else evaluation_seed
+                ),
                 self.accelerator.device,
             ), torch.inference_mode():
                 for raw_examples in batches:
@@ -2367,8 +3007,41 @@ class VLATrainer(TrainerUtils):
                             "cannot prove complete, duplicate-free coverage."
                         )
                     local_heldout_indices.extend(heldout_indices)
-                    examples = self._without_heldout_metadata(raw_examples)
+                    hold_actions = self._heldout_metadata_array(
+                        raw_examples, "_heldout_eval_hold_action"
+                    )
+                    action_midpoints = self._heldout_metadata_array(
+                        raw_examples, "_heldout_eval_action_midpoint"
+                    )
+                    subtask_indices = self._heldout_metadata_array(
+                        raw_examples, "_heldout_eval_subtask_index"
+                    )
+                    action_subtask_indices = self._heldout_metadata_array(
+                        raw_examples, "_heldout_eval_action_subtask_indices"
+                    )
+                    has_control_metadata = all(
+                        value is not None
+                        for value in (
+                            hold_actions,
+                            action_midpoints,
+                            subtask_indices,
+                            action_subtask_indices,
+                        )
+                    )
+                    if require_heldout_indices and not has_control_metadata:
+                        raise RuntimeError(
+                            "Heldout eval batch is missing current-state hold, action "
+                            "midpoint, anchor-subtask, or per-action subtask metadata "
+                            "required by control metrics."
+                        )
+                    if control_metadata_seen is None:
+                        control_metadata_seen = has_control_metadata
+                    elif control_metadata_seen != has_control_metadata:
+                        raise RuntimeError(
+                            "Heldout control metadata presence changed between microbatches."
+                        )
 
+                    examples = self._without_heldout_metadata(raw_examples)
                     if isinstance(examples, Mapping):
                         actions = self._eval_numpy(examples["action"])
                         action_mask = examples.get("action_mask")
@@ -2415,178 +3088,343 @@ class VLATrainer(TrainerUtils):
                         self._eval_numpy(output_dict["normalized_actions"]),
                         dtype=np.float32,
                     )
-                    if normalized_actions.shape != actions.shape:
-                        raise RuntimeError(
-                            "Evaluation prediction/target shape mismatch: "
-                            f"predicted={normalized_actions.shape}, target={actions.shape}."
-                        )
                     if actions.ndim != 3:
                         raise RuntimeError(
                             "Evaluation actions must have shape [batch, horizon, dim], "
                             f"got {actions.shape}."
                         )
+                    if normalized_actions.shape != actions.shape:
+                        raise RuntimeError(
+                            "Evaluation prediction/target shape mismatch: "
+                            f"predicted={normalized_actions.shape}, target={actions.shape}."
+                        )
                     current_action_shape = (int(actions.shape[1]), int(actions.shape[2]))
                     if action_shape is None:
                         action_shape = current_action_shape
-                        arm_dimensions = self._eval_arm_dimensions(actions.shape[2])
+                        action_groups = self._eval_action_groups(actions.shape[2])
+                        available_prefix_horizons = tuple(
+                            horizon
+                            for horizon in requested_prefix_horizons
+                            if horizon <= int(actions.shape[1])
+                        )
+                        for horizon in available_prefix_horizons:
+                            for group_name in action_groups:
+                                group_stats[(horizon, group_name)] = _new_group_stats()
+                                for subtask in expected_subtasks:
+                                    subtask_stats[(subtask, horizon, group_name)] = {
+                                        "policy_abs": 0.0,
+                                        "count": 0.0,
+                                    }
+                            for subtask in expected_subtasks:
+                                subtask_action_timesteps[(subtask, horizon)] = 0.0
+                            if "gripper" in action_groups:
+                                gripper_stats[horizon] = _new_gripper_stats()
                     elif current_action_shape != action_shape:
                         raise RuntimeError(
                             "Evaluation action shape changed between microbatches: "
                             f"{current_action_shape} != {action_shape}."
                         )
-                    metric_mask = None
+
+                    metric_mask = np.ones_like(actions, dtype=bool)
                     if action_mask is not None:
-                        metric_mask = np.asarray(action_mask, dtype=np.float32)
+                        raw_mask = np.asarray(action_mask, dtype=bool)
+                        if raw_mask.shape != actions.shape:
+                            raw_mask = np.broadcast_to(raw_mask, actions.shape)
+                        metric_mask &= raw_mask
                     if action_is_pad is not None:
-                        timestep_mask = (
-                            ~np.asarray(action_is_pad, dtype=bool)
-                        ).astype(np.float32)
+                        timestep_mask = ~np.asarray(action_is_pad, dtype=bool)
                         if timestep_mask.ndim == 2:
                             timestep_mask = timestep_mask[..., None]
-                        metric_mask = (
-                            timestep_mask
-                            if metric_mask is None
-                            else metric_mask * timestep_mask
+                        metric_mask &= np.broadcast_to(timestep_mask, actions.shape)
+
+                    nonfinite_valid = metric_mask & (
+                        ~np.isfinite(normalized_actions) | ~np.isfinite(actions)
+                    )
+                    if bool(nonfinite_valid.any()):
+                        raise RuntimeError(
+                            "Evaluation prediction/target contains non-finite values "
+                            "at supervised action elements: "
+                            f"count={int(nonfinite_valid.sum())}."
                         )
-                    if metric_mask is not None:
-                        if metric_mask.shape != normalized_actions.shape:
-                            metric_mask = np.broadcast_to(
-                                metric_mask,
-                                normalized_actions.shape,
-                            )
-                        metric_mask = np.asarray(metric_mask, dtype=bool)
-                        nonfinite_valid = metric_mask & (
-                            ~np.isfinite(normalized_actions) | ~np.isfinite(actions)
-                        )
-                        if bool(nonfinite_valid.any()):
+                    diff = np.zeros_like(normalized_actions, dtype=np.float32)
+                    np.subtract(
+                        normalized_actions,
+                        actions,
+                        out=diff,
+                        where=metric_mask,
+                    )
+                    per_observation_counts = metric_mask.reshape(
+                        metric_mask.shape[0], -1
+                    ).sum(axis=1)
+                    valid_observation = per_observation_counts > 0
+
+                    totals["abs_sum"] += float(np.abs(diff).sum())
+                    totals["sq_sum"] += float(np.square(diff).sum())
+                    totals["element_count"] += float(metric_mask.sum())
+                    totals["observations"] += float(actions.shape[0])
+                    totals["valid_observations"] += float(valid_observation.sum())
+
+                    if has_control_metadata:
+                        hold_actions = np.asarray(hold_actions, dtype=np.float32)
+                        action_midpoints = np.asarray(action_midpoints, dtype=np.float32)
+                        subtask_indices = np.asarray(subtask_indices).reshape(-1)
+                        action_subtask_indices = np.asarray(action_subtask_indices)
+                        if hold_actions.ndim == 1 and actions.shape[0] == 1:
+                            hold_actions = hold_actions[None, :]
+                        if action_midpoints.ndim == 1 and actions.shape[0] == 1:
+                            action_midpoints = action_midpoints[None, :]
+                        expected_metadata_shape = (actions.shape[0], actions.shape[2])
+                        if hold_actions.shape != expected_metadata_shape:
                             raise RuntimeError(
-                                "Evaluation prediction/target contains non-finite "
-                                "values at supervised action elements: "
-                                f"count={int(nonfinite_valid.sum())}."
+                                "Heldout current-state hold shape mismatch: "
+                                f"{hold_actions.shape} != {expected_metadata_shape}."
                             )
-                        # np.where(pred-target, ...) would still evaluate the
-                        # masked subtraction.  Using ufunc `where` prevents NaN
-                        # or inf in a truly masked target (including the all-
-                        # invalid episode) from poisoning aggregate sums.
-                        diff = np.zeros_like(normalized_actions, dtype=np.float32)
+                        if action_midpoints.shape != expected_metadata_shape:
+                            raise RuntimeError(
+                                "Heldout action-midpoint shape mismatch: "
+                                f"{action_midpoints.shape} != {expected_metadata_shape}."
+                            )
+                        if subtask_indices.shape != (actions.shape[0],):
+                            raise RuntimeError(
+                                "Heldout subtask metadata shape mismatch: "
+                                f"{subtask_indices.shape} != {(actions.shape[0],)}."
+                            )
+                        if action_subtask_indices.ndim == 1 and actions.shape[0] == 1:
+                            action_subtask_indices = action_subtask_indices[None, :]
+                        expected_action_subtask_shape = actions.shape[:2]
+                        if action_subtask_indices.shape != expected_action_subtask_shape:
+                            raise RuntimeError(
+                                "Heldout per-action subtask metadata shape mismatch: "
+                                f"{action_subtask_indices.shape} != "
+                                f"{expected_action_subtask_shape}."
+                            )
+                        if not np.all(np.isfinite(hold_actions)) or not np.all(
+                            np.isfinite(action_midpoints)
+                        ):
+                            raise RuntimeError(
+                                "Heldout hold or action-midpoint metadata contains NaN/Inf."
+                            )
+                        subtasks = np.asarray(
+                            [int(value) for value in subtask_indices], dtype=np.int64
+                        )
+                        action_subtasks = np.asarray(
+                            action_subtask_indices, dtype=np.int64
+                        )
+                        unknown_subtasks = sorted(
+                            (
+                                set(subtasks.tolist())
+                                | set(action_subtasks.reshape(-1).tolist())
+                            )
+                            - set(expected_subtasks)
+                        )
+                        if unknown_subtasks:
+                            raise RuntimeError(
+                                "Heldout eval observed subtasks absent from its immutable "
+                                f"sampling report: {unknown_subtasks}."
+                            )
+                        hold_chunk = np.broadcast_to(
+                            hold_actions[:, None, :], actions.shape
+                        )
+                        target_delta = actions - hold_chunk
+                        prediction_delta = normalized_actions - hold_chunk
+                        hold_error = np.zeros_like(actions, dtype=np.float32)
                         np.subtract(
-                            normalized_actions,
+                            hold_chunk,
                             actions,
-                            out=diff,
+                            out=hold_error,
                             where=metric_mask,
                         )
-                        metric_count = float(metric_mask.sum())
-                        per_observation_counts = metric_mask.reshape(
-                            metric_mask.shape[0], -1
-                        ).sum(axis=1)
-                        valid_observation_count = int(
-                            (per_observation_counts > 0).sum()
+                        movement_mask = metric_mask & (
+                            np.abs(target_delta) >= movement_threshold
                         )
+                        direction_correct = target_delta * prediction_delta > 0
+                        for subtask in expected_subtasks:
+                            selected = subtasks == subtask
+                            subtask_observations[subtask] += float(selected.sum())
+                            subtask_valid_observations[subtask] += float(
+                                (selected & valid_observation).sum()
+                            )
                     else:
-                        nonfinite = (
-                            ~np.isfinite(normalized_actions) | ~np.isfinite(actions)
-                        )
-                        if bool(nonfinite.any()):
-                            raise RuntimeError(
-                                "Evaluation prediction/target contains non-finite "
-                                "values at supervised action elements: "
-                                f"count={int(nonfinite.sum())}."
-                            )
-                        diff = normalized_actions - actions
-                        metric_count = float(diff.size)
-                        valid_observation_count = int(actions.shape[0])
+                        hold_error = None
+                        movement_mask = None
+                        direction_correct = None
+                        subtasks = None
+                        action_subtasks = None
 
-                    for prefix_horizon in requested_prefix_horizons:
-                        if prefix_horizon > int(actions.shape[1]):
-                            continue
-                        prefix_diff = diff[:, :prefix_horizon, :]
-                        if metric_mask is None:
-                            prefix_count = float(prefix_diff.size)
-                            prefix_arm_count = (
-                                float(
-                                    actions.shape[0]
-                                    * prefix_horizon
-                                    * len(arm_dimensions)
+                    for horizon in available_prefix_horizons:
+                        if has_control_metadata:
+                            for subtask in expected_subtasks:
+                                subtask_action_timesteps[(subtask, horizon)] += float(
+                                    (action_subtasks[:, :horizon] == subtask).sum()
                                 )
-                                if arm_dimensions is not None
-                                else 0.0
-                            )
-                        else:
-                            prefix_mask = metric_mask[:, :prefix_horizon, :]
-                            prefix_count = float(prefix_mask.sum())
-                            prefix_arm_count = (
-                                float(prefix_mask[..., arm_dimensions].sum())
-                                if arm_dimensions is not None
-                                else 0.0
-                            )
-                        prefix_abs_sums[prefix_horizon] = (
-                            prefix_abs_sums.get(prefix_horizon, 0.0)
-                            + float(np.abs(prefix_diff).sum())
-                        )
-                        prefix_element_counts[prefix_horizon] = (
-                            prefix_element_counts.get(prefix_horizon, 0.0)
-                            + prefix_count
-                        )
-                        if arm_dimensions is not None:
-                            prefix_arm_abs_sums[prefix_horizon] = (
-                                prefix_arm_abs_sums.get(prefix_horizon, 0.0)
-                                + float(
-                                    np.abs(prefix_diff[..., arm_dimensions]).sum()
+                        for group_name, dimensions in action_groups.items():
+                            dim_array = np.asarray(dimensions, dtype=np.int64)
+                            selected_mask = metric_mask[:, :horizon, :][..., dim_array]
+                            selected_diff = diff[:, :horizon, :][..., dim_array]
+                            stats = group_stats[(horizon, group_name)]
+                            stats["policy_abs"] += float(np.abs(selected_diff).sum())
+                            stats["count"] += float(selected_mask.sum())
+                            if has_control_metadata:
+                                selected_hold = hold_error[:, :horizon, :][..., dim_array]
+                                selected_movement = movement_mask[:, :horizon, :][
+                                    ..., dim_array
+                                ]
+                                stats["hold_abs"] += float(np.abs(selected_hold).sum())
+                                stats["movement_policy_abs"] += float(
+                                    np.abs(selected_diff)[selected_movement].sum()
                                 )
+                                stats["movement_hold_abs"] += float(
+                                    np.abs(selected_hold)[selected_movement].sum()
+                                )
+                                stats["movement_count"] += float(
+                                    selected_movement.sum()
+                                )
+                                stats["direction_correct"] += float(
+                                    direction_correct[:, :horizon, :][..., dim_array][
+                                        selected_movement
+                                    ].sum()
+                                )
+                                for subtask in expected_subtasks:
+                                    timestep_selector = (
+                                        action_subtasks[:, :horizon] == subtask
+                                    )
+                                    stage_mask = selected_mask & timestep_selector[
+                                        :, :, None
+                                    ]
+                                    stage_stats = subtask_stats[
+                                        (subtask, horizon, group_name)
+                                    ]
+                                    stage_stats["policy_abs"] += float(
+                                        np.abs(selected_diff)[stage_mask].sum()
+                                    )
+                                    stage_stats["count"] += float(stage_mask.sum())
+                        if has_control_metadata and "gripper" in action_groups:
+                            gripper_dimensions = np.asarray(
+                                action_groups["gripper"], dtype=np.int64
                             )
-                            prefix_arm_element_counts[prefix_horizon] = (
-                                prefix_arm_element_counts.get(prefix_horizon, 0.0)
-                                + prefix_arm_count
+                            gripper_mask = metric_mask[:, :horizon, :][
+                                ..., gripper_dimensions
+                            ]
+                            thresholds = action_midpoints[:, None, gripper_dimensions]
+                            target_close = (
+                                actions[:, :horizon, :][..., gripper_dimensions]
+                                < thresholds
                             )
-
-                    local_abs_sum += float(np.abs(diff).sum())
-                    local_sq_sum += float(np.square(diff).sum())
-                    local_element_count += metric_count
-                    local_observation_count += int(actions.shape[0])
-                    local_valid_observation_count += valid_observation_count
+                            predicted_close = (
+                                normalized_actions[:, :horizon, :][..., gripper_dimensions]
+                                < thresholds
+                            )
+                            current_close = hold_actions[:, gripper_dimensions] < action_midpoints[
+                                :, gripper_dimensions
+                            ]
+                            previous_close = np.concatenate(
+                                (current_close[:, None, :], target_close[:, :-1, :]),
+                                axis=1,
+                            )
+                            previous_valid = np.concatenate(
+                                (
+                                    np.ones_like(current_close[:, None, :], dtype=bool),
+                                    gripper_mask[:, :-1, :],
+                                ),
+                                axis=1,
+                            )
+                            transition_valid = gripper_mask & previous_valid
+                            open_to_close = (
+                                ~previous_close & target_close & transition_valid
+                            )
+                            close_to_open = (
+                                previous_close & ~target_close & transition_valid
+                            )
+                            stats = gripper_stats[horizon]
+                            stats["target_close"] += float(
+                                (target_close & gripper_mask).sum()
+                            )
+                            stats["target_open"] += float(
+                                (~target_close & gripper_mask).sum()
+                            )
+                            stats["predicted_close"] += float(
+                                (predicted_close & gripper_mask).sum()
+                            )
+                            stats["true_close"] += float(
+                                (predicted_close & target_close & gripper_mask).sum()
+                            )
+                            stats["true_open"] += float(
+                                (~predicted_close & ~target_close & gripper_mask).sum()
+                            )
+                            stats["open_to_close"] += float(open_to_close.sum())
+                            stats["open_to_close_correct"] += float(
+                                (predicted_close & open_to_close).sum()
+                            )
+                            stats["close_to_open"] += float(close_to_open.sum())
+                            stats["close_to_open_correct"] += float(
+                                (~predicted_close & close_to_open).sum()
+                            )
+                            stats["open_to_close_windows"] += float(
+                                open_to_close.any(axis=(1, 2)).sum()
+                            )
+                            stats["close_to_open_windows"] += float(
+                                close_to_open.any(axis=(1, 2)).sum()
+                            )
         finally:
-            # Restore every module's exact prior mode. Calling model.train()
-            # would incorrectly switch frozen V-JEPA/teacher modules that were
-            # intentionally already in eval mode.
             for module, was_training in module_modes:
                 module.training = was_training
 
-        available_prefix_horizons = tuple(sorted(prefix_abs_sums))
-        local_metric_values = [
-            local_abs_sum,
-            local_sq_sum,
-            local_element_count,
-            float(local_observation_count),
-            float(local_valid_observation_count),
+        if action_shape is None:
+            raise RuntimeError("Evaluation loader produced no batches.")
+        if transition_coverage_horizon is not None and "gripper" not in action_groups:
+            raise RuntimeError(
+                "Transition coverage was requested for an action layout without "
+                "the RealMan gripper actuator group."
+            )
+
+        scalar_entries: list[tuple[tuple, float]] = [
+            (("total", key), float(value)) for key, value in totals.items()
         ]
-        for prefix_horizon in available_prefix_horizons:
-            local_metric_values.extend(
+        for key in sorted(group_stats):
+            for field in sorted(group_stats[key]):
+                scalar_entries.append((("group", *key, field), group_stats[key][field]))
+        for subtask in expected_subtasks:
+            scalar_entries.append(
+                (("subtask_observations", subtask), subtask_observations[subtask])
+            )
+            scalar_entries.append(
                 (
-                    prefix_abs_sums[prefix_horizon],
-                    prefix_element_counts[prefix_horizon],
+                    ("subtask_valid_observations", subtask),
+                    subtask_valid_observations[subtask],
                 )
             )
-            if arm_dimensions is not None:
-                local_metric_values.extend(
-                    (
-                        prefix_arm_abs_sums[prefix_horizon],
-                        prefix_arm_element_counts[prefix_horizon],
-                    )
+        for key in sorted(subtask_stats):
+            for field in sorted(subtask_stats[key]):
+                scalar_entries.append(
+                    (("subtask", *key, field), subtask_stats[key][field])
+                )
+        for key in sorted(subtask_action_timesteps):
+            scalar_entries.append(
+                (
+                    ("subtask_action_timesteps", *key),
+                    subtask_action_timesteps[key],
+                )
+            )
+        for horizon in sorted(gripper_stats):
+            for field in sorted(gripper_stats[horizon]):
+                scalar_entries.append(
+                    (("gripper", horizon, field), gripper_stats[horizon][field])
                 )
         local_metrics = torch.tensor(
-            local_metric_values,
+            [value for _, value in scalar_entries],
             device=self.accelerator.device,
             dtype=torch.float64,
         )
         reduced_metrics = self.accelerator.reduce(local_metrics, reduction="sum")
-        reduced_values = reduced_metrics.tolist()
-        (
-            total_abs_sum,
-            total_sq_sum,
-            total_count,
-            total_observations,
-            total_valid_observations,
-        ) = reduced_values[:5]
+        reduced = {
+            key: float(value)
+            for (key, _), value in zip(scalar_entries, reduced_metrics.tolist())
+        }
+        total_abs_sum = reduced[("total", "abs_sum")]
+        total_sq_sum = reduced[("total", "sq_sum")]
+        total_count = reduced[("total", "element_count")]
+        total_observations = reduced[("total", "observations")]
+        total_valid_observations = reduced[("total", "valid_observations")]
 
         if expected_observations is not None:
             if int(total_observations) != int(expected_observations):
@@ -2595,17 +3433,27 @@ class VLATrainer(TrainerUtils):
                     f"global batch: got {int(total_observations)} observations, "
                     f"expected {int(expected_observations)}."
                 )
-            local_index_tensor = torch.tensor(
-                local_heldout_indices,
-                device=self.accelerator.device,
-                dtype=torch.int64,
-            )
-            gather = getattr(self.accelerator, "gather", None)
-            if callable(gather):
-                gathered_indices = gather(local_index_tensor).detach().cpu().tolist()
+            if dist.is_initialized():
+                # The frozen pilot audit deliberately has 95 examples over
+                # eight ranks (7x12 + 1x11). Tensor all-gather requires equal
+                # shapes and would either fail or force duplicate padding.
+                # Object gather preserves the exact variable-length index list
+                # from each rank so the no-replacement audit remains provable.
+                gathered_indices = gather_object(local_heldout_indices)
             else:
-                # Unit-test/single-process accelerators may expose only reduce.
-                gathered_indices = local_index_tensor.detach().cpu().tolist()
+                local_index_tensor = torch.tensor(
+                    local_heldout_indices,
+                    device=self.accelerator.device,
+                    dtype=torch.int64,
+                )
+                gather = getattr(self.accelerator, "gather", None)
+                if callable(gather):
+                    gathered_indices = (
+                        gather(local_index_tensor).detach().cpu().tolist()
+                    )
+                else:
+                    # Unit-test/single-process accelerators may expose only reduce.
+                    gathered_indices = local_index_tensor.detach().cpu().tolist()
             expected_indices = list(range(int(expected_observations)))
             if sorted(int(value) for value in gathered_indices) != expected_indices:
                 raise RuntimeError(
@@ -2634,29 +3482,388 @@ class VLATrainer(TrainerUtils):
             total_valid_observations
         )
         step_metrics[f"{metric_prefix}_valid_action_elements"] = float(total_count)
-        metric_offset = 5
-        for prefix_horizon in available_prefix_horizons:
-            prefix_abs_sum = float(reduced_values[metric_offset])
-            prefix_count = float(reduced_values[metric_offset + 1])
-            metric_offset += 2
-            step_metrics[
-                f"{metric_prefix}_valid_all_action_elements_h{prefix_horizon}"
-            ] = prefix_count
-            if prefix_count > 0:
+        for horizon in available_prefix_horizons:
+            for group_name in action_groups:
+                count = reduced[("group", horizon, group_name, "count")]
+                policy_abs = reduced[("group", horizon, group_name, "policy_abs")]
                 step_metrics[
-                    f"{metric_prefix}_normalized_all_action_mae_h{prefix_horizon}"
-                ] = prefix_abs_sum / prefix_count
-            if arm_dimensions is not None:
-                prefix_arm_abs_sum = float(reduced_values[metric_offset])
-                prefix_arm_count = float(reduced_values[metric_offset + 1])
-                metric_offset += 2
-                step_metrics[
-                    f"{metric_prefix}_valid_arm_elements_h{prefix_horizon}"
-                ] = prefix_arm_count
-                if prefix_arm_count > 0:
+                    f"{metric_prefix}_valid_{group_name}_elements_h{horizon}"
+                ] = count
+                if count > 0:
                     step_metrics[
-                        f"{metric_prefix}_normalized_arm_mae_h{prefix_horizon}"
-                    ] = prefix_arm_abs_sum / prefix_arm_count
+                        f"{metric_prefix}_normalized_{group_name}_mae_h{horizon}"
+                    ] = policy_abs / count
+                if control_metadata_seen:
+                    hold_abs = reduced[("group", horizon, group_name, "hold_abs")]
+                    movement_count = reduced[
+                        ("group", horizon, group_name, "movement_count")
+                    ]
+                    movement_policy_abs = reduced[
+                        ("group", horizon, group_name, "movement_policy_abs")
+                    ]
+                    movement_hold_abs = reduced[
+                        ("group", horizon, group_name, "movement_hold_abs")
+                    ]
+                    direction_correct = reduced[
+                        ("group", horizon, group_name, "direction_correct")
+                    ]
+                    if count > 0:
+                        hold_mae = hold_abs / count
+                        step_metrics[
+                            f"{metric_prefix}_current_state_hold_normalized_"
+                            f"{group_name}_mae_h{horizon}"
+                        ] = hold_mae
+                        if hold_abs > 0:
+                            step_metrics[
+                                f"{metric_prefix}_policy_vs_hold_{group_name}_"
+                                f"mae_ratio_h{horizon}"
+                            ] = policy_abs / hold_abs
+                    step_metrics[
+                        f"{metric_prefix}_movement_{group_name}_elements_h{horizon}"
+                    ] = movement_count
+                    if movement_count > 0:
+                        step_metrics[
+                            f"{metric_prefix}_normalized_{group_name}_movement_"
+                            f"mae_h{horizon}"
+                        ] = movement_policy_abs / movement_count
+                        step_metrics[
+                            f"{metric_prefix}_current_state_hold_normalized_"
+                            f"{group_name}_movement_mae_h{horizon}"
+                        ] = movement_hold_abs / movement_count
+                        if movement_hold_abs > 0:
+                            step_metrics[
+                                f"{metric_prefix}_policy_vs_hold_{group_name}_"
+                                f"movement_mae_ratio_h{horizon}"
+                            ] = movement_policy_abs / movement_hold_abs
+                        step_metrics[
+                            f"{metric_prefix}_{group_name}_movement_direction_"
+                            f"accuracy_h{horizon}"
+                        ] = direction_correct / movement_count
+
+        if control_metadata_seen:
+            for subtask in expected_subtasks:
+                observations = reduced[("subtask_observations", subtask)]
+                valid_observations = reduced[
+                    ("subtask_valid_observations", subtask)
+                ]
+                expected_count = int(subtask_counts.get(subtask, 0))
+                expected_valid_count = int(evaluable_subtask_counts.get(subtask, 0))
+                if int(observations) != expected_count or int(
+                    valid_observations
+                ) != expected_valid_count:
+                    raise RuntimeError(
+                        "Heldout per-subtask coverage differs from its immutable "
+                        f"sampling report for subtask {subtask}: observations="
+                        f"{int(observations)}/{expected_count}, evaluable="
+                        f"{int(valid_observations)}/{expected_valid_count}."
+                    )
+                step_metrics[
+                    f"{metric_prefix}_subtask_{subtask}_observations"
+                ] = observations
+                step_metrics[
+                    f"{metric_prefix}_subtask_{subtask}_action_evaluable_observations"
+                ] = valid_observations
+                for horizon in available_prefix_horizons:
+                    action_timestep_count = reduced[
+                        ("subtask_action_timesteps", subtask, horizon)
+                    ]
+                    step_metrics[
+                        f"{metric_prefix}_subtask_{subtask}_action_timesteps_h{horizon}"
+                    ] = action_timestep_count
+                    expected_action_timestep_counts = (
+                        _heldout_report_action_subtask_counts(
+                            sampling_report,
+                            horizon=horizon,
+                            field="subtask_action_timestep_counts_by_horizon",
+                        )
+                    )
+                    if expected_action_timestep_counts and int(
+                        action_timestep_count
+                    ) != int(expected_action_timestep_counts.get(subtask, 0)):
+                        raise RuntimeError(
+                            "Heldout per-action subtask timestep coverage differs "
+                            f"from its immutable report at h{horizon}, subtask "
+                            f"{subtask}: {int(action_timestep_count)}/"
+                            f"{int(expected_action_timestep_counts.get(subtask, 0))}."
+                        )
+                    for group_name in action_groups:
+                        count = reduced[
+                            ("subtask", subtask, horizon, group_name, "count")
+                        ]
+                        policy_abs = reduced[
+                            ("subtask", subtask, horizon, group_name, "policy_abs")
+                        ]
+                        step_metrics[
+                            f"{metric_prefix}_subtask_{subtask}_valid_{group_name}_"
+                            f"elements_h{horizon}"
+                        ] = count
+                        if count > 0:
+                            step_metrics[
+                                f"{metric_prefix}_subtask_{subtask}_normalized_"
+                                f"{group_name}_mae_h{horizon}"
+                            ] = policy_abs / count
+                        if group_name == "all_action":
+                            expected_valid_counts = (
+                                _heldout_report_action_subtask_counts(
+                                    sampling_report,
+                                    horizon=horizon,
+                                    field=(
+                                        "subtask_valid_action_element_counts_by_horizon"
+                                    ),
+                                )
+                            )
+                            if expected_valid_counts and int(count) != int(
+                                expected_valid_counts.get(subtask, 0)
+                            ):
+                                raise RuntimeError(
+                                    "Heldout per-action subtask valid-element "
+                                    "coverage differs from its immutable report at "
+                                    f"h{horizon}, subtask {subtask}: {int(count)}/"
+                                    f"{int(expected_valid_counts.get(subtask, 0))}."
+                                )
+
+            if "gripper" in action_groups:
+                for horizon in available_prefix_horizons:
+                    values = {
+                        field: reduced[("gripper", horizon, field)]
+                        for field in gripper_stats[horizon]
+                    }
+                    for field in (
+                        "target_close",
+                        "target_open",
+                        "open_to_close",
+                        "close_to_open",
+                    ):
+                        step_metrics[
+                            f"{metric_prefix}_gripper_{field}_elements_h{horizon}"
+                        ] = values[field]
+                    step_metrics[
+                        f"{metric_prefix}_gripper_open_to_close_windows_h{horizon}"
+                    ] = values["open_to_close_windows"]
+                    step_metrics[
+                        f"{metric_prefix}_gripper_close_to_open_windows_h{horizon}"
+                    ] = values["close_to_open_windows"]
+                    if values["target_close"] > 0:
+                        step_metrics[
+                            f"{metric_prefix}_gripper_close_recall_h{horizon}"
+                        ] = values["true_close"] / values["target_close"]
+                    if values["predicted_close"] > 0:
+                        step_metrics[
+                            f"{metric_prefix}_gripper_close_precision_h{horizon}"
+                        ] = values["true_close"] / values["predicted_close"]
+                    if values["target_open"] > 0:
+                        step_metrics[
+                            f"{metric_prefix}_gripper_open_recall_h{horizon}"
+                        ] = values["true_open"] / values["target_open"]
+                    if values["target_close"] > 0 and values["target_open"] > 0:
+                        step_metrics[
+                            f"{metric_prefix}_gripper_balanced_accuracy_h{horizon}"
+                        ] = 0.5 * (
+                            values["true_close"] / values["target_close"]
+                            + values["true_open"] / values["target_open"]
+                        )
+                    if values["open_to_close"] > 0:
+                        step_metrics[
+                            f"{metric_prefix}_gripper_open_to_close_recall_h{horizon}"
+                        ] = (
+                            values["open_to_close_correct"]
+                            / values["open_to_close"]
+                        )
+                    if values["close_to_open"] > 0:
+                        step_metrics[
+                            f"{metric_prefix}_gripper_close_to_open_recall_h{horizon}"
+                        ] = (
+                            values["close_to_open_correct"]
+                            / values["close_to_open"]
+                        )
+                    if (
+                        values["open_to_close"] > 0
+                        and values["close_to_open"] > 0
+                    ):
+                        open_to_close_recall = (
+                            values["open_to_close_correct"]
+                            / values["open_to_close"]
+                        )
+                        close_to_open_recall = (
+                            values["close_to_open_correct"]
+                            / values["close_to_open"]
+                        )
+                        transition_balanced_recall = 0.5 * (
+                            open_to_close_recall + close_to_open_recall
+                        )
+                        transition_min_recall = min(
+                            open_to_close_recall,
+                            close_to_open_recall,
+                        )
+                        step_metrics[
+                            f"{metric_prefix}_gripper_transition_balanced_"
+                            f"recall_h{horizon}"
+                        ] = transition_balanced_recall
+                        step_metrics[
+                            f"{metric_prefix}_gripper_transition_min_"
+                            f"recall_h{horizon}"
+                        ] = transition_min_recall
+                        arm_ratio_key = (
+                            f"{metric_prefix}_policy_vs_hold_arm_movement_"
+                            f"mae_ratio_h{horizon}"
+                        )
+                        if arm_ratio_key in step_metrics:
+                            # Lower is better and non-compensatory: if either
+                            # transition direction is ignored, arm motion alone
+                            # cannot improve the score below 1. Arm quality only
+                            # improves a checkpoint after both grasp and release
+                            # recall are non-zero.
+                            arm_ratio = max(float(step_metrics[arm_ratio_key]), 0.0)
+                            task_success_score = transition_min_recall / (
+                                1.0 + arm_ratio
+                            )
+                            step_metrics[
+                                f"{metric_prefix}_task_success_score_h{horizon}"
+                            ] = task_success_score
+                            step_metrics[
+                                f"{metric_prefix}_task_failure_score_h{horizon}"
+                            ] = 1.0 - task_success_score
+
+                if (
+                    any(
+                        value < 0
+                        for value in (
+                            minimum_open_to_close_transitions,
+                            minimum_close_to_open_transitions,
+                            minimum_open_to_close_windows,
+                            minimum_close_to_open_windows,
+                            minimum_arm_movement_elements,
+                        )
+                    )
+                    or not math.isfinite(float(minimum_arm_movement_hold_abs))
+                    or minimum_arm_movement_hold_abs < 0
+                ):
+                    raise ValueError(
+                        "Heldout minimum movement/transition coverage values must "
+                        "be finite and non-negative."
+                    )
+                if transition_coverage_horizon is not None:
+                    transition_horizon = int(transition_coverage_horizon)
+                    if transition_horizon not in available_prefix_horizons:
+                        raise RuntimeError(
+                            "Configured transition coverage horizon must be one of "
+                            f"{available_prefix_horizons}, got {transition_horizon}."
+                        )
+                    transition_values = {
+                        field: reduced[("gripper", transition_horizon, field)]
+                        for field in gripper_stats[transition_horizon]
+                    }
+                    if (
+                        transition_values["open_to_close"]
+                        < minimum_open_to_close_transitions
+                        or transition_values["close_to_open"]
+                        < minimum_close_to_open_transitions
+                        or transition_values["open_to_close_windows"]
+                        < minimum_open_to_close_windows
+                        or transition_values["close_to_open_windows"]
+                        < minimum_close_to_open_windows
+                    ):
+                        raise RuntimeError(
+                            "Heldout gripper transition coverage is insufficient at "
+                            f"h{transition_horizon}: open_to_close_events="
+                            f"{int(transition_values['open_to_close'])}/"
+                            f"{minimum_open_to_close_transitions}, close_to_open_events="
+                            f"{int(transition_values['close_to_open'])}/"
+                            f"{minimum_close_to_open_transitions}, "
+                            f"open_to_close_windows="
+                            f"{int(transition_values['open_to_close_windows'])}/"
+                            f"{minimum_open_to_close_windows}, "
+                            f"close_to_open_windows="
+                            f"{int(transition_values['close_to_open_windows'])}/"
+                            f"{minimum_close_to_open_windows}."
+                        )
+                    arm_movement_count = reduced[
+                        ("group", transition_horizon, "arm", "movement_count")
+                    ]
+                    arm_movement_hold_abs = reduced[
+                        (
+                            "group",
+                            transition_horizon,
+                            "arm",
+                            "movement_hold_abs",
+                        )
+                    ]
+                    if sampling_report is not None:
+                        expected_transition_coverage = {
+                            "open_to_close": sampling_report.get(
+                                "open_to_close_transition_count_h10"
+                            ),
+                            "close_to_open": sampling_report.get(
+                                "close_to_open_transition_count_h10"
+                            ),
+                            "open_to_close_windows": sampling_report.get(
+                                "open_to_close_transition_window_count_h10"
+                            ),
+                            "close_to_open_windows": sampling_report.get(
+                                "close_to_open_transition_window_count_h10"
+                            ),
+                        }
+                        mismatched_transition_coverage = {
+                            key: (int(transition_values[key]), int(expected))
+                            for key, expected in expected_transition_coverage.items()
+                            if expected is not None
+                            and int(transition_values[key]) != int(expected)
+                        }
+                        if mismatched_transition_coverage:
+                            raise RuntimeError(
+                                "Heldout runtime transition coverage differs from "
+                                "its immutable sampling report: "
+                                f"{mismatched_transition_coverage}."
+                            )
+                        expected_movement_count = sampling_report.get(
+                            "arm_movement_element_count_h10"
+                        )
+                        if expected_movement_count is not None and int(
+                            arm_movement_count
+                        ) != int(expected_movement_count):
+                            raise RuntimeError(
+                                "Heldout runtime H10 arm-movement element coverage "
+                                "differs from its immutable sampling report: "
+                                f"{int(arm_movement_count)}/"
+                                f"{int(expected_movement_count)}."
+                            )
+                        expected_hold_abs = sampling_report.get(
+                            "arm_movement_hold_abs_sum_h10"
+                        )
+                        if expected_hold_abs is not None and not math.isclose(
+                            arm_movement_hold_abs,
+                            float(expected_hold_abs),
+                            rel_tol=1.0e-5,
+                            abs_tol=1.0e-6,
+                        ):
+                            raise RuntimeError(
+                                "Heldout runtime H10 arm-movement hold denominator "
+                                "differs from its immutable sampling report: "
+                                f"{arm_movement_hold_abs}/"
+                                f"{float(expected_hold_abs)}."
+                            )
+                    if (
+                        arm_movement_count < minimum_arm_movement_elements
+                        or arm_movement_hold_abs < minimum_arm_movement_hold_abs
+                    ):
+                        raise RuntimeError(
+                            "Heldout H10 arm-movement denominator coverage is "
+                            "insufficient: elements="
+                            f"{int(arm_movement_count)}/"
+                            f"{minimum_arm_movement_elements}, hold_abs="
+                            f"{arm_movement_hold_abs}/"
+                            f"{minimum_arm_movement_hold_abs}."
+                        )
+                    task_failure_key = (
+                        f"{metric_prefix}_task_failure_score_h{transition_horizon}"
+                    )
+                    if task_failure_key not in step_metrics:
+                        raise RuntimeError(
+                            "Heldout task failure score is unavailable despite "
+                            "configured transition coverage. H10 arm movement/hold "
+                            "coverage and both gripper transition directions are "
+                            "required."
+                        )
         if total_count > 0:
             step_metrics[f"{metric_prefix}_normalized_action_mae"] = (
                 total_abs_sum / total_count
@@ -2666,9 +3873,300 @@ class VLATrainer(TrainerUtils):
             ) ** 0.5
         return step_metrics
 
+    @staticmethod
+    def _heldout_report_evidence(report: Mapping, *, label: str) -> dict:
+        digest = report.get("window_selection_sha256")
+        if not isinstance(digest, str) or len(digest) != 64:
+            raise RuntimeError(
+                f"{label} sampling report lacks a valid window-selection digest."
+            )
+        evidence_keys = (
+            "schema_version",
+            "purpose",
+            "view",
+            "algorithm",
+            "seed_sha256",
+            "window_selection_sha256",
+            "observation_count",
+            "action_evaluable_observation_count",
+            "valid_action_timestep_count",
+            "valid_action_element_count",
+            "subtask_observation_counts",
+            "subtask_evaluable_observation_counts",
+            "open_to_close_transition_count_h10",
+            "close_to_open_transition_count_h10",
+            "open_to_close_transition_window_count_h10",
+            "close_to_open_transition_window_count_h10",
+            "arm_movement_element_count_h10",
+            "arm_movement_hold_abs_sum_h10",
+            "movement_threshold_normalized",
+            "focused_subtasks",
+            "subtask_action_timestep_counts_by_horizon",
+            "subtask_valid_action_element_counts_by_horizon",
+            "zero_valid_action_episodes",
+            "production_valid",
+            "checkpoint_selection_eligible",
+            "legacy_underfilled_holdout",
+            "episode_split_provenance",
+        )
+        evidence = {key: report[key] for key in evidence_keys if key in report}
+        if "episode_split_provenance" not in evidence:
+            raise RuntimeError(
+                f"{label} sampling report lacks split/statistics provenance."
+            )
+        return evidence
+
+    def _eval_source_training_config_evidence(self) -> dict[str, str]:
+        """Validate the frozen source-run config used to build an eval model."""
+
+        path_value = self.config.trainer.get(
+            "eval_source_training_config_path", None
+        )
+        expected_sha256 = self.config.trainer.get(
+            "eval_source_training_config_sha256", None
+        )
+        if not path_value or not expected_sha256:
+            raise RuntimeError(
+                "Eval-only checkpoint audit requires the frozen source run's "
+                "config path and SHA-256."
+            )
+        path = Path(str(path_value)).expanduser().resolve()
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"Frozen source training config does not exist: {path}"
+            )
+        actual_sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
+        if actual_sha256 != str(expected_sha256):
+            raise RuntimeError(
+                "Frozen source training config SHA-256 mismatch: "
+                f"expected={expected_sha256}, actual={actual_sha256}."
+            )
+        return {"path": str(path), "sha256": actual_sha256}
+
+    def _persist_heldout_eval_artifact(self, metrics: Mapping) -> Path | None:
+        """Atomically persist machine-readable evidence independent of trackers."""
+
+        if not getattr(self.accelerator, "is_main_process", True):
+            return None
+        output_dir_value = self.config.get("output_dir", None)
+        if not output_dir_value:
+            # Object-level evaluator tests and ad-hoc probes may have no run dir.
+            return None
+        if self.heldout_eval_sampling_report is None:
+            raise RuntimeError("Cannot persist heldout eval without its sampling report.")
+
+        output_dir = Path(str(output_dir_value)).expanduser().resolve()
+        config_path = output_dir / "config.yaml"
+        if config_path.is_file():
+            config_sha256 = hashlib.sha256(config_path.read_bytes()).hexdigest()
+            config_identity_path = "config.yaml"
+        else:
+            serialized_config = OmegaConf.to_yaml(self.config, resolve=True).encode(
+                "utf-8"
+            )
+            config_sha256 = hashlib.sha256(serialized_config).hexdigest()
+            config_identity_path = None
+
+        def metric_group(prefix: str) -> dict[str, float]:
+            result: dict[str, float] = {}
+            for key, value in metrics.items():
+                if not str(key).startswith(prefix):
+                    continue
+                scalar = self._to_scalar(value)
+                if scalar is not None:
+                    result[str(key)] = float(scalar)
+            return dict(sorted(result.items()))
+
+        unbiased_metrics = metric_group("heldout_eval_")
+        focused_metrics = metric_group("heldout_focused_eval_")
+        if not unbiased_metrics:
+            raise RuntimeError("Heldout eval artifact has no unbiased metrics.")
+        focused_enabled = (
+            getattr(self, "vla_focused_eval_dataloader", None) is not None
+        )
+        if focused_enabled and not focused_metrics:
+            raise RuntimeError("Heldout eval artifact has no focused metrics.")
+
+        sampling_reports = {
+            "unbiased": self._heldout_report_evidence(
+                self.heldout_eval_sampling_report,
+                label="Unbiased heldout",
+            )
+        }
+        if focused_enabled:
+            if self.heldout_focused_eval_sampling_report is None:
+                raise RuntimeError(
+                    "Focused eval artifact is missing its sampling report."
+                )
+            sampling_reports["focused"] = self._heldout_report_evidence(
+                self.heldout_focused_eval_sampling_report,
+                label="Focused heldout",
+            )
+        production_valid = all(
+            report.get("production_valid") is True
+            for report in sampling_reports.values()
+        )
+        checkpoint_selection_eligible = all(
+            report.get("checkpoint_selection_eligible") is True
+            for report in sampling_reports.values()
+        )
+        if getattr(self, "legacy_underfilled_eval", False) and (
+            production_valid or checkpoint_selection_eligible
+        ):
+            raise RuntimeError(
+                "Legacy underfilled audit cannot produce a production-valid or "
+                "checkpoint-selection-eligible artifact."
+            )
+
+        step = int(self.completed_steps)
+        eval_only = bool(self.config.trainer.get("eval_only", False))
+        source_training_config_evidence = None
+        if eval_only:
+            source_training_config_evidence = getattr(
+                self,
+                "eval_source_training_config_evidence",
+                None,
+            )
+            if source_training_config_evidence is None:
+                source_training_config_evidence = (
+                    self._eval_source_training_config_evidence()
+                )
+        source_checkpoint = (
+            getattr(self, "loaded_checkpoint_path", None)
+            if eval_only
+            else None
+        )
+        if source_checkpoint is None and not eval_only:
+            # An unconditional save at a coincident save/eval boundary happens
+            # before evaluation, so that checkpoint is an exact source. Step-0
+            # and eval-only-without-save artifacts must never invent a
+            # checkpoints/steps_N path that does not exist.
+            live_checkpoint = output_dir / "checkpoints" / f"steps_{step}"
+            if live_checkpoint.is_dir():
+                source_checkpoint = str(live_checkpoint.resolve())
+        checkpoint_relative_path = None
+        if source_checkpoint is not None:
+            try:
+                checkpoint_relative_path = str(
+                    Path(source_checkpoint).resolve().relative_to(output_dir)
+                )
+            except ValueError:
+                checkpoint_relative_path = None
+        checkpoint_identity: dict[str, object] = {
+            "step": step,
+            "source_path": source_checkpoint,
+            "source_kind": (
+                "checkpoint"
+                if source_checkpoint
+                else (
+                    "deterministic_untrained_initialization"
+                    if eval_only
+                    and bool(
+                        self.config.trainer.get(
+                            "eval_only_untrained_initialization", False
+                        )
+                    )
+                    else "live_in_memory_model"
+                )
+            ),
+        }
+        if source_checkpoint:
+            checkpoint_root = Path(source_checkpoint)
+            trainer_state_path = checkpoint_root / "trainer_state.json"
+            if trainer_state_path.is_file():
+                checkpoint_identity["trainer_state_sha256"] = hashlib.sha256(
+                    trainer_state_path.read_bytes()
+                ).hexdigest()
+            for candidate in ("model.safetensors", "pytorch_model.pt"):
+                model_path = checkpoint_root / candidate
+                if model_path.is_file():
+                    model_stat = model_path.stat()
+                    checkpoint_identity["model_file"] = candidate
+                    checkpoint_identity["model_file_size_bytes"] = int(
+                        model_stat.st_size
+                    )
+                    break
+        selection_metric_name = str(
+            getattr(
+                self,
+                "best_metric_name",
+                self.config.trainer.get("best_metric_name", "mae_score"),
+            )
+        )
+        selection_metric_mode = str(
+            getattr(
+                self,
+                "best_metric_mode",
+                self.config.trainer.get("best_metric_mode", "min"),
+            )
+        )
+        if (
+            checkpoint_selection_eligible
+            and selection_metric_name not in metrics
+        ):
+            raise RuntimeError(
+                "Production-valid heldout eval is missing its configured "
+                f"checkpoint-selection metric {selection_metric_name!r}."
+            )
+        payload = {
+            "schema_version": 1,
+            "checkpoint_step": step,
+            "checkpoint_relative_path": checkpoint_relative_path,
+            "checkpoint": checkpoint_identity,
+            "run": {
+                "run_id": str(self.config.get("run_id", "")),
+                "output_dir": str(output_dir),
+                "seed": int(self.config.get("seed", 0)),
+                "config_path": config_identity_path,
+                "config_sha256": config_sha256,
+                "source_training_config": source_training_config_evidence,
+            },
+            "sampling_reports": sampling_reports,
+            "production_valid": production_valid,
+            "checkpoint_selection_eligible": checkpoint_selection_eligible,
+            "selection_metric": {
+                "name": selection_metric_name,
+                "mode": selection_metric_mode,
+                "eligible": checkpoint_selection_eligible,
+                "value": (
+                    float(metrics[selection_metric_name])
+                    if selection_metric_name in metrics
+                    else None
+                ),
+            },
+            "metrics": {
+                "unbiased": unbiased_metrics,
+                "focused": focused_metrics,
+            },
+        }
+        artifact_dir = output_dir / "heldout_eval_metrics"
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        artifact_path = artifact_dir / f"step_{step:08d}.json"
+        temporary_path = artifact_dir / (
+            f".{artifact_path.name}.tmp-{os.getpid()}-{threading.get_ident()}"
+        )
+        try:
+            with temporary_path.open("w", encoding="utf-8") as handle:
+                json.dump(payload, handle, indent=2, sort_keys=True, allow_nan=False)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary_path, artifact_path)
+            directory_fd = os.open(artifact_dir, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        finally:
+            if temporary_path.exists():
+                temporary_path.unlink()
+        _make_artifact_tree_host_readable(artifact_dir)
+        return artifact_path
+
     def eval_heldout_action_model(self, step_metrics: dict = None) -> dict:
         if self.vla_eval_dataloader is None:
             raise RuntimeError("No independent heldout eval dataloader is configured.")
+        metrics = step_metrics or {}
         _reset_loader_generators(
             self.vla_eval_dataloader,
             int(self.heldout_eval_seed),
@@ -2676,14 +4174,18 @@ class VLATrainer(TrainerUtils):
         try:
             metrics = self._evaluate_action_batches(
                 self.vla_eval_dataloader,
-                step_metrics=step_metrics or {},
+                step_metrics=metrics,
                 metric_prefix="heldout_eval",
-                expected_observations=int(self.total_batch_size),
+                expected_observations=int(
+                    self.heldout_eval_sampling_report["observation_count"]
+                ),
                 expected_valid_observations=int(
                     self.heldout_eval_expected_valid_observations
                 ),
                 expected_valid_elements=int(self.heldout_eval_expected_valid_elements),
                 require_heldout_indices=True,
+                sampling_report=self.heldout_eval_sampling_report,
+                evaluation_seed=int(self.heldout_eval_seed),
             )
         finally:
             _close_heldout_eval_caches(self.vla_eval_dataloader)
@@ -2693,6 +4195,76 @@ class VLATrainer(TrainerUtils):
         metrics["heldout_eval_zero_valid_action_episodes"] = float(
             len(zero_valid_episodes)
         )
+        if getattr(self, "vla_focused_eval_dataloader", None) is not None:
+            _reset_loader_generators(
+                self.vla_focused_eval_dataloader,
+                int(self.heldout_focused_eval_seed),
+            )
+            try:
+                metrics = self._evaluate_action_batches(
+                    self.vla_focused_eval_dataloader,
+                    step_metrics=metrics,
+                    metric_prefix="heldout_focused_eval",
+                    expected_observations=int(
+                        self.heldout_focused_eval_sampling_report[
+                            "observation_count"
+                        ]
+                    ),
+                    expected_valid_observations=int(
+                        self.heldout_focused_eval_expected_valid_observations
+                    ),
+                    expected_valid_elements=int(
+                        self.heldout_focused_eval_expected_valid_elements
+                    ),
+                    require_heldout_indices=True,
+                    sampling_report=self.heldout_focused_eval_sampling_report,
+                    evaluation_seed=int(self.heldout_focused_eval_seed),
+                    transition_coverage_horizon=int(
+                        self.config.trainer.get(
+                            "heldout_focused_eval_transition_coverage_horizon", 10
+                        )
+                    ),
+                    minimum_open_to_close_transitions=int(
+                        self.config.trainer.get(
+                            "heldout_focused_eval_min_open_to_close_transitions", 1
+                        )
+                    ),
+                    minimum_close_to_open_transitions=int(
+                        self.config.trainer.get(
+                            "heldout_focused_eval_min_close_to_open_transitions", 1
+                        )
+                    ),
+                    minimum_open_to_close_windows=int(
+                        self.config.trainer.get(
+                            "heldout_focused_eval_min_open_to_close_windows", 1
+                        )
+                    ),
+                    minimum_close_to_open_windows=int(
+                        self.config.trainer.get(
+                            "heldout_focused_eval_min_close_to_open_windows", 1
+                        )
+                    ),
+                    minimum_arm_movement_elements=int(
+                        self.config.trainer.get(
+                            "heldout_focused_eval_min_arm_movement_elements_h10", 1
+                        )
+                    ),
+                    minimum_arm_movement_hold_abs=float(
+                        self.config.trainer.get(
+                            "heldout_focused_eval_min_arm_movement_hold_abs_h10",
+                            1.0e-12,
+                        )
+                    ),
+                )
+            finally:
+                _close_heldout_eval_caches(self.vla_focused_eval_dataloader)
+            focused_zero_valid = self.heldout_focused_eval_sampling_report.get(
+                "zero_valid_action_episodes", []
+            )
+            metrics["heldout_focused_eval_zero_valid_action_episodes"] = float(
+                len(focused_zero_valid)
+            )
+        self._persist_heldout_eval_artifact(metrics)
         return metrics
 
     def eval_action_model(self, step_metrics: dict = None) -> dict:
@@ -3102,43 +4674,75 @@ class VLATrainer(TrainerUtils):
             setattr(self, attr_name, None)
         _shutdown_dataloader_workers(getattr(self, "vla_train_dataloader", None))
         _shutdown_dataloader_workers(getattr(self, "vla_eval_dataloader", None))
+        _shutdown_dataloader_workers(
+            getattr(self, "vla_focused_eval_dataloader", None)
+        )
         gc.collect()
 
 
 def main(cfg) -> None:
+    eval_only = bool(cfg.trainer.get("eval_only", False))
+    legacy_underfilled_eval = bool(
+        cfg.trainer.get("eval_only_legacy_underfilled_holdout", False)
+    )
+    if legacy_underfilled_eval and not eval_only:
+        raise ValueError(
+            "trainer.eval_only_legacy_underfilled_holdout is audit-only and "
+            "cannot be used during training or checkpoint selection."
+        )
     accelerator = build_accelerator(cfg)
-    logger.info("VLA Training :: Warming Up")
+    logger.info(
+        "VLA Checkpoint Evaluation :: Warming Up"
+        if eval_only
+        else "VLA Training :: Warming Up"
+    )
     interrupted = False
     trainer = None
     vla_train_dataloader = None
     vla_eval_dataloader = None
+    vla_focused_eval_dataloader = None
 
     try:
         # create output directory and save config
         output_dir = setup_directories(cfg=cfg)
+        if eval_only and bool(
+            cfg.trainer.get("eval_only_untrained_initialization", False)
+        ):
+            # Model construction happens before trainer preparation. Pin it so
+            # the step-0 reference is reproducible across launches/ranks.
+            set_seed(int(cfg.get("seed", 0)))
         # build model
         vla = build_model(cfg)
-        # prepare data
-        vla_train_dataloader = prepare_data(
+        # Eval-only deliberately never constructs or reads a shuffled training
+        # loader and never creates an optimizer.
+        if not eval_only:
+            vla_train_dataloader = prepare_data(
+                cfg=cfg,
+                accelerator=accelerator,
+                output_dir=output_dir,
+                model=vla,
+            )
+        (
+            vla_eval_dataloader,
+            vla_focused_eval_dataloader,
+        ) = prepare_heldout_eval_data(
             cfg=cfg,
             accelerator=accelerator,
             output_dir=output_dir,
             model=vla,
         )
-        vla_eval_dataloader = prepare_heldout_eval_data(
-            cfg=cfg,
-            accelerator=accelerator,
-            output_dir=output_dir,
-            model=vla,
-        )
-        resolve_training_schedule(
-            cfg=cfg,
-            vla_train_dataloader=vla_train_dataloader,
-            num_processes=accelerator.num_processes,
-        )
-
-        # set optimizer and scheduler
-        optimizer, lr_scheduler = setup_optimizer_and_scheduler(model=vla, cfg=cfg)
+        if eval_only:
+            optimizer = None
+            lr_scheduler = None
+        else:
+            resolve_training_schedule(
+                cfg=cfg,
+                vla_train_dataloader=vla_train_dataloader,
+                num_processes=accelerator.num_processes,
+            )
+            optimizer, lr_scheduler = setup_optimizer_and_scheduler(
+                model=vla, cfg=cfg
+            )
 
         trainer = VLATrainer(
             cfg=cfg,
@@ -3148,12 +4752,15 @@ def main(cfg) -> None:
             lr_scheduler=lr_scheduler,
             accelerator=accelerator,
             vla_eval_dataloader=vla_eval_dataloader,
+            vla_focused_eval_dataloader=vla_focused_eval_dataloader,
         )
 
-        # execute training preparation
-        trainer.prepare_training()
-        # execute training
-        trainer.train()
+        if eval_only:
+            trainer.prepare_checkpoint_evaluation()
+            trainer.evaluate_checkpoint_only()
+        else:
+            trainer.prepare_training()
+            trainer.train()
 
         # And... we're done!
         logger.info("... and that's all, folks!")
@@ -3171,6 +4778,7 @@ def main(cfg) -> None:
             try:
                 _shutdown_dataloader_workers(vla_train_dataloader)
                 _shutdown_dataloader_workers(vla_eval_dataloader)
+                _shutdown_dataloader_workers(vla_focused_eval_dataloader)
             except Exception as exc:
                 logger.warning(f"Fallback dataloader shutdown failed: {exc}")
         if dist.is_initialized():

@@ -49,6 +49,22 @@ canonical_json_sha256 = _EPISODE_SPLIT_MODULE.canonical_json_sha256
 episode_set_sha256 = _EPISODE_SPLIT_MODULE.episode_set_sha256
 file_sha256 = _EPISODE_SPLIT_MODULE.file_sha256
 
+_ACTION_VALIDITY_PATH = (
+    REPO_ROOT / "starVLA/dataloader/action_validity_mask.py"
+)
+_ACTION_VALIDITY_SPEC = importlib.util.spec_from_file_location(
+    "_magna_action_validity_helpers", _ACTION_VALIDITY_PATH
+)
+if _ACTION_VALIDITY_SPEC is None or _ACTION_VALIDITY_SPEC.loader is None:
+    raise ImportError(
+        f"Could not load action-validity helpers from {_ACTION_VALIDITY_PATH}"
+    )
+_ACTION_VALIDITY_MODULE = importlib.util.module_from_spec(_ACTION_VALIDITY_SPEC)
+sys.modules[_ACTION_VALIDITY_SPEC.name] = _ACTION_VALIDITY_MODULE
+_ACTION_VALIDITY_SPEC.loader.exec_module(_ACTION_VALIDITY_MODULE)
+action_validity_prefix_mask = _ACTION_VALIDITY_MODULE.action_validity_prefix_mask
+valid_flags_from_label_values = _ACTION_VALIDITY_MODULE.valid_flags_from_label_values
+
 
 DEFAULT_DATASET_ROOT = Path(
     "/home/mehul/work/reward_model_small/magna_training_data_with_interventions"
@@ -354,6 +370,112 @@ def _rank_episodes(
         ranked,
         key=lambda item: (item["ranking_sha256"], item["episode_id"]),
     )
+
+
+def _supervised_window_eligibility(
+    dataset_root: Path,
+    episodes: pd.DataFrame,
+    *,
+    data_cfg: dict[str, Any],
+    structural_window: dict[str, Any],
+) -> tuple[np.ndarray, dict[int, str]]:
+    """Mirror training's action mask and require one supervised eval window."""
+
+    lengths = episodes["length"].to_numpy(dtype=np.int64)
+    minimum_length = int(structural_window["minimum_episode_length"])
+    length_eligible = lengths >= minimum_length
+    if not bool(data_cfg.get("use_action_validity_prefix_mask", False)):
+        return length_eligible, {
+            int(row.episode_index): (
+                f"length<{minimum_length} cannot span offsets "
+                f"[{structural_window['required_min_offset']},"
+                f"{structural_window['required_max_offset']}]"
+            )
+            for row in episodes[~length_eligible].itertuples(index=False)
+        }
+    if bool(data_cfg.get("delete_pause_frame", False)):
+        raise ValueError(
+            "Holdout supervision eligibility does not support delete_pause_frame=true; "
+            "candidate filtering must be mirrored explicitly."
+        )
+
+    label_key = str(data_cfg.get("action_validity_label_key", "valid_state"))
+    positive_is_valid = bool(
+        data_cfg.get("action_validity_positive_is_valid", True)
+    )
+    invalid_run_length = int(
+        data_cfg.get("action_validity_invalid_run_length", 10)
+    )
+    if invalid_run_length <= 0:
+        raise ValueError("action_validity_invalid_run_length must be positive")
+    action_min = int(structural_window["action_min_offset"])
+    action_max = int(structural_window["action_max_offset"])
+    action_offsets = np.arange(action_min, action_max + 1, dtype=np.int64)
+
+    flags_by_episode: dict[int, np.ndarray] = {}
+    for path in sorted((dataset_root / "data").glob("**/*.parquet")):
+        schema_names = set(pq.ParquetFile(path).schema_arrow.names)
+        if label_key not in schema_names:
+            raise ValueError(
+                f"Action-validity label {label_key!r} is missing from {path}."
+            )
+        table = pq.read_table(
+            path, columns=["episode_index", "frame_index", label_key]
+        )
+        frame = table.to_pandas()
+        for episode_id, rows in frame.groupby("episode_index", sort=False):
+            ordered = rows.sort_values("frame_index", kind="stable")
+            observed_frames = ordered["frame_index"].to_numpy(dtype=np.int64)
+            if not np.array_equal(
+                observed_frames, np.arange(len(ordered), dtype=np.int64)
+            ):
+                raise ValueError(
+                    f"Episode {int(episode_id)} has non-contiguous frame_index "
+                    "while computing holdout supervision eligibility."
+                )
+            flags_by_episode[int(episode_id)] = valid_flags_from_label_values(
+                ordered[label_key].to_numpy(),
+                positive_is_valid=positive_is_valid,
+            )
+
+    eligible = np.zeros(len(episodes), dtype=bool)
+    reasons: dict[int, str] = {}
+    for position, row in enumerate(episodes.itertuples(index=False)):
+        episode_id = int(row.episode_index)
+        length = int(row.length)
+        if length < minimum_length:
+            reasons[episode_id] = (
+                f"length<{minimum_length} cannot span offsets "
+                f"[{structural_window['required_min_offset']},"
+                f"{structural_window['required_max_offset']}]"
+            )
+            continue
+        flags = flags_by_episode.get(episode_id)
+        if flags is None or flags.shape != (length,):
+            raise ValueError(
+                f"Episode {episode_id} action-validity labels have shape "
+                f"{None if flags is None else flags.shape}, expected {(length,)}."
+            )
+        valid_min = max(0, -action_min)
+        valid_max = min(length - 1, length - 1 - action_max)
+        found = False
+        for base_index in range(valid_min, valid_max + 1):
+            target_flags = flags[base_index + action_offsets]
+            if bool(
+                action_validity_prefix_mask(
+                    target_flags,
+                    invalid_run_length=invalid_run_length,
+                ).any()
+            ):
+                found = True
+                break
+        eligible[position] = found
+        if not found:
+            reasons[episode_id] = (
+                "no structurally unpadded action window has a supervised element "
+                f"under {label_key} sustained-invalid-prefix masking"
+            )
+    return eligible, reasons
 
 
 def _arrow_column_to_numpy(column: pa.ChunkedArray) -> np.ndarray:
@@ -902,14 +1024,21 @@ def build(args: argparse.Namespace) -> None:
 
     structural_window = batch["evaluation_structural_window"]
     minimum_episode_length = int(structural_window["minimum_episode_length"])
-    eligible_mask = episodes["length"].to_numpy(dtype=np.int64) >= minimum_episode_length
+    training_config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    eligible_mask, ineligibility_reasons = _supervised_window_eligibility(
+        dataset_root,
+        episodes,
+        data_cfg=training_config["datasets"]["vla_data"],
+        structural_window=structural_window,
+    )
     eligible_episodes = episodes[eligible_mask].reset_index(drop=True)
     ineligible_episodes = episodes[~eligible_mask]
     if holdout_count > len(eligible_episodes):
         raise ValueError(
             f"Effective global batch requests {holdout_count} held-out episodes, "
-            f"but only {len(eligible_episodes)} episodes can provide an unpadded "
-            f"window spanning offsets [{structural_window['required_min_offset']}, "
+            f"but only {len(eligible_episodes)} episodes can provide a supervised "
+            "unpadded window spanning offsets "
+            f"[{structural_window['required_min_offset']}, "
             f"{structural_window['required_max_offset']}]."
         )
 
@@ -1017,7 +1146,8 @@ def build(args: argparse.Namespace) -> None:
             "nested_prefix": True,
             "eligible_episode_policy": (
                 "complete episodes with at least one structurally unpadded "
-                "deployment-observation/action window"
+                "deployment-observation/action window containing at least one "
+                "supervised action element under the training validity mask"
             ),
             "eligibility": {
                 **structural_window,
@@ -1029,9 +1159,7 @@ def build(args: argparse.Namespace) -> None:
                         "episode_id": int(row.episode_index),
                         "length": int(row.length),
                         "reason": (
-                            f"length<{minimum_episode_length} cannot span offsets "
-                            f"[{structural_window['required_min_offset']},"
-                            f"{structural_window['required_max_offset']}]"
+                            ineligibility_reasons[int(row.episode_index)]
                         ),
                     }
                     for row in ineligible_episodes.itertuples(index=False)
