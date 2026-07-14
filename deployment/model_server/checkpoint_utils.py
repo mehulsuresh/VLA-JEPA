@@ -175,6 +175,7 @@ def build_policy_metadata(policy, checkpoint_path: str | Path) -> dict[str, Any]
         action_horizon = int(future_window) + 1
 
     norm_mode_hints = _infer_norm_mode_hints(policy)
+    rtc_config = _cfg_get(policy.config, "framework", "action_model", "rtc_training")
 
     metadata = {
         "env": "real_robot",
@@ -198,6 +199,17 @@ def build_policy_metadata(policy, checkpoint_path: str | Path) -> dict[str, Any]
         "camera_order_hint": _CAMERA_ORDER_HINTS.get(data_mix),
         **norm_mode_hints,
     }
+    if rtc_config is not None:
+        configured_max_delay = max(0, int(_cfg_get(rtc_config, "max_delay", default=0) or 0))
+        max_delay_exclusive = min(configured_max_delay, max(0, int(action_horizon)))
+        metadata["rtc_inference_contract"] = {
+            "training_enabled": bool(_cfg_get(rtc_config, "enabled", default=False)),
+            "method": _cfg_get(rtc_config, "method", default="prefix"),
+            "max_delay_exclusive": max_delay_exclusive,
+            "max_prefix_len": max(0, max_delay_exclusive - 1),
+            "action_space": "normalized_policy_action",
+            "client_opt_in": True,
+        }
     camera_order_hint = tuple(metadata.get("camera_order_hint") or ())
     try:
         action_dim = int(metadata.get("action_dim"))
@@ -209,9 +221,26 @@ def build_policy_metadata(policy, checkpoint_path: str | Path) -> dict[str, Any]
         and action_dim in REALMAN_POLICY_ACTION_DIMS
         and state_dim == REALMAN_STATE_DIM
     ):
+        for mode_key in ("default_action_norm_mode", "default_state_norm_mode"):
+            mode = metadata.get(mode_key)
+            if not isinstance(mode, str) or not mode:
+                raise RuntimeError(
+                    f"Cannot serve Realman checkpoint because `{mode_key}` could not be "
+                    "reconstructed from its data configuration. Refusing to guess q99: "
+                    "a min/max checkpoint would receive and emit different values."
+                )
+        if default_unnorm_key is None:
+            raise RuntimeError(
+                "Cannot serve Realman checkpoint without one unambiguous normalization key."
+            )
+        if default_unnorm_key not in state_stats_by_key:
+            raise RuntimeError(
+                f"Realman normalization key {default_unnorm_key!r} has action stats but no state stats."
+            )
         omitted_indices = realman_omitted_robot_action_indices(action_dim)
         qwen_frame_size = metadata.get("video_resolution_size") or DEFAULT_QWEN_FRAME_SIZE
         qwen_resolution_size = metadata.get("resolution_size")
+        state_norm_mode = metadata["default_state_norm_mode"]
         metadata.update(
             {
                 "policy_action_names": list(realman_policy_action_names(action_dim)),
@@ -241,6 +270,11 @@ def build_policy_metadata(policy, checkpoint_path: str | Path) -> dict[str, Any]
                     "state_shape": [1, 1, state_dim],
                     "state_dtype": "float32",
                     "state_normalized": True,
+                    # Mirror Normalizer.forward in the training dataloader. q99
+                    # clamps after scaling; min_max and mean_std deliberately do
+                    # not clamp observations outside their fitted statistics.
+                    "state_normalization_mode": state_norm_mode,
+                    "state_normalization_clip": state_norm_mode == "q99",
                 },
             }
         )

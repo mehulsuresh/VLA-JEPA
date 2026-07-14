@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "description": "Confirmed in-training episode 1442 (source file_1492), sampled at task-relevant frames across reach, pickup, carry, place, align, and removal stages.",
+  "excluded_from_training": false,
+  "datasets": {
+    "magna_training_data_with_interventions": [
+      1442
+    ]
+  },
+  "frames": {
+    "magna_training_data_with_interventions": {
+      "1442": [
+        0,
+        100,
+        180,
+        220,
+        232,
+        240,
+        269,
+        270,
+        278,
+        300,
+        340,
+        400,
+        500,
+        609,
+        610,
+        700,
+        800,
+        809,
+        810,
+        844,
+        850,
+        900,
+        929,
+        930,
+        1000,
+        1100,
+        1200,
+        1300,
+        1370,
+        1400,
+        1409,
+        1410,
+        1450,
+        1500,
+        1580,
+        1590
+      ]
+    }
+  }
+}

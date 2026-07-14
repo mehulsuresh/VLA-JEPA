@@ -17,7 +17,6 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from deployment.trossen.pipeline import (
-    continuous_unnormalize,
     resolve_action_stats,
     resolve_norm_mode,
     resolve_state_stats,
@@ -36,6 +35,7 @@ from deployment.realman.pipeline import (
     extract_state_vector,
     json_safe,
     load_observation_npz,
+    realman_continuous_unnormalize as _realman_continuous_unnormalize,
     resolve_qwen_frame_size,
     split_action_chunk,
     split_action_vector,
@@ -168,7 +168,11 @@ def _infer_once(
         raise RuntimeError(f"Inference failed: {response}")
 
     normalized_chunk = np.asarray(response["data"]["normalized_actions"], dtype=np.float32)[0]
-    policy_action_chunk = continuous_unnormalize(normalized_chunk, action_stats, mode=action_norm_mode)
+    policy_action_chunk = _realman_continuous_unnormalize(
+        normalized_chunk,
+        action_stats,
+        mode=action_norm_mode,
+    )
     if policy_action_chunk.shape[-1] not in REALMAN_POLICY_ACTION_DIMS:
         raise RuntimeError(
             f"Policy returned action dim {policy_action_chunk.shape[-1]}, "

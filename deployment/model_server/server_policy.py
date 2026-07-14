@@ -141,19 +141,243 @@ def _continuous_unnormalize(values: np.ndarray, stats: dict[str, Any], *, mode: 
     if mode == "min_max":
         min_value = np.asarray(stats["min"], dtype=np.float32)
         max_value = np.asarray(stats["max"], dtype=np.float32)
-        clipped = np.clip(array, -1.0, 1.0)
-        return ((clipped + 1.0) / 2.0 * (max_value - min_value) + min_value).astype(np.float32, copy=False)
+        return ((array + 1.0) / 2.0 * (max_value - min_value) + min_value).astype(
+            np.float32,
+            copy=False,
+        )
     if mode == "q99":
         q01 = np.asarray(stats["q01"], dtype=np.float32)
         q99 = np.asarray(stats["q99"], dtype=np.float32)
-        clipped = np.clip(array, -1.0, 1.0)
-        mask = np.asarray(stats.get("mask", np.ones_like(q01, dtype=bool)), dtype=bool)
-        return np.where(mask, 0.5 * (clipped + 1.0) * (q99 - q01) + q01, clipped).astype(np.float32, copy=False)
+        return (0.5 * (array + 1.0) * (q99 - q01) + q01).astype(
+            np.float32,
+            copy=False,
+        )
     if mode == "mean_std":
         mean = np.asarray(stats["mean"], dtype=np.float32)
         std = np.asarray(stats["std"], dtype=np.float32)
         return (array * std + mean).astype(np.float32, copy=False)
     raise ValueError(f"Unsupported action normalization mode `{mode}`")
+
+
+class BatchedMedianActionEnsemblePolicy:
+    """Draw several stochastic chunks in one model call and return their median.
+
+    The live websocket contract is deliberately single-observation.  For an
+    ensemble, that observation is duplicated along the model batch dimension so
+    the expensive vision/language forward pass is still issued only once.
+    """
+
+    _DIAGNOSTIC_KEY = "policy_ensemble"
+
+    def __init__(self, policy: Any, *, ensemble_size: int) -> None:
+        if isinstance(ensemble_size, bool) or not isinstance(ensemble_size, (int, np.integer)):
+            raise ValueError(f"policy ensemble size must be a positive integer, got {ensemble_size!r}")
+        if int(ensemble_size) <= 0:
+            raise ValueError(f"policy ensemble size must be positive, got {ensemble_size}")
+        self.policy = policy
+        self.ensemble_size = int(ensemble_size)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.policy, name)
+
+    @staticmethod
+    def _require_single_sequence(value: Any, *, name: str) -> list[Any]:
+        if isinstance(value, (str, bytes)) or not hasattr(value, "__len__"):
+            raise ValueError(f"{name} must be a batch sequence with exactly one sample")
+        if len(value) != 1:
+            raise ValueError(f"{name} must have batch size 1, got {len(value)}")
+        return list(value)
+
+    def _repeat_qwen_frames(self, value: Any) -> list[Any]:
+        samples = self._require_single_sequence(value, name="qwen_frames")
+        sample = samples[0]
+        sample_shape = getattr(sample, "shape", None)
+        shape = tuple(sample_shape if sample_shape is not None else np.asarray(sample).shape)
+        if len(shape) != 4 or any(int(dim) <= 0 for dim in shape):
+            raise ValueError(
+                "qwen_frames must contain one non-empty [V,H,W,C] or [V,C,H,W] sample; "
+                f"got sample shape {shape}"
+            )
+        # Reusing the immutable observation preserves view ordering exactly and
+        # avoids allocating K copies of the comparatively large uint8 frames.
+        return [sample] * self.ensemble_size
+
+    def _repeat_batch_images(self, value: Any) -> list[list[Any]]:
+        samples = self._require_single_sequence(value, name="batch_images")
+        sample = samples[0]
+        if isinstance(sample, (str, bytes)) or not hasattr(sample, "__len__"):
+            raise ValueError("batch_images sample must be a non-empty sequence of camera views")
+        if len(sample) <= 0:
+            raise ValueError("batch_images sample must contain at least one camera view")
+        views = list(sample)
+        # Each ensemble member gets its own list container while retaining the
+        # original image objects and camera order.
+        return [list(views) for _ in range(self.ensemble_size)]
+
+    def _repeat_numeric_batch(
+        self,
+        value: Any,
+        *,
+        name: str,
+        allowed_ndims: set[int],
+    ) -> Any:
+        if isinstance(value, torch.Tensor):
+            shape = tuple(value.shape)
+            ndim = value.ndim
+            if ndim not in allowed_ndims or any(int(dim) <= 0 for dim in shape):
+                raise ValueError(
+                    f"{name} must have rank {sorted(allowed_ndims)} with non-empty dimensions; "
+                    f"got {shape}"
+                )
+            if shape[0] != 1:
+                raise ValueError(f"{name} must have batch size 1, got shape {shape}")
+            if not bool(torch.isfinite(value).all().item()):
+                raise ValueError(f"{name} contains non-finite values")
+            return torch.repeat_interleave(value, self.ensemble_size, dim=0)
+
+        array = np.asarray(value)
+        if array.ndim not in allowed_ndims or any(int(dim) <= 0 for dim in array.shape):
+            raise ValueError(
+                f"{name} must have rank {sorted(allowed_ndims)} with non-empty dimensions; "
+                f"got {array.shape}"
+            )
+        if array.shape[0] != 1:
+            raise ValueError(f"{name} must have batch size 1, got shape {array.shape}")
+        try:
+            finite = bool(np.isfinite(array).all())
+        except TypeError as exc:
+            raise ValueError(f"{name} must be numeric, got dtype {array.dtype}") from exc
+        if not finite:
+            raise ValueError(f"{name} contains non-finite values")
+        return np.repeat(array, self.ensemble_size, axis=0)
+
+    def _repeat_inputs(self, kwargs: dict[str, Any]) -> dict[str, Any]:
+        if kwargs.get("batch") is not None:
+            raise ValueError(
+                "policy ensembles do not accept prebuilt `batch` inputs; send the single-observation "
+                "qwen_frames or batch_images websocket contract"
+            )
+
+        has_qwen = kwargs.get("qwen_frames") is not None
+        has_legacy = kwargs.get("batch_images") is not None
+        if has_qwen == has_legacy:
+            raise ValueError("policy ensemble requires exactly one of qwen_frames or batch_images")
+
+        instructions = self._require_single_sequence(kwargs.get("instructions"), name="instructions")
+        if not isinstance(instructions[0], str):
+            raise ValueError(
+                f"instructions must contain one string, got {type(instructions[0]).__name__}"
+            )
+
+        repeated = dict(kwargs)
+        repeated["instructions"] = instructions * self.ensemble_size
+        if has_qwen:
+            repeated["qwen_frames"] = self._repeat_qwen_frames(kwargs["qwen_frames"])
+        else:
+            repeated["batch_images"] = self._repeat_batch_images(kwargs["batch_images"])
+
+        if kwargs.get("state") is not None:
+            repeated["state"] = self._repeat_numeric_batch(
+                kwargs["state"],
+                name="state",
+                allowed_ndims={2, 3},
+            )
+        if kwargs.get("prev_actions") is not None:
+            repeated["prev_actions"] = self._repeat_numeric_batch(
+                kwargs["prev_actions"],
+                name="prev_actions",
+                allowed_ndims={3},
+            )
+        return repeated
+
+    def _reduce_auxiliary_output(self, value: Any) -> Any:
+        """Drop ensemble rows from non-action outputs without retaining all draws."""
+
+        if isinstance(value, np.ndarray):
+            if value.ndim > 0 and value.shape[0] == self.ensemble_size:
+                return value[:1].copy()
+            return value
+        if isinstance(value, torch.Tensor):
+            if value.ndim > 0 and value.shape[0] == self.ensemble_size:
+                return value[:1].clone()
+            return value
+        if isinstance(value, dict):
+            return {key: self._reduce_auxiliary_output(item) for key, item in value.items()}
+        if isinstance(value, list):
+            if len(value) == self.ensemble_size:
+                return value[:1]
+            return [self._reduce_auxiliary_output(item) for item in value]
+        if isinstance(value, tuple):
+            if len(value) == self.ensemble_size:
+                return value[:1]
+            return tuple(self._reduce_auxiliary_output(item) for item in value)
+        return value
+
+    def predict_action(self, *args, **kwargs) -> dict[str, Any]:
+        # Size one is intentionally an exact compatibility/no-op path.
+        if self.ensemble_size == 1:
+            return self.policy.predict_action(*args, **kwargs)
+        if args:
+            raise ValueError("policy ensemble inference requires keyword arguments")
+
+        repeated_kwargs = self._repeat_inputs(kwargs)
+        output = self.policy.predict_action(**repeated_kwargs)
+        if not isinstance(output, dict):
+            raise ValueError(f"policy predict_action must return a dict, got {type(output).__name__}")
+        if self._DIAGNOSTIC_KEY in output:
+            raise ValueError(f"policy output uses reserved key `{self._DIAGNOSTIC_KEY}`")
+        if "normalized_actions" not in output:
+            raise ValueError("policy ensemble output is missing normalized_actions")
+
+        try:
+            draws = np.asarray(output["normalized_actions"], dtype=np.float32)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("policy ensemble normalized_actions must be a numeric array") from exc
+        if draws.ndim != 3 or draws.shape[0] != self.ensemble_size:
+            raise ValueError(
+                "policy ensemble expected normalized_actions "
+                f"[{self.ensemble_size},T,D], got {draws.shape}"
+            )
+        if draws.shape[1] <= 0 or draws.shape[2] <= 0:
+            raise ValueError(f"policy ensemble normalized_actions has empty shape {draws.shape}")
+        if not np.isfinite(draws).all():
+            raise ValueError("policy ensemble normalized_actions contains non-finite values")
+
+        reduced = {
+            key: self._reduce_auxiliary_output(value)
+            for key, value in output.items()
+            if key != "normalized_actions"
+        }
+        reduced["normalized_actions"] = np.median(draws, axis=0, keepdims=True).astype(
+            np.float32,
+            copy=False,
+        )
+        pointwise_draw_std = np.std(draws.astype(np.float64), axis=0)
+        reduced[self._DIAGNOSTIC_KEY] = {
+            "size": self.ensemble_size,
+            "reducer": "median",
+            "normalized_draw_std": float(pointwise_draw_std.mean()),
+        }
+        return reduced
+
+
+def _configure_policy_ensemble(
+    policy: Any,
+    *,
+    ensemble_size: int,
+    metadata: dict[str, Any],
+) -> Any:
+    wrapper = BatchedMedianActionEnsemblePolicy(policy, ensemble_size=ensemble_size)
+    metadata["policy_ensemble"] = {
+        "enabled": wrapper.ensemble_size > 1,
+        "size": wrapper.ensemble_size,
+        "reducer": "median" if wrapper.ensemble_size > 1 else "identity",
+        "model_calls_per_request": 1,
+    }
+    if wrapper.ensemble_size == 1:
+        return policy
+    logging.info("Batched median policy ensemble enabled: %s", metadata["policy_ensemble"])
+    return wrapper
 
 
 class PolicyOutputJsonlLogger:
@@ -242,6 +466,7 @@ class PolicyOutputJsonlLogger:
                 "default_unnorm_key": self.metadata.get("default_unnorm_key"),
                 "default_action_norm_mode": self.metadata.get("default_action_norm_mode"),
                 "camera_order_hint": self.metadata.get("camera_order_hint"),
+                "policy_ensemble": self.metadata.get("policy_ensemble"),
             },
             "payload_summary": self._payload_summary(payload, sequence_id=sequence_id),
             "output_keys": sorted(output.keys()),
@@ -267,6 +492,8 @@ class PolicyOutputJsonlLogger:
             }
         if "action_guard" in output:
             record["action_guard"] = output["action_guard"]
+        if "policy_ensemble" in output:
+            record["policy_ensemble"] = output["policy_ensemble"]
 
         with self._lock:
             with self.path.open("a", encoding="utf-8") as handle:
@@ -302,6 +529,19 @@ class PolicyOutputJsonlLogger:
         qwen_frames = payload.get("qwen_frames")
         if qwen_frames is not None:
             summary["qwen_frames"] = self._image_summary(qwen_frames, sequence_id=sequence_id)
+        prev_actions = payload.get("prev_actions")
+        if prev_actions is not None:
+            prev_actions_arr = np.asarray(prev_actions, dtype=np.float32)
+            summary["prev_actions"] = {
+                "shape": list(prev_actions_arr.shape),
+                "dtype": str(prev_actions_arr.dtype),
+                "min": float(prev_actions_arr.min()) if prev_actions_arr.size else None,
+                "max": float(prev_actions_arr.max()) if prev_actions_arr.size else None,
+            }
+        if "prefix_len" in payload:
+            summary["prefix_len"] = int(payload["prefix_len"])
+        if "rtc_config" in payload:
+            summary["rtc_config"] = payload["rtc_config"]
         return summary
 
     def _image_summary(self, batch_images: Any, *, sequence_id: int) -> dict[str, Any]:
@@ -463,7 +703,7 @@ class ActionGuardRetryPolicy:
             )
 
         raise RuntimeError(
-            "Action guard rejected all sampled chunks; refusing to send an unsafe action. "
+            "Action guard heuristic rejected all sampled chunks; refusing to select one. "
             f"attempts={json.dumps(_json_safe(rejected))}"
         )
 
@@ -586,6 +826,21 @@ def main(args) -> None:
     local_ip = socket.gethostbyname(hostname)
     logging.info("Creating server (host: %s, ip: %s)", hostname, local_ip)
     metadata = build_policy_metadata(vla, resolved_ckpt_path)
+    metadata["server_precision"] = {
+        "global_bf16_parameter_cast": bool(args.use_bf16 and device.type == "cuda"),
+        "inference_autocast": "bfloat16" if device.type == "cuda" else None,
+    }
+    guard_is_realman = _is_realman_data_mix(metadata)
+    if guard_is_realman and metadata["server_precision"]["global_bf16_parameter_cast"]:
+        logging.warning(
+            "--use_bf16 globally casts the FP32 Realman action head and state projector. "
+            "Omit it for the training-aligned mixed-precision path."
+        )
+    served_policy = _configure_policy_ensemble(
+        vla,
+        ensemble_size=args.policy_ensemble_size,
+        metadata=metadata,
+    )
     output_logger = None
     if args.policy_output_log_path:
         output_logger = PolicyOutputJsonlLogger(
@@ -597,17 +852,15 @@ def main(args) -> None:
         )
         logging.info("Policy server output logging enabled at `%s`", output_logger.path)
 
-    served_policy = vla
-    guard_is_realman = _is_realman_data_mix(metadata)
     guard_enabled = (
-        not args.disable_action_guard
+        args.enable_action_guard
         and guard_is_realman
         and int(metadata.get("action_dim") or 0) in _REALMAN_POLICY_ACTION_DIMS
         and int(args.action_guard_max_attempts) > 1
     )
     if guard_enabled:
         served_policy = ActionGuardRetryPolicy(
-            vla,
+            served_policy,
             metadata=metadata,
             max_attempts=args.action_guard_max_attempts,
             first_n=args.action_guard_first_n,
@@ -634,8 +887,12 @@ def main(args) -> None:
             "min_tail_lift_mean": float(args.action_guard_min_tail_lift_mean),
         }
         logging.info("Action guard enabled: %s", metadata["action_guard"])
-    elif args.disable_action_guard:
-        logging.warning("Action guard disabled by CLI flag")
+    elif not args.enable_action_guard:
+        metadata["action_guard"] = {
+            "enabled": False,
+            "reason": "not explicitly enabled",
+        }
+        logging.info("Action guard disabled (default; pass --enable_action_guard to opt in)")
     elif guard_is_realman:
         logging.warning("Action guard inactive because max_attempts <= 1")
 
@@ -658,6 +915,17 @@ def build_argparser():
     parser.add_argument("--port", type=int, default=10093)
     parser.add_argument("--use_bf16", action="store_true")
     parser.add_argument("--cuda", type=int, default=0)
+    parser.add_argument(
+        "--policy-ensemble-size",
+        "--policy_ensemble_size",
+        dest="policy_ensemble_size",
+        type=_positive_int,
+        default=os.getenv("POLICY_ENSEMBLE_SIZE", "1"),
+        help=(
+            "Number of stochastic action draws to generate in one batched model call. "
+            "Values above one return the elementwise median normalized action chunk."
+        ),
+    )
     parser.add_argument(
         "--load_training_backbones",
         action="store_true",
@@ -694,17 +962,31 @@ def build_argparser():
             "The JSONL log stores image stats and SHA256 hashes either way."
         ),
     )
-    parser.add_argument(
-        "--disable_action_guard",
+    guard_toggle = parser.add_mutually_exclusive_group()
+    guard_toggle.add_argument(
+        "--enable_action_guard",
+        dest="enable_action_guard",
         action="store_true",
-        default=env_flag_enabled("POLICY_DISABLE_ACTION_GUARD"),
-        help="Disable Realman action safety retry checks.",
+        default=(
+            env_flag_enabled("POLICY_ENABLE_ACTION_GUARD")
+            and not env_flag_enabled("POLICY_DISABLE_ACTION_GUARD")
+        ),
+        help=(
+            "Opt in to the legacy Realman stochastic retry heuristic. It thresholds "
+            "absolute joint-pose magnitude and is not a model-quality or motion-safety check."
+        ),
+    )
+    guard_toggle.add_argument(
+        "--disable_action_guard",
+        dest="enable_action_guard",
+        action="store_false",
+        help="Explicitly keep the legacy Realman stochastic retry heuristic disabled (default).",
     )
     parser.add_argument(
         "--action_guard_max_attempts",
         type=int,
         default=int(os.getenv("POLICY_ACTION_GUARD_MAX_ATTEMPTS", "8")),
-        help="Maximum stochastic samples before refusing to return an unsafe Realman action chunk.",
+        help="Maximum stochastic samples considered by the opt-in joint-pose-magnitude heuristic.",
     )
     parser.add_argument("--action_guard_first_n", type=int, default=int(os.getenv("POLICY_ACTION_GUARD_FIRST_N", "10")))
     parser.add_argument("--action_guard_tail_start", type=int, default=int(os.getenv("POLICY_ACTION_GUARD_TAIL_START", "20")))
@@ -756,6 +1038,16 @@ def env_flag_enabled(name: str) -> bool:
     if raw is None:
         return False
     return raw.strip().lower() not in {"", "0", "false", "no", "off"}
+
+
+def _positive_int(value: Any) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError(f"expected a positive integer, got {value!r}") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError(f"expected a positive integer, got {value!r}")
+    return parsed
 
 
 if __name__ == "__main__":

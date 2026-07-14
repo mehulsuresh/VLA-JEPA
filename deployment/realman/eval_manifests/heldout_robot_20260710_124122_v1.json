@@ -1,0 +1,49 @@
+{
+  "schema_version": 2,
+  "description": "Read-only evaluation episode copied from collection2/20260710_124122/episode_000000 after the Magna training dataset was frozen. The canonical dataset validates with its own counted statistics; the evaluator normalizes its raw 22D actions and 19D states using checkpoint statistics.",
+  "excluded_from_training": true,
+  "external_to_training_catalog": true,
+  "training_data_mix": "magna_source_no_base_no_lift_interventions_v3",
+  "training_dataset_episode_catalog_sha256": "f4c2f81976d9172d619c878e2122f8a349c0cac0fcbc598c8fefa02c4ab16002",
+  "evaluation_dataset_episode_catalog_sha256": "9d3ef23797b7e6cec5f24422d46017797e83f2ddc1b8296163b6f92f15fab4e6",
+  "holdout_proof": {
+    "proof_kind": "reconstructed_against_verified_legacy_checkpoint_training_dataset",
+    "episode_identity_algorithm": "realman-source-episode-content-v1",
+    "training": {
+      "episode_count": 1638,
+      "frame_count": 2452692,
+      "source_content_catalog_sha256": "fa541dfb5465d30255e3b85e35bfff47da62873be4b21e18db2bb713eca81768",
+      "source_statistics_catalog_sha256": "918c00551c6d1afcf35a3f221923c57c8c0729426419345e68b5133acf910bd2"
+    },
+    "evaluation": {
+      "episode_count": 1,
+      "frame_count": 1804,
+      "source_content_catalog_sha256": "bfd241e5627aa7324bff6310cf3927e60766677162f4ff049e9bcda55b54a502",
+      "source_statistics_catalog_sha256": "799953f843a1dc1040b4792e6ca81fe73cc1d30c9c24a9b57ef93f7a98f4846a"
+    },
+    "selected_evaluation_episodes": [
+      {
+        "episode_index": 0,
+        "length": 1804,
+        "fps": 20,
+        "source_action_sha256": "a5fa4c48154bca3afe4b54ccbf3b65902e58811918dc963091b35948cd35933e",
+        "source_observation_state_sha256": "5b9aa3a8ec6e51f886ca52df1350ea169ac97566fe055862f1a4296274d85e71",
+        "source_trajectory_sha256": "483559797b8b94f7311fec07a860b75abf8fffe50c181ff0dfa140282ae8dd17",
+        "source_statistics_sha256": "64beaa74bd31d797ad9ecf8bc0be342c80003d8be5d3c88ef8c743c13b5da7e4"
+      }
+    ]
+  },
+  "selection": {
+    "source_host": "ogrealman",
+    "source_session": "collection2/20260710_124122",
+    "source_episode": 0,
+    "episode_length": 1804,
+    "fps": 20,
+    "canonical_dataset": "/home/mehul/work/reward_model_small/magna_heldout_robot_eval/magna_heldout_20260710_124122_lerobot_v3_canonical"
+  },
+  "datasets": {
+    "magna_heldout_20260710_124122_lerobot_v3_canonical": [
+      0
+    ]
+  }
+}

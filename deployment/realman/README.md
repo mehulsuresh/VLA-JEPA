@@ -61,8 +61,14 @@ checkpoints/<run-id>/
 ```
 
 Start the server from the repository root. Training-only V-JEPA and MoGe
-backbones are skipped by default. The action-output guard is enabled unless
-`--disable_action_guard` is explicitly supplied:
+backbones are skipped by default. Keep the legacy action-output retry heuristic
+disabled: it thresholds absolute joint-pose magnitude, so it can bias stochastic
+samples but cannot determine whether a trajectory is safe or useful. The robot
+client remains responsible for hard limits and per-command step limits.
+
+Do not pass `--use_bf16` for the alignment baseline. Training retains FP32
+parameters for the action head and state projector while using BF16 autocast;
+the flag casts those parameters themselves to BF16.
 
 ```bash
 conda run -n vla-jepa-py313-min --no-capture-output \
@@ -70,7 +76,7 @@ conda run -n vla-jepa-py313-min --no-capture-output \
   --ckpt_path checkpoints/<run-id>/checkpoints/steps_<N> \
   --host 0.0.0.0 \
   --port 10093 \
-  --use_bf16 \
+  --disable_action_guard \
   --policy_output_log_path logs/realman_vlajepa_server.jsonl \
   --policy_input_image_dir logs/realman_vlajepa_inputs
 ```
@@ -118,9 +124,10 @@ the validation run must not actuate any subsystem.
 
 The robot JSONL entry includes `policy_input` with frame/state shapes and dtypes.
 The workstation JSONL records per-view hashes and optional PNG paths, normalized
-state values, output tensors, and action-guard acceptance/retry details.
+state values, and output tensors. It also records action-guard acceptance/retry
+details when that heuristic is explicitly enabled.
 
-## Guarded Live Rollout
+## Diagnostic Live Rollout
 
 Begin with one action per replan. Keep operator takeover available:
 
@@ -139,9 +146,55 @@ python robot_unified_teleop.py \
   --policy-log-path logs/vlajepa_unified_policy.jsonl
 ```
 
-Only increase both chunk settings to `20` after reviewing the dry run and the
-single-step rollout. A chunk of 20 executes 20 predicted absolute targets at
-20 Hz before replanning from a fresh observation.
+Use one to four actions per replan while diagnosing model output and tracking.
+Plain synchronous rollout starts at action row zero only after inference
+finishes, so roughly `latency_seconds * policy_fps` leading rows are stale. Do
+not use action horizon 50 as the execution chunk: it would run 2.5 seconds
+open-loop at 20 Hz.
+
+After the clean checkpoint passes offline evaluation, measure its high-percentile
+server latency and choose a delay `L` with margin. Keep the model horizon at 50,
+set both the execution chunk and delayed-unconditioned overlap to `L`, and
+require `2 * L <= 50`. The previous FP32 server RPC reached 475 ms before
+camera capture, payload construction, decoding, and action preparation, so use
+`L=12` as the first measurement point rather than assuming it is sufficient:
+
+```bash
+python robot_unified_teleop.py \
+  --policy-server-kind realman \
+  --policy-host 192.168.10.223 \
+  --policy-port 10093 \
+  --policy-instruction "reach into the bin, lift the chain, put it in the jig, then remove it from the jig and put it in the other bin" \
+  --policy-autostart \
+  --policy-num-steps 0 \
+  --policy-fps 20 \
+  --policy-chunk-size 12 \
+  --policy-max-live-chunk-size 12 \
+  --policy-async-overlap \
+  --policy-async-delay-steps 12 \
+  --policy-allow-large-live-chunks \
+  --policy-log-path "logs/vlajepa_eval_$(date +%Y%m%d_%H%M%S).jsonl"
+```
+
+This overlap mode is for the clean no-RTC checkpoint and sends no RTC payload.
+Bootstrap holds and then executes rows `0:L`; later responses execute rows
+`L:2L`. The complete observation/RPC/preparation worker must finish before the
+absolute `L/fps` boundary with a 12.5 ms activation reserve at 20 Hz. Actual
+camera and measured-state timestamps must lie within half a tick of tick zero,
+and dispatch completion must remain within half a tick. A fixed
+`--policy-action-index L` is a simpler synchronous fallback but is less robust
+to latency variation.
+
+If the operator explicitly wants no client-side rollout guards, replace
+`--policy-allow-large-live-chunks` with
+`--policy-disable-vla-rollout-safety`. That flag bypasses post-unnormalization
+hard clipping, slew limits, the live chunk cap/guard, and the latency abort. It
+does not disable shape/finite checks, observation freshness, disabled-subsystem
+holds, robot-controller limits, or operator stops. It also does not bypass
+sensor alignment, the `L/fps` pipeline deadline, activation reserve, or
+absolute dispatch cadence. Normalized actions are training-aligned and
+unclipped by default; `--policy-clip-normalized-actions` is an explicit
+non-training-aligned diagnostic override.
 
 The older `run_realman_policy.py` hardware-adapter mode remains useful for
 offline `.npz` tests, but the unified teleop path above is the supported live

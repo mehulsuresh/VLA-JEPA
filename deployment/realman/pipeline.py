@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 import numpy as np
 
@@ -82,6 +82,70 @@ REALMAN_POLICY_ACTION_DIMS = (
     REALMAN_POLICY_ACTION_DIM_NO_BASE,
     REALMAN_POLICY_ACTION_DIM_NO_BASE_NO_LIFT,
 )
+
+
+def realman_continuous_unnormalize(
+    values: Any,
+    stats: Mapping[str, Any],
+    *,
+    mode: str,
+) -> np.ndarray:
+    """Apply the exact training action inverse without clipping predictions.
+
+    Values outside the nominal normalized interval remain outside it during
+    the affine inverse.  This matches ``Normalizer.inverse`` and the RealMan
+    policy server; any robot-side safety handling is a separate post-inverse
+    concern.  Keeping this helper RealMan-local avoids inheriting the legacy
+    bounded diagnostic inverse used by the Trossen deployment adapter.
+    """
+
+    array = np.asarray(values, dtype=np.float32)
+
+    def _stat(name: str) -> np.ndarray:
+        value = np.asarray(stats[name], dtype=np.float32)
+        if value.ndim != 1:
+            raise ValueError(
+                f"RealMan action statistic {name!r} must be one-dimensional, "
+                f"got {value.shape}."
+            )
+        if array.ndim == 0 or array.shape[-1] != value.shape[0]:
+            raise ValueError(
+                "RealMan action inverse dimension mismatch: "
+                f"values={array.shape}, {name}={value.shape}."
+            )
+        return value
+
+    if mode == "min_max":
+        minimum = _stat("min")
+        maximum = _stat("max")
+        if minimum.shape != maximum.shape:
+            raise ValueError(
+                f"RealMan min/max statistics differ: {minimum.shape} != {maximum.shape}."
+            )
+        return (0.5 * (array + 1.0) * (maximum - minimum) + minimum).astype(
+            np.float32,
+            copy=False,
+        )
+    if mode == "q99":
+        q01 = _stat("q01")
+        q99 = _stat("q99")
+        if q01.shape != q99.shape:
+            raise ValueError(
+                f"RealMan q01/q99 statistics differ: {q01.shape} != {q99.shape}."
+            )
+        return (0.5 * (array + 1.0) * (q99 - q01) + q01).astype(
+            np.float32,
+            copy=False,
+        )
+    if mode == "mean_std":
+        mean = _stat("mean")
+        std = _stat("std")
+        if mean.shape != std.shape:
+            raise ValueError(
+                f"RealMan mean/std statistics differ: {mean.shape} != {std.shape}."
+            )
+        return (array * std + mean).astype(np.float32, copy=False)
+    raise ValueError(f"Unsupported RealMan action normalization mode {mode!r}.")
 
 
 def realman_policy_action_names(action_dim: int) -> tuple[str, ...]:

@@ -6,6 +6,7 @@ import asyncio
 import logging
 import traceback
 
+import numpy as np
 import websockets.asyncio.server
 import websockets.frames
 
@@ -36,6 +37,74 @@ class WebsocketPolicyServer:
 
     def serve_forever(self) -> None:
         asyncio.run(self.run())
+
+    def _validate_rtc_payload(self, payload: dict) -> str | None:
+        """Validate the opt-in RTC prefix against the checkpoint contract."""
+
+        rtc_keys = ("prev_actions", "prefix_len", "rtc_config")
+        present = [key for key in rtc_keys if key in payload]
+        if not present:
+            return None
+
+        contract = self._metadata.get("rtc_inference_contract")
+        if not isinstance(contract, dict):
+            return "Payload requested RTC, but the policy metadata does not advertise an RTC contract"
+        if not bool(contract.get("training_enabled")):
+            return "Payload requested RTC, but RTC was not enabled for this checkpoint's training"
+        missing = [key for key in rtc_keys if key not in payload]
+        if missing:
+            return f"RTC payload must include prev_actions, prefix_len, and rtc_config; missing {missing}"
+
+        rtc_config = payload.get("rtc_config")
+        if not isinstance(rtc_config, dict) or rtc_config.get("enabled") is not True:
+            return "rtc_config must be a dict with enabled=true"
+        expected_method = str(contract.get("method", "prefix"))
+        if str(rtc_config.get("method", "")) != expected_method:
+            return f"rtc_config.method must be {expected_method!r}"
+
+        prefix_len = payload.get("prefix_len")
+        if isinstance(prefix_len, (bool, np.bool_)) or not isinstance(
+            prefix_len, (int, np.integer)
+        ):
+            return "prefix_len must be an integer"
+        prefix_len = int(prefix_len)
+        max_prefix_len = int(contract.get("max_prefix_len", 0) or 0)
+        if prefix_len < 1 or prefix_len > max_prefix_len:
+            return f"prefix_len must be in [1, {max_prefix_len}], got {prefix_len}"
+
+        try:
+            prev_actions = np.asarray(payload.get("prev_actions"))
+        except Exception:
+            return "prev_actions must be a numeric [1, prefix_len, action_dim] array"
+        expected_action_dim = self._metadata.get("action_dim")
+        expected_horizon = self._metadata.get("action_horizon")
+        expected_shape = (
+            1,
+            prefix_len,
+            int(expected_action_dim) if expected_action_dim is not None else None,
+        )
+        if prev_actions.ndim != 3:
+            return f"prev_actions must have rank 3, got shape {prev_actions.shape}"
+        if prev_actions.shape[0] != 1 or prev_actions.shape[1] < prefix_len:
+            return (
+                "prev_actions must have shape [1, at_least_prefix_len, action_dim]; "
+                f"expected batch 1 and at least {prefix_len} rows, got {prev_actions.shape}"
+            )
+        if expected_horizon is not None and prev_actions.shape[1] > int(expected_horizon):
+            return (
+                f"prev_actions cannot exceed action_horizon={int(expected_horizon)}, "
+                f"got {prev_actions.shape[1]} rows"
+            )
+        if expected_shape[2] is not None and prev_actions.shape[2] != expected_shape[2]:
+            return (
+                f"prev_actions action dimension must be {expected_shape[2]}, "
+                f"got {prev_actions.shape[2]}"
+            )
+        if prev_actions.dtype.kind not in "fiu":
+            return f"prev_actions must be numeric, got dtype {prev_actions.dtype}"
+        if not np.isfinite(prev_actions).all():
+            return "prev_actions contains non-finite values"
+        return None
 
     async def run(self):
         async with websockets.asyncio.server.serve(
@@ -141,6 +210,31 @@ class WebsocketPolicyServer:
                     "type": "inference_result",
                     "request_id": req_id,
                     "error": {"message": "Payload must not include both `batch_images` and `qwen_frames`"},
+                }
+            input_contract = self._metadata.get("realman_input_contract")
+            required_image_key = input_contract.get("payload_key") if isinstance(input_contract, dict) else None
+            if required_image_key and image_payload_keys[0] != required_image_key:
+                return {
+                    "status": "error",
+                    "ok": False,
+                    "type": "inference_result",
+                    "request_id": req_id,
+                    "error": {
+                        "message": (
+                            f"Policy input contract requires `{required_image_key}`; "
+                            f"received `{image_payload_keys[0]}`. Refusing an incompatible "
+                            "image preprocessing path."
+                        )
+                    },
+                }
+            rtc_error = self._validate_rtc_payload(payload)
+            if rtc_error is not None:
+                return {
+                    "status": "error",
+                    "ok": False,
+                    "type": "inference_result",
+                    "request_id": req_id,
+                    "error": {"message": rtc_error},
                 }
             try:
                 infer_payload = dict(payload)
