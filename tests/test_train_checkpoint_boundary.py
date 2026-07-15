@@ -97,7 +97,7 @@ def _loop_trainer(
         metrics["heldout_eval_normalized_arm_mae_h20"] = 0.25
         return metrics
 
-    def save_checkpoint():
+    def save_checkpoint(*, prune=True):
         events.append(("save", trainer.completed_steps))
 
     def should_save(_metrics):
@@ -114,6 +114,9 @@ def _loop_trainer(
     trainer._train_step = train_step
     trainer.eval_heldout_action_model = evaluate
     trainer._save_checkpoint = save_checkpoint
+    trainer._finalize_deferred_checkpoint = (
+        lambda _metrics, *, track_heldout_best: None
+    )
     trainer._should_save_checkpoint = should_save
     trainer._force_checkpoint_requested = force_requested
     trainer._clear_force_checkpoint_request = clear_force
@@ -142,6 +145,7 @@ def test_unconditional_terminal_checkpoint_survives_fail_closed_eval():
     assert trainer.completed_steps == 1
     assert events == [
         ("train", 0, True),
+        ("force_check", 1),
         ("save", 1),
         ("eval", 1),
     ]
@@ -186,6 +190,7 @@ def test_save_best_only_eval_failure_does_not_create_unselected_checkpoint():
 
     assert events == [
         ("train", 0, True),
+        ("force_check", 1),
         ("eval", 1),
     ]
 
@@ -225,6 +230,114 @@ def test_force_checkpoint_waits_for_completed_optimizer_step_then_saves_once():
     assert [event for event in events if event[0] == "force_check"] == [
         ("force_check", 1)
     ]
+    assert [event for event in events if event[0] == "save"] == [("save", 1)]
+    assert [event for event in events if event[0] == "force_clear"] == [
+        ("force_clear", 1)
+    ]
+
+
+def test_force_checkpoint_decision_is_sampled_once_and_broadcast_to_all_ranks(
+    monkeypatch,
+):
+    trainer = object.__new__(VLATrainer)
+    trainer.config = OmegaConf.create(
+        {"trainer": {"enable_force_checkpoint_file": True}}
+    )
+    trainer.force_checkpoint_path = "/shared/run/FORCE_CHECKPOINT"
+    rank = {"value": 0}
+    broadcast_value = {}
+    exists_calls = []
+
+    monkeypatch.setattr(train_starvla.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        train_starvla.dist, "get_rank", lambda: rank["value"]
+    )
+    monkeypatch.setattr(train_starvla.dist, "get_backend", lambda: "gloo")
+
+    def broadcast_object_list(container, *, src, **_kwargs):
+        assert src == 0
+        if rank["value"] == 0:
+            broadcast_value["decision"] = container[0]
+        else:
+            container[0] = broadcast_value["decision"]
+
+    monkeypatch.setattr(
+        train_starvla.dist, "broadcast_object_list", broadcast_object_list
+    )
+
+    def sentinel_exists(path):
+        assert path == trainer.force_checkpoint_path
+        exists_calls.append(rank["value"])
+        # Model the exact race: absent when rank zero samples it, then present
+        # by the time rank one reaches this point. Rank one must never resample.
+        return rank["value"] == 1
+
+    monkeypatch.setattr(train_starvla.os.path, "exists", sentinel_exists)
+
+    assert trainer._force_checkpoint_requested() is False
+    rank["value"] = 1
+    assert trainer._force_checkpoint_requested() is False
+    assert exists_calls == [0]
+
+
+def test_force_at_eval_only_cadence_pre_saves_unconditional_checkpoint():
+    trainer, events = _loop_trainer(
+        sync_sequence=[True],
+        eval_interval=1,
+        save_interval=99,
+        force_requests=[True],
+    )
+
+    trainer.train()
+
+    assert [event for event in events if event[0] == "save"] == [("save", 1)]
+    assert events.index(("save", 1)) < events.index(("eval", 1))
+    assert [event for event in events if event[0] == "force_clear"] == [
+        ("force_clear", 1)
+    ]
+
+
+@pytest.mark.parametrize(
+    ("eval_metric", "expected_value", "expected_step"),
+    [(0.20, 0.20, 1), (0.40, 0.30, 0)],
+)
+def test_save_best_only_force_at_eval_cadence_considers_improved_and_worse_metrics(
+    eval_metric,
+    expected_value,
+    expected_step,
+):
+    trainer, events = _loop_trainer(
+        sync_sequence=[True],
+        eval_interval=1,
+        save_interval=99,
+        save_best_only=True,
+        force_requests=[True],
+    )
+    trainer.best_metric_value = 0.30
+    trainer.best_metric_step = 0
+
+    def evaluate(metrics):
+        events.append(("eval", trainer.completed_steps))
+        metrics["selection_metric"] = eval_metric
+        return metrics
+
+    def consider(metrics):
+        events.append(("best_decision", trainer.completed_steps))
+        value = float(metrics["selection_metric"])
+        if value < trainer.best_metric_value:
+            trainer.best_metric_value = value
+            trainer.best_metric_step = trainer.completed_steps
+            return True
+        return False
+
+    trainer.eval_heldout_action_model = evaluate
+    trainer._should_save_checkpoint = consider
+
+    trainer.train()
+
+    assert trainer.best_metric_value == pytest.approx(expected_value)
+    assert trainer.best_metric_step == expected_step
+    assert events.index(("eval", 1)) < events.index(("best_decision", 1))
     assert [event for event in events if event[0] == "save"] == [("save", 1)]
     assert [event for event in events if event[0] == "force_clear"] == [
         ("force_clear", 1)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import os
 from pathlib import Path
 import shlex
@@ -253,6 +254,39 @@ def _full_state_checkpoint(
     return checkpoint
 
 
+def _write_selection_state(
+    checkpoint: Path,
+    *,
+    best_step: int | None,
+    best_value: float | None,
+) -> None:
+    metric_name = "heldout_focused_eval_task_failure_score_h10"
+    trainer_state = {
+        "completed_steps": int(checkpoint.name.removeprefix("steps_")),
+        "selection_state_schema_version": 1,
+        "best_metric_name": metric_name,
+        "best_metric_mode": "min",
+        "best_metric_value": best_value,
+        "best_metric_step": best_step,
+    }
+    (checkpoint / "trainer_state.json").write_text(
+        json.dumps(trainer_state) + "\n", encoding="utf-8"
+    )
+    selection_state = {
+        "schema_version": 1,
+        "best_metric_name": metric_name,
+        "best_metric_mode": "min",
+        "best_metric_value": best_value,
+        "best_metric_step": best_step,
+        "checkpoint_relative_path": (
+            None if best_step is None else f"checkpoints/steps_{best_step}"
+        ),
+    }
+    (checkpoint / "selection_state.json").write_text(
+        json.dumps(selection_state) + "\n", encoding="utf-8"
+    )
+
+
 def test_h100_production_launcher_preserves_resume_controls_and_has_no_step_cap(tmp_path):
     checkpoint = _full_state_checkpoint(tmp_path)
     result, generator_args_path = _run_fake_h100(
@@ -494,6 +528,278 @@ def test_h100_launcher_rejects_trainer_state_step_mismatch(tmp_path):
         "--trainer.resume_from_checkpoint",
         str(checkpoint),
     )
+    assert result.returncode == 2
+    assert result.stdout == ""
+
+
+def test_h100_launcher_requires_selection_state_for_new_checkpoint_schema(tmp_path):
+    checkpoint = _full_state_checkpoint(tmp_path)
+    (checkpoint / "trainer_state.json").write_text(
+        json.dumps(
+            {
+                "completed_steps": 5,
+                "selection_state_schema_version": 1,
+                "best_metric_name": "heldout_focused_eval_task_failure_score_h10",
+                "best_metric_mode": "min",
+                "best_metric_value": None,
+                "best_metric_step": None,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    result, _ = _run_fake_h100(
+        tmp_path,
+        "--trainer.is_resume",
+        "true",
+        "--trainer.resume_from_checkpoint",
+        str(checkpoint),
+    )
+
+    assert result.returncode == 2
+    assert result.stdout == ""
+
+
+def test_h100_launcher_accepts_complete_new_selection_state(tmp_path):
+    checkpoint = _full_state_checkpoint(tmp_path)
+    _write_selection_state(checkpoint, best_step=5, best_value=0.25)
+
+    result, _ = _run_fake_h100(
+        tmp_path,
+        "--trainer.is_resume",
+        "true",
+        "--trainer.resume_from_checkpoint",
+        str(checkpoint),
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("schema_version", 2),
+        ("schema_version", 1.0),
+        ("schema_version", True),
+        ("best_metric_name", "wrong_metric"),
+        ("best_metric_value", float("nan")),
+        ("best_metric_step", 6),
+        ("checkpoint_relative_path", "checkpoints/steps_4"),
+    ],
+)
+def test_h100_launcher_rejects_malformed_new_selection_state(
+    tmp_path, field, value
+):
+    checkpoint = _full_state_checkpoint(tmp_path)
+    _write_selection_state(checkpoint, best_step=5, best_value=0.25)
+    selection_path = checkpoint / "selection_state.json"
+    payload = json.loads(selection_path.read_text(encoding="utf-8"))
+    payload[field] = value
+    selection_path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+
+    result, _ = _run_fake_h100(
+        tmp_path,
+        "--trainer.is_resume",
+        "true",
+        "--trainer.resume_from_checkpoint",
+        str(checkpoint),
+    )
+
+    assert result.returncode == 2
+    assert result.stdout == ""
+
+
+def test_h100_launcher_rejects_missing_selected_best_checkpoint(tmp_path):
+    checkpoint = _full_state_checkpoint(tmp_path, name="steps_10")
+    _write_selection_state(checkpoint, best_step=5, best_value=0.25)
+
+    result, _ = _run_fake_h100(
+        tmp_path,
+        "--trainer.is_resume",
+        "true",
+        "--trainer.resume_from_checkpoint",
+        str(checkpoint),
+    )
+
+    assert result.returncode == 2
+    assert result.stdout == ""
+
+
+def test_h100_launcher_rejects_incomplete_selected_best_checkpoint(tmp_path):
+    best_checkpoint = _full_state_checkpoint(tmp_path, name="steps_5")
+    checkpoint = _full_state_checkpoint(tmp_path, name="steps_10")
+    _write_selection_state(checkpoint, best_step=5, best_value=0.25)
+    (best_checkpoint / "optimizer.bin").unlink()
+
+    result, _ = _run_fake_h100(
+        tmp_path,
+        "--trainer.is_resume",
+        "true",
+        "--trainer.resume_from_checkpoint",
+        str(checkpoint),
+    )
+
+    assert result.returncode == 2
+    assert result.stdout == ""
+
+
+def test_h100_launcher_accepts_empty_new_selection_state(tmp_path):
+    checkpoint = _full_state_checkpoint(tmp_path)
+    _write_selection_state(checkpoint, best_step=None, best_value=None)
+
+    result, _ = _run_fake_h100(
+        tmp_path,
+        "--trainer.is_resume",
+        "true",
+        "--trainer.resume_from_checkpoint",
+        str(checkpoint),
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_h100_launcher_accepts_complete_older_best_dependency(tmp_path):
+    best_checkpoint = _full_state_checkpoint(tmp_path, name="steps_5")
+    _write_selection_state(best_checkpoint, best_step=5, best_value=0.25)
+    checkpoint = _full_state_checkpoint(tmp_path, name="steps_10")
+    _write_selection_state(checkpoint, best_step=5, best_value=0.25)
+
+    result, _ = _run_fake_h100(
+        tmp_path,
+        "--trainer.is_resume",
+        "true",
+        "--trainer.resume_from_checkpoint",
+        str(checkpoint),
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_h100_launcher_accepts_transitive_selection_dependency_closure(tmp_path):
+    checkpoint_5 = _full_state_checkpoint(tmp_path, name="steps_5")
+    _write_selection_state(checkpoint_5, best_step=5, best_value=0.30)
+    checkpoint_10 = _full_state_checkpoint(tmp_path, name="steps_10")
+    _write_selection_state(checkpoint_10, best_step=5, best_value=0.30)
+    checkpoint_15 = _full_state_checkpoint(tmp_path, name="steps_15")
+    _write_selection_state(checkpoint_15, best_step=10, best_value=0.20)
+
+    result, _ = _run_fake_h100(
+        tmp_path,
+        "--trainer.is_resume",
+        "true",
+        "--trainer.resume_from_checkpoint",
+        str(checkpoint_15),
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize("schema", [2, 1.0, True])
+def test_h100_launcher_rejects_nonexact_trainer_selection_schema(tmp_path, schema):
+    checkpoint = _full_state_checkpoint(tmp_path)
+    _write_selection_state(checkpoint, best_step=5, best_value=0.25)
+    trainer_state_path = checkpoint / "trainer_state.json"
+    trainer_state = json.loads(trainer_state_path.read_text(encoding="utf-8"))
+    trainer_state["selection_state_schema_version"] = schema
+    trainer_state_path.write_text(
+        json.dumps(trainer_state) + "\n", encoding="utf-8"
+    )
+
+    result, _ = _run_fake_h100(
+        tmp_path,
+        "--trainer.is_resume",
+        "true",
+        "--trainer.resume_from_checkpoint",
+        str(checkpoint),
+    )
+
+    assert result.returncode == 2
+    assert result.stdout == ""
+
+
+def test_h100_launcher_rejects_coordinated_wrong_metric_identity(tmp_path):
+    checkpoint = _full_state_checkpoint(tmp_path)
+    _write_selection_state(checkpoint, best_step=5, best_value=0.25)
+    for filename in ("trainer_state.json", "selection_state.json"):
+        path = checkpoint / filename
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["best_metric_name"] = "coordinated_but_wrong_metric"
+        path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+
+    result, _ = _run_fake_h100(
+        tmp_path,
+        "--trainer.is_resume",
+        "true",
+        "--trainer.resume_from_checkpoint",
+        str(checkpoint),
+    )
+
+    assert result.returncode == 2
+    assert result.stdout == ""
+
+
+def test_h100_launcher_rejects_malformed_legacy_sidecar(tmp_path):
+    checkpoint = _full_state_checkpoint(tmp_path)
+    (checkpoint / "selection_state.json").write_text("{", encoding="utf-8")
+
+    result, _ = _run_fake_h100(
+        tmp_path,
+        "--trainer.is_resume",
+        "true",
+        "--trainer.resume_from_checkpoint",
+        str(checkpoint),
+    )
+
+    assert result.returncode == 2
+    assert result.stdout == ""
+
+
+def test_h100_launcher_rejects_malformed_selected_best_sidecar(tmp_path):
+    best_checkpoint = _full_state_checkpoint(tmp_path, name="steps_5")
+    _write_selection_state(best_checkpoint, best_step=5, best_value=0.25)
+    best_payload_path = best_checkpoint / "selection_state.json"
+    best_payload = json.loads(best_payload_path.read_text(encoding="utf-8"))
+    best_payload["schema_version"] = 2
+    best_payload_path.write_text(
+        json.dumps(best_payload) + "\n", encoding="utf-8"
+    )
+    checkpoint = _full_state_checkpoint(tmp_path, name="steps_10")
+    _write_selection_state(checkpoint, best_step=5, best_value=0.25)
+
+    result, _ = _run_fake_h100(
+        tmp_path,
+        "--trainer.is_resume",
+        "true",
+        "--trainer.resume_from_checkpoint",
+        str(checkpoint),
+    )
+
+    assert result.returncode == 2
+    assert result.stdout == ""
+
+
+def test_h100_launcher_rejects_external_symlinked_best_checkpoint(tmp_path):
+    external_best = _full_state_checkpoint(
+        tmp_path,
+        name="steps_5",
+        run_id="robot_ft_lerobot_magna_interventions_h100x8_b16_external",
+    )
+    _write_selection_state(external_best, best_step=5, best_value=0.25)
+    checkpoint = _full_state_checkpoint(tmp_path, name="steps_10")
+    _write_selection_state(checkpoint, best_step=5, best_value=0.25)
+    (checkpoint.parent / "steps_5").symlink_to(
+        external_best, target_is_directory=True
+    )
+
+    result, _ = _run_fake_h100(
+        tmp_path,
+        "--trainer.is_resume",
+        "true",
+        "--trainer.resume_from_checkpoint",
+        str(checkpoint),
+    )
+
     assert result.returncode == 2
     assert result.stdout == ""
 

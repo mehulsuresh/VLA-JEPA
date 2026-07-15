@@ -1,5 +1,6 @@
 import copy
 import json
+from pathlib import Path
 
 import pytest
 import torch
@@ -238,3 +239,57 @@ def test_model_only_resume_still_fast_forwards_fresh_lambdalr(tmp_path):
         resumed_model.parameters(), source_model.parameters(), strict=True
     ):
         torch.testing.assert_close(resumed_parameter, source_parameter, rtol=0, atol=0)
+
+
+def test_eval_only_model_only_resume_accepts_external_checkpoint_without_mutation(
+    tmp_path,
+):
+    source_checkpoint = tmp_path / "external-source" / "steps_10"
+    source_checkpoint.mkdir(parents=True)
+    (source_checkpoint / "trainer_state.json").write_text(
+        json.dumps({"completed_steps": 10}),
+        encoding="utf-8",
+    )
+    torch.manual_seed(13)
+    source_model = torch.nn.Linear(3, 2)
+    torch.save(source_model.state_dict(), source_checkpoint / "pytorch_model.pt")
+
+    eval_output = tmp_path / "separate-eval-output"
+    eval_output.mkdir()
+    sentinel = eval_output / "sentinel.txt"
+    sentinel.write_text("eval output must remain selection-free\n", encoding="utf-8")
+
+    resumed_model = torch.nn.Linear(3, 2)
+    accelerator = _CheckpointLoadingAccelerator(resumed_model, None, None, {})
+    trainer = object.__new__(VLATrainer)
+    trainer.config = OmegaConf.create(
+        {
+            "output_dir": str(eval_output),
+            "trainer": {
+                "eval_only": True,
+                "resume_load_optimizer_state": False,
+            },
+        }
+    )
+    trainer.checkpoint_dir = str(eval_output / "checkpoints")
+    trainer.model = resumed_model
+    trainer.optimizer = None
+    trainer.lr_scheduler = None
+    trainer.accelerator = accelerator
+    trainer.completed_steps = 0
+    trainer.best_metric_value = None
+
+    trainer._load_checkpoint(source_checkpoint)
+
+    assert accelerator.loaded_path is None
+    assert trainer.loaded_checkpoint_path == str(source_checkpoint.resolve())
+    assert trainer.completed_steps == 10
+    for resumed_parameter, source_parameter in zip(
+        resumed_model.parameters(), source_model.parameters(), strict=True
+    ):
+        torch.testing.assert_close(resumed_parameter, source_parameter, rtol=0, atol=0)
+    assert not (eval_output / "best_checkpoint.json").exists()
+    assert not Path(trainer.checkpoint_dir).exists()
+    assert sentinel.read_text(encoding="utf-8") == (
+        "eval output must remain selection-free\n"
+    )

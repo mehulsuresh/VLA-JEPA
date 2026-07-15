@@ -24,6 +24,7 @@ import json
 import os
 import random
 import shutil
+import stat
 import sys
 import logging
 import queue
@@ -610,6 +611,53 @@ def _atomic_write_bytes(path: Path, payload: bytes) -> None:
     finally:
         if temporary_path.exists():
             temporary_path.unlink()
+
+
+def _sha256_file(path: Path, *, chunk_size: int = 8 * 1024 * 1024) -> str:
+    """Hash a potentially large checkpoint file without materializing it."""
+
+    before = path.lstat()
+    if not stat.S_ISREG(before.st_mode):
+        raise RuntimeError(f"SHA-256 source is not a regular file: {path}")
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        opened_before = os.fstat(handle.fileno())
+        if (
+            opened_before.st_dev != before.st_dev
+            or opened_before.st_ino != before.st_ino
+            or opened_before.st_size != before.st_size
+            or opened_before.st_mtime_ns != before.st_mtime_ns
+        ):
+            raise RuntimeError(f"SHA-256 source changed before hashing: {path}")
+        while chunk := handle.read(chunk_size):
+            digest.update(chunk)
+        opened_after = os.fstat(handle.fileno())
+    after = path.lstat()
+    identity_before = (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+    )
+    if (
+        (
+            opened_after.st_dev,
+            opened_after.st_ino,
+            opened_after.st_size,
+            opened_after.st_mtime_ns,
+        )
+        != identity_before
+        or (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+        )
+        != identity_before
+        or not stat.S_ISREG(after.st_mode)
+    ):
+        raise RuntimeError(f"SHA-256 source changed while hashing: {path}")
+    return digest.hexdigest()
 
 
 def _plain_config(config) -> dict:
@@ -1859,6 +1907,7 @@ class VLATrainer(TrainerUtils):
         self.best_metric_name = str(self.config.trainer.get("best_metric_name", "mae_score"))
         self.best_metric_mode = str(self.config.trainer.get("best_metric_mode", "min")).lower()
         self.best_metric_value = None
+        self.best_metric_step = None
         self.loaded_checkpoint_path: str | None = None
         self.legacy_underfilled_eval = bool(
             self.config.trainer.get(
@@ -2538,7 +2587,24 @@ class VLATrainer(TrainerUtils):
     def _force_checkpoint_requested(self) -> bool:
         if not bool(self.config.trainer.get("enable_force_checkpoint_file", True)):
             return False
-        return os.path.exists(getattr(self, "force_checkpoint_path", ""))
+        force_checkpoint_path = getattr(self, "force_checkpoint_path", "")
+        if not dist.is_initialized():
+            return os.path.exists(force_checkpoint_path)
+
+        # Only rank zero samples the asynchronous sentinel. If every rank
+        # performs its own exists() call, creation between those calls can
+        # split the save/eval branches around collective checkpoint I/O.
+        rank_zero_request = (
+            os.path.exists(force_checkpoint_path)
+            if dist.get_rank() == 0
+            else None
+        )
+        shared_request = self._broadcast_object_from_rank_zero(rank_zero_request)
+        if type(shared_request) is not bool:
+            raise RuntimeError(
+                "Distributed FORCE_CHECKPOINT decision is not an exact boolean."
+            )
+        return shared_request
 
     def _clear_force_checkpoint_request(self):
         if self.accelerator.is_main_process:
@@ -2554,6 +2620,18 @@ class VLATrainer(TrainerUtils):
         checkpoint_path = str(Path(checkpoint_path).expanduser().resolve())
         if not Path(checkpoint_path).is_dir():
             raise FileNotFoundError(f"Checkpoint directory does not exist: {checkpoint_path}")
+        if not hasattr(self, "best_metric_name"):
+            self.best_metric_name = str(
+                self.config.trainer.get("best_metric_name", "mae_score")
+            )
+        if not hasattr(self, "best_metric_mode"):
+            self.best_metric_mode = str(
+                self.config.trainer.get("best_metric_mode", "min")
+            ).lower()
+        if not hasattr(self, "best_metric_value"):
+            self.best_metric_value = None
+        if not hasattr(self, "best_metric_step"):
+            self.best_metric_step = None
         load_optimizer_state = bool(self.config.trainer.get("resume_load_optimizer_state", True))
         if load_optimizer_state:
             self.accelerator.load_state(checkpoint_path)
@@ -2592,23 +2670,165 @@ class VLATrainer(TrainerUtils):
                     "Model-only checkpoint load mismatch: "
                     f"missing_keys={sorted(missing_keys)} unexpected_keys={sorted(unexpected_keys)}"
                 )
-        trainer_state_path = os.path.join(checkpoint_path, "trainer_state.json")
-        if os.path.exists(trainer_state_path):
+        trainer_state_path = Path(checkpoint_path) / "trainer_state.json"
+        requires_selection_state = False
+        trainer_state_best_value: float | None = None
+        trainer_state_best_step: int | None = None
+        checkpoint_name = Path(checkpoint_path).name
+        checkpoint_path_step = None
+        if checkpoint_name.startswith("steps_"):
             try:
-                with open(trainer_state_path, "r") as f:
-                    trainer_state = json.load(f)
-                self.completed_steps = int(trainer_state.get("completed_steps", self.completed_steps))
-                best_metric_value = trainer_state.get("best_metric_value", None)
-                self.best_metric_value = None if best_metric_value is None else float(best_metric_value)
-            except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
-                logger.warning(f"Unable to load trainer state from checkpoint `{checkpoint_path}`: {exc}")
+                checkpoint_path_step = int(checkpoint_name.split("_", 1)[1])
+            except ValueError:
+                checkpoint_path_step = None
+            if (
+                checkpoint_path_step is None
+                or checkpoint_path_step < 0
+                or checkpoint_name != f"steps_{checkpoint_path_step}"
+            ):
+                checkpoint_path_step = None
+
+        trainer_state = None
+        if trainer_state_path.exists():
+            if trainer_state_path.is_symlink() or not trainer_state_path.is_file():
+                raise RuntimeError(
+                    f"Checkpoint trainer state is not a regular file: {trainer_state_path}"
+                )
+            try:
+                trainer_state = json.loads(
+                    trainer_state_path.read_text(encoding="utf-8")
+                )
+            except (OSError, json.JSONDecodeError) as exc:
+                raise RuntimeError(
+                    f"Unable to load checkpoint trainer state: {trainer_state_path}"
+                ) from exc
+            if not isinstance(trainer_state, Mapping):
+                raise RuntimeError(
+                    f"Checkpoint trainer state is not a JSON object: {trainer_state_path}"
+                )
+            selection_state_schema_version = trainer_state.get(
+                "selection_state_schema_version"
+            )
+            if selection_state_schema_version is not None and (
+                type(selection_state_schema_version) is not int
+                or selection_state_schema_version != 1
+            ):
+                raise RuntimeError(
+                    "Unsupported checkpoint selection-state schema version "
+                    f"{selection_state_schema_version!r} in {trainer_state_path}."
+                )
+            requires_selection_state = selection_state_schema_version == 1
+            raw_completed_steps = trainer_state.get("completed_steps")
+            if (
+                isinstance(raw_completed_steps, bool)
+                or not isinstance(raw_completed_steps, int)
+                or raw_completed_steps < 0
+            ):
+                raise RuntimeError(
+                    f"Checkpoint completed_steps must be a non-negative integer: {trainer_state_path}"
+                )
+            if checkpoint_path_step is not None and raw_completed_steps != checkpoint_path_step:
+                raise RuntimeError(
+                    "Checkpoint completed_steps does not match its canonical path: "
+                    f"{trainer_state_path}"
+                )
+            if requires_selection_state and checkpoint_path_step is None:
+                raise RuntimeError(
+                    "Schema-v1 checkpoint path must have canonical steps_N form: "
+                    f"{checkpoint_path}"
+                )
+            self.completed_steps = raw_completed_steps
+            if requires_selection_state:
+                if trainer_state.get("best_metric_name") != self.best_metric_name:
+                    raise RuntimeError(
+                        f"Checkpoint trainer metric name mismatch: {trainer_state_path}"
+                    )
+                if trainer_state.get("best_metric_mode") != self.best_metric_mode:
+                    raise RuntimeError(
+                        f"Checkpoint trainer metric mode mismatch: {trainer_state_path}"
+                    )
+
+            raw_best_value = trainer_state.get("best_metric_value")
+            raw_best_step = trainer_state.get("best_metric_step")
+            if raw_best_value is None and raw_best_step is None:
+                trainer_state_best_value = None
+                trainer_state_best_step = None
+            else:
+                if not self._is_finite_json_number(raw_best_value):
+                    raise RuntimeError(
+                        f"Checkpoint trainer best metric must be finite: {trainer_state_path}"
+                    )
+                trainer_state_best_value = float(raw_best_value)
+                if raw_best_step is None and not requires_selection_state:
+                    # Legacy save-best-only checkpoints only wrote the value;
+                    # their checkpoint was necessarily the selected best.
+                    trainer_state_best_step = self.completed_steps
+                elif (
+                    isinstance(raw_best_step, bool)
+                    or not isinstance(raw_best_step, int)
+                    or raw_best_step < 0
+                    or raw_best_step > self.completed_steps
+                ):
+                    raise RuntimeError(
+                        f"Checkpoint trainer best step is malformed: {trainer_state_path}"
+                    )
+                else:
+                    trainer_state_best_step = raw_best_step
+            self.best_metric_value = trainer_state_best_value
+            self.best_metric_step = trainer_state_best_step
+        elif checkpoint_path_step is not None:
+            # Explicit legacy fallback for checkpoints predating trainer state.
+            self.completed_steps = checkpoint_path_step
+
+        selection_state_path = Path(checkpoint_path) / "selection_state.json"
+        if selection_state_path.exists():
+            if trainer_state is None or not requires_selection_state:
+                raise RuntimeError(
+                    "selection_state.json requires a schema-v1 trainer state: "
+                    f"{selection_state_path}"
+                )
+            if selection_state_path.is_symlink() or not selection_state_path.is_file():
+                raise RuntimeError(
+                    f"Checkpoint selection state is not a regular file: {selection_state_path}"
+                )
+            try:
+                selection_state = json.loads(
+                    selection_state_path.read_text(encoding="utf-8")
+                )
+            except (OSError, json.JSONDecodeError) as exc:
+                raise RuntimeError(
+                    "Unable to load checkpoint selection state from "
+                    f"`{selection_state_path}`: {exc}"
+                ) from exc
+            (
+                self.best_metric_value,
+                self.best_metric_step,
+            ) = self._validated_checkpoint_selection_state(
+                selection_state,
+                source=selection_state_path,
+                maximum_step=self.completed_steps,
+            )
+        elif requires_selection_state:
+            raise RuntimeError(
+                "Checkpoint trainer state requires the resume-authoritative "
+                f"selection state, but it is missing: {selection_state_path}"
+            )
         else:
-            checkpoint_name = os.path.basename(os.path.normpath(checkpoint_path))
-            if checkpoint_name.startswith("steps_"):
-                try:
-                    self.completed_steps = int(checkpoint_name.split("_", 1)[1])
-                except ValueError:
-                    logger.warning(f"Unable to parse completed_steps from checkpoint path: {checkpoint_path}")
+            # Validate the legacy trainer_state fallback too. A non-finite or
+            # half-populated best state must not be allowed to drive pruning.
+            self._validated_in_memory_best_state(maximum_step=self.completed_steps)
+        eval_only = bool(self.config.trainer.get("eval_only", False))
+        if eval_only:
+            reconciled_eval_artifact = False
+        else:
+            reconciled_eval_artifact = self._reconcile_same_step_heldout_eval_artifact(
+                Path(checkpoint_path),
+                trainer_state_best=(
+                    trainer_state_best_value,
+                    trainer_state_best_step,
+                ),
+                selection_state_required=requires_selection_state,
+            )
         # Accelerate restores the scheduler together with the optimizer during
         # a full-state resume. Stepping it again would preserve ``last_epoch``
         # but increment ``_step_count`` a second time, so the resumed scheduler
@@ -2630,15 +2850,1042 @@ class VLATrainer(TrainerUtils):
                 )
         resume_mode = "full_state" if load_optimizer_state else "model_only"
         self.loaded_checkpoint_path = checkpoint_path
+        if (
+            not eval_only
+            and not reconciled_eval_artifact
+            and self.best_metric_step is not None
+        ):
+            self._run_rank_zero_operation(
+                self._persist_best_checkpoint_pointer,
+                label="resume best-checkpoint pointer persistence",
+            )
+            distributed_wait(self.accelerator)
         self.accelerator.print(f"Resumed from checkpoint ({resume_mode}): {checkpoint_path}")
 
-    def _save_checkpoint(self):
+    def _selection_state_payload(self) -> dict:
+        """Return the small, resume-authoritative best-checkpoint state."""
+
+        self._validated_in_memory_best_state(maximum_step=self.completed_steps)
+        checkpoint_relative_path = (
+            None
+            if self.best_metric_step is None
+            else f"checkpoints/steps_{self.best_metric_step}"
+        )
+        return {
+            "schema_version": 1,
+            "best_metric_name": self.best_metric_name,
+            "best_metric_mode": self.best_metric_mode,
+            "best_metric_value": self.best_metric_value,
+            "best_metric_step": self.best_metric_step,
+            "checkpoint_relative_path": checkpoint_relative_path,
+        }
+
+    def _validated_checkpoint_selection_state(
+        self,
+        payload: Mapping,
+        *,
+        source: Path,
+        maximum_step: int,
+    ) -> tuple[float | None, int | None]:
+        schema_version = (
+            payload.get("schema_version") if isinstance(payload, Mapping) else None
+        )
+        if (
+            not isinstance(payload, Mapping)
+            or type(schema_version) is not int
+            or schema_version != 1
+        ):
+            raise RuntimeError(
+                f"Unsupported or malformed checkpoint selection state: {source}"
+            )
+        if payload.get("best_metric_name") != self.best_metric_name:
+            raise RuntimeError(
+                "Checkpoint selection metric name does not match the current "
+                f"run: {source}"
+            )
+        if payload.get("best_metric_mode") != self.best_metric_mode:
+            raise RuntimeError(
+                "Checkpoint selection metric mode does not match the current "
+                f"run: {source}"
+            )
+        if self.best_metric_mode not in {"min", "max"}:
+            raise RuntimeError(
+                f"Unsupported checkpoint selection metric mode: {self.best_metric_mode}"
+            )
+
+        raw_value = payload.get("best_metric_value")
+        raw_step = payload.get("best_metric_step")
+        raw_relative_path = payload.get("checkpoint_relative_path")
+        if raw_value is None and raw_step is None:
+            if raw_relative_path is not None:
+                raise RuntimeError(
+                    f"Empty checkpoint selection state has a path: {source}"
+                )
+            return None, None
+        if raw_value is None or raw_step is None:
+            raise RuntimeError(
+                f"Checkpoint selection value and step must be set together: {source}"
+            )
+        if (
+            isinstance(raw_value, bool)
+            or not isinstance(raw_value, (int, float))
+            or isinstance(raw_step, bool)
+            or not isinstance(raw_step, int)
+        ):
+            raise RuntimeError(
+                f"Checkpoint selection value/step is malformed: {source}"
+            )
+        try:
+            value = float(raw_value)
+            step = int(raw_step)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"Checkpoint selection value/step is malformed: {source}"
+            ) from exc
+        if not math.isfinite(value):
+            raise RuntimeError(
+                f"Checkpoint selection metric must be finite: {source}"
+            )
+        if step < 0 or step > int(maximum_step):
+            raise RuntimeError(
+                "Checkpoint selection step is outside the resumed checkpoint "
+                f"history: step={step}, maximum={maximum_step}, source={source}"
+            )
+        expected_relative_path = f"checkpoints/steps_{step}"
+        if raw_relative_path != expected_relative_path:
+            raise RuntimeError(
+                "Checkpoint selection path does not match its step: "
+                f"expected={expected_relative_path}, source={source}"
+            )
+        return value, step
+
+    @staticmethod
+    def _is_finite_json_number(value: object) -> bool:
+        return (
+            not isinstance(value, bool)
+            and isinstance(value, (int, float))
+            and math.isfinite(float(value))
+        )
+
+    def _validate_same_step_artifact_run_identity(
+        self,
+        artifact: Mapping,
+        *,
+        output_dir: Path,
+        artifact_path: Path,
+    ) -> None:
+        run_identity = artifact.get("run")
+        if not isinstance(run_identity, Mapping):
+            raise RuntimeError(
+                f"Same-step heldout eval artifact lacks run identity: {artifact_path}"
+            )
+        artifact_seed = run_identity.get("seed")
+        expected_seed = int(self.config.get("seed", 0))
+        if (
+            run_identity.get("run_id") != str(self.config.get("run_id", ""))
+            or run_identity.get("output_dir") != str(output_dir)
+            or isinstance(artifact_seed, bool)
+            or not isinstance(artifact_seed, int)
+            or artifact_seed != expected_seed
+        ):
+            raise RuntimeError(
+                "Same-step heldout eval artifact run identity does not match the "
+                f"resumed run: {artifact_path}"
+            )
+
+        config_path = output_dir / "config.yaml"
+        if config_path.is_symlink():
+            raise RuntimeError(
+                f"Run config is not a regular file: {config_path}"
+            )
+        if config_path.is_file():
+            expected_config_path = "config.yaml"
+            expected_config_sha256 = hashlib.sha256(
+                config_path.read_bytes()
+            ).hexdigest()
+        elif config_path.exists():
+            raise RuntimeError(
+                f"Run config is not a regular file: {config_path}"
+            )
+        else:
+            expected_config_path = None
+            expected_config_sha256 = hashlib.sha256(
+                OmegaConf.to_yaml(self.config, resolve=True).encode("utf-8")
+            ).hexdigest()
+        if (
+            run_identity.get("config_path") != expected_config_path
+            or run_identity.get("config_sha256") != expected_config_sha256
+        ):
+            raise RuntimeError(
+                "Same-step heldout eval artifact config identity does not match "
+                f"the resumed run: {artifact_path}"
+            )
+
+        schedule_path = output_dir / "resolved_training_schedule.json"
+        if schedule_path.is_symlink() or not schedule_path.is_file():
+            raise RuntimeError(
+                "Same-step heldout eval artifact requires a regular resolved "
+                f"schedule: {schedule_path}"
+            )
+        expected_schedule_identity = _validated_resolved_schedule_evidence(
+            schedule_path,
+            config_sha256=expected_config_sha256,
+        )
+        if run_identity.get("resolved_training_schedule") != expected_schedule_identity:
+            raise RuntimeError(
+                "Same-step heldout eval artifact resolved-schedule identity does "
+                f"not match the resumed run: {artifact_path}"
+            )
+        if run_identity.get("source_training_config") is not None:
+            raise RuntimeError(
+                "Live-training same-step artifact must not claim an eval-only "
+                f"source config: {artifact_path}"
+            )
+
+    def _validate_checkpoint_bound_artifact_identity(
+        self,
+        checkpoint_identity: Mapping,
+        *,
+        checkpoint_path: Path,
+        artifact_path: Path,
+        step: int,
+    ) -> None:
+        expected_fields = {
+            "step",
+            "source_path",
+            "source_kind",
+            "trainer_state_sha256",
+            "model_file",
+            "model_file_size_bytes",
+            "model_file_sha256",
+        }
+        if set(checkpoint_identity) != expected_fields:
+            raise RuntimeError(
+                "Checkpoint-bound same-step artifact has incomplete or unexpected "
+                f"identity fields: {artifact_path}"
+            )
+        identity_step = checkpoint_identity.get("step")
+        if (
+            isinstance(identity_step, bool)
+            or not isinstance(identity_step, int)
+            or identity_step != step
+            or checkpoint_identity.get("source_kind") != "checkpoint"
+        ):
+            raise RuntimeError(
+                f"Same-step heldout eval artifact has inconsistent checkpoint identity: {artifact_path}"
+            )
+        expected_source_path = str(checkpoint_path.expanduser().resolve())
+        if checkpoint_identity.get("source_path") != expected_source_path:
+            raise RuntimeError(
+                "Same-step heldout eval artifact source_path does not match the "
+                f"resumed checkpoint: expected={expected_source_path}, artifact={artifact_path}"
+            )
+        trainer_state_path = checkpoint_path / "trainer_state.json"
+        if trainer_state_path.is_symlink() or not trainer_state_path.is_file():
+            raise RuntimeError(
+                "Cannot authenticate same-step heldout eval artifact without a "
+                f"regular trainer_state.json: {trainer_state_path}"
+            )
+        trainer_state_sha256 = hashlib.sha256(
+            trainer_state_path.read_bytes()
+        ).hexdigest()
+        if checkpoint_identity.get("trainer_state_sha256") != trainer_state_sha256:
+            raise RuntimeError(
+                "Same-step heldout eval artifact trainer_state SHA-256 does not "
+                f"match the resumed checkpoint: {artifact_path}"
+            )
+
+        model_file = checkpoint_identity.get("model_file")
+        if model_file not in {"model.safetensors", "pytorch_model.pt"}:
+            raise RuntimeError(
+                f"Same-step heldout eval artifact has an unsupported model file: {artifact_path}"
+            )
+        model_path = checkpoint_path / str(model_file)
+        if model_path.is_symlink() or not model_path.is_file():
+            raise RuntimeError(
+                "Same-step heldout eval artifact model file is missing or not a "
+                f"regular file: {model_path}"
+            )
+        expected_model_size = checkpoint_identity.get("model_file_size_bytes")
+        actual_model_size = model_path.stat().st_size
+        if (
+            isinstance(expected_model_size, bool)
+            or not isinstance(expected_model_size, int)
+            or expected_model_size <= 0
+            or expected_model_size != actual_model_size
+        ):
+            raise RuntimeError(
+                "Same-step heldout eval artifact model file size does not match "
+                f"the resumed checkpoint: {artifact_path}"
+            )
+        expected_model_sha256 = checkpoint_identity.get("model_file_sha256")
+        if (
+            not isinstance(expected_model_sha256, str)
+            or len(expected_model_sha256) != 64
+            or expected_model_sha256 != _sha256_file(model_path)
+        ):
+            raise RuntimeError(
+                "Same-step heldout eval artifact model SHA-256 does not match the "
+                f"resumed checkpoint: {artifact_path}"
+            )
+
+    def _validate_save_best_only_live_artifact_identity(
+        self,
+        checkpoint_identity: Mapping,
+        *,
+        artifact_path: Path,
+        step: int,
+    ) -> None:
+        if self.config.trainer.get("save_best_only", False) is not True:
+            raise RuntimeError(
+                "A non-checkpoint-bound same-step heldout artifact is only valid "
+                f"for save_best_only=true: {artifact_path}"
+            )
+        if set(checkpoint_identity) != {"step", "source_path", "source_kind"}:
+            raise RuntimeError(
+                "save_best_only live-model artifact contains unexpected "
+                f"checkpoint identity fields: {artifact_path}"
+            )
+        identity_step = checkpoint_identity.get("step")
+        if (
+            isinstance(identity_step, bool)
+            or not isinstance(identity_step, int)
+            or identity_step != step
+            or checkpoint_identity.get("source_kind") != "live_in_memory_model"
+            or checkpoint_identity.get("source_path") is not None
+        ):
+            raise RuntimeError(
+                "save_best_only same-step artifact is not exact live-model "
+                f"evidence: {artifact_path}"
+            )
+
+    def _validated_same_step_heldout_eval_artifact(
+        self,
+        checkpoint_path: Path,
+    ) -> dict | None:
+        """Validate a durable eval artifact left before selection finalization.
+
+        The heldout artifact is written before ``selection_state.json`` is
+        advanced. A process kill in that narrow window must not silently lose
+        the completed evaluation on resume. This reader deliberately validates
+        the artifact against immutable checkpoint bytes rather than trusting a
+        filename or a metric copied out of context.
+        """
+
+        step = int(self.completed_steps)
+        output_dir_value = self.config.get("output_dir", None)
+        if not output_dir_value:
+            return None
+        output_dir = Path(str(output_dir_value)).expanduser().resolve()
+        artifact_path = output_dir / "heldout_eval_metrics" / f"step_{step:08d}.json"
+        if artifact_path.is_symlink():
+            raise RuntimeError(
+                f"Same-step heldout eval artifact is not a regular file: {artifact_path}"
+            )
+        if not artifact_path.exists():
+            return None
+        if not artifact_path.is_file():
+            raise RuntimeError(
+                f"Same-step heldout eval artifact is not a regular file: {artifact_path}"
+            )
+        try:
+            artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                f"Unable to read same-step heldout eval artifact {artifact_path}: {exc}"
+            ) from exc
+        if not isinstance(artifact, Mapping):
+            raise RuntimeError(
+                f"Same-step heldout eval artifact is not a JSON object: {artifact_path}"
+            )
+        schema_version = artifact.get("schema_version")
+        if type(schema_version) is not int or schema_version != 1:
+            raise RuntimeError(
+                f"Unsupported same-step heldout eval artifact schema: {artifact_path}"
+            )
+
+        artifact_step = artifact.get("checkpoint_step")
+        if (
+            isinstance(artifact_step, bool)
+            or not isinstance(artifact_step, int)
+            or artifact_step != step
+        ):
+            raise RuntimeError(
+                "Same-step heldout eval artifact checkpoint_step does not match "
+                f"the resumed checkpoint: {artifact_path}"
+            )
+        try:
+            expected_relative_path = checkpoint_path.expanduser().resolve().relative_to(
+                output_dir
+            ).as_posix()
+        except ValueError as exc:
+            raise RuntimeError(
+                "Resumed checkpoint is outside the run output directory, so its "
+                f"same-step heldout artifact cannot be authenticated: {checkpoint_path}"
+            ) from exc
+        if "checkpoint_relative_path" not in artifact:
+            raise RuntimeError(
+                f"Same-step heldout eval artifact lacks checkpoint_relative_path: {artifact_path}"
+            )
+        checkpoint_identity = artifact.get("checkpoint")
+        if not isinstance(checkpoint_identity, Mapping):
+            raise RuntimeError(
+                f"Same-step heldout eval artifact lacks checkpoint identity: {artifact_path}"
+            )
+        artifact_relative_path = artifact.get("checkpoint_relative_path")
+        save_best_only_live_artifact = artifact_relative_path is None
+        if save_best_only_live_artifact:
+            self._validate_save_best_only_live_artifact_identity(
+                checkpoint_identity,
+                artifact_path=artifact_path,
+                step=step,
+            )
+        else:
+            if artifact_relative_path != expected_relative_path:
+                raise RuntimeError(
+                    "Same-step heldout eval artifact checkpoint_relative_path does "
+                    f"not match {expected_relative_path!r}: {artifact_path}"
+                )
+            self._validate_checkpoint_bound_artifact_identity(
+                checkpoint_identity,
+                checkpoint_path=checkpoint_path,
+                artifact_path=artifact_path,
+                step=step,
+            )
+        self._validate_same_step_artifact_run_identity(
+            artifact,
+            output_dir=output_dir,
+            artifact_path=artifact_path,
+        )
+
+        production_valid = artifact.get("production_valid")
+        checkpoint_selection_eligible = artifact.get(
+            "checkpoint_selection_eligible"
+        )
+        if not isinstance(production_valid, bool) or not isinstance(
+            checkpoint_selection_eligible, bool
+        ):
+            raise RuntimeError(
+                f"Same-step heldout eval artifact has malformed validity flags: {artifact_path}"
+            )
+        sampling_reports = artifact.get("sampling_reports")
+        if not isinstance(sampling_reports, Mapping) or not sampling_reports:
+            raise RuntimeError(
+                f"Same-step heldout eval artifact lacks sampling reports: {artifact_path}"
+            )
+        if "unbiased" not in sampling_reports:
+            raise RuntimeError(
+                f"Same-step heldout eval artifact lacks its unbiased report: {artifact_path}"
+            )
+        current_unbiased_report = getattr(
+            self, "heldout_eval_sampling_report", None
+        )
+        if not isinstance(current_unbiased_report, Mapping):
+            raise RuntimeError(
+                "Training resume cannot authenticate heldout evidence without "
+                f"the current unbiased sampling report: {artifact_path}"
+            )
+        expected_sampling_reports = {
+            "unbiased": self._heldout_report_evidence(
+                current_unbiased_report,
+                label="Current unbiased heldout",
+            )
+        }
+        if getattr(self, "vla_focused_eval_dataloader", None) is not None:
+            current_focused_report = getattr(
+                self, "heldout_focused_eval_sampling_report", None
+            )
+            if not isinstance(current_focused_report, Mapping):
+                raise RuntimeError(
+                    "Training resume cannot authenticate heldout evidence without "
+                    f"the current focused sampling report: {artifact_path}"
+                )
+            expected_sampling_reports["focused"] = self._heldout_report_evidence(
+                current_focused_report,
+                label="Current focused heldout",
+            )
+        if dict(sampling_reports) != expected_sampling_reports:
+            raise RuntimeError(
+                "Same-step heldout eval sampling evidence does not exactly match "
+                f"the current holdout manifest/statistics: {artifact_path}"
+            )
+        report_production_flags: list[bool] = []
+        report_eligibility_flags: list[bool] = []
+        for report_name, report in sampling_reports.items():
+            if not isinstance(report_name, str) or not isinstance(report, Mapping):
+                raise RuntimeError(
+                    f"Same-step heldout eval artifact has a malformed sampling report: {artifact_path}"
+                )
+            report_production = report.get("production_valid")
+            report_eligible = report.get("checkpoint_selection_eligible")
+            if not isinstance(report_production, bool) or not isinstance(
+                report_eligible, bool
+            ):
+                raise RuntimeError(
+                    "Same-step heldout eval sampling report has malformed validity "
+                    f"flags ({report_name}): {artifact_path}"
+                )
+            report_production_flags.append(report_production)
+            report_eligibility_flags.append(report_eligible)
+        if production_valid != all(report_production_flags):
+            raise RuntimeError(
+                f"Same-step heldout eval production-valid evidence is inconsistent: {artifact_path}"
+            )
+        if checkpoint_selection_eligible != all(report_eligibility_flags):
+            raise RuntimeError(
+                f"Same-step heldout eval selection-eligibility evidence is inconsistent: {artifact_path}"
+            )
+        if checkpoint_selection_eligible and not production_valid:
+            raise RuntimeError(
+                "Same-step heldout eval artifact cannot be selection-eligible "
+                f"without being production-valid: {artifact_path}"
+            )
+
+        selection_metric = artifact.get("selection_metric")
+        if not isinstance(selection_metric, Mapping):
+            raise RuntimeError(
+                f"Same-step heldout eval artifact lacks selection_metric: {artifact_path}"
+            )
+        if selection_metric.get("name") != self.best_metric_name:
+            raise RuntimeError(
+                "Same-step heldout eval selection metric name does not match the "
+                f"run configuration: {artifact_path}"
+            )
+        if selection_metric.get("mode") != self.best_metric_mode:
+            raise RuntimeError(
+                "Same-step heldout eval selection metric mode does not match the "
+                f"run configuration: {artifact_path}"
+            )
+        if self.best_metric_mode not in {"min", "max"}:
+            raise RuntimeError(
+                f"Unsupported same-step heldout selection metric mode: {self.best_metric_mode}"
+            )
+        if selection_metric.get("eligible") is not checkpoint_selection_eligible:
+            raise RuntimeError(
+                "Same-step heldout eval selection metric eligibility is "
+                f"inconsistent: {artifact_path}"
+            )
+
+        metrics = artifact.get("metrics")
+        if not isinstance(metrics, Mapping):
+            raise RuntimeError(
+                f"Same-step heldout eval artifact lacks metric groups: {artifact_path}"
+            )
+        for required_group in ("unbiased", "focused"):
+            if required_group not in metrics or not isinstance(
+                metrics[required_group], Mapping
+            ):
+                raise RuntimeError(
+                    "Same-step heldout eval artifact lacks a valid "
+                    f"{required_group!r} metric group: {artifact_path}"
+                )
+        for group_name, group in metrics.items():
+            if not isinstance(group_name, str) or not isinstance(group, Mapping):
+                raise RuntimeError(
+                    f"Same-step heldout eval artifact has a malformed metric group: {artifact_path}"
+                )
+            for metric_name, value in group.items():
+                if not isinstance(metric_name, str) or not self._is_finite_json_number(
+                    value
+                ):
+                    raise RuntimeError(
+                        "Same-step heldout eval artifact has a malformed or "
+                        f"non-finite metric ({group_name}): {artifact_path}"
+                    )
+        metric_matches = [
+            group[self.best_metric_name]
+            for group in metrics.values()
+            if isinstance(group, Mapping) and self.best_metric_name in group
+        ]
+        raw_metric_value = selection_metric.get("value")
+        if raw_metric_value is None:
+            if checkpoint_selection_eligible or metric_matches:
+                raise RuntimeError(
+                    "Same-step heldout eval artifact selection metric value is "
+                    f"missing or inconsistent: {artifact_path}"
+                )
+            metric_value = None
+        else:
+            if not self._is_finite_json_number(raw_metric_value):
+                raise RuntimeError(
+                    "Same-step heldout eval selection metric value is not finite: "
+                    f"{artifact_path}"
+                )
+            if len(metric_matches) != 1 or not self._is_finite_json_number(
+                metric_matches[0]
+            ):
+                raise RuntimeError(
+                    "Same-step heldout eval selection metric is not represented "
+                    f"exactly once in its metric groups: {artifact_path}"
+                )
+            metric_value = float(raw_metric_value)
+            if float(metric_matches[0]) != metric_value:
+                raise RuntimeError(
+                    "Same-step heldout eval selection metric disagrees with the "
+                    f"recorded metric group: {artifact_path}"
+                )
+        if checkpoint_selection_eligible and metric_value is None:
+            raise RuntimeError(
+                f"Selection-eligible heldout eval has no finite metric: {artifact_path}"
+            )
+
+        return {
+            "artifact_path": str(artifact_path),
+            "eligible": bool(production_valid and checkpoint_selection_eligible),
+            "metric_value": metric_value,
+            "save_best_only_live_artifact": save_best_only_live_artifact,
+        }
+
+    @staticmethod
+    def _broadcast_object_from_rank_zero(payload: object) -> object:
+        if not dist.is_initialized():
+            return payload
+        container = [payload if dist.get_rank() == 0 else None]
+        broadcast_kwargs = {}
+        if "nccl" in str(dist.get_backend()).lower():
+            broadcast_kwargs["device"] = torch.device(
+                "cuda", torch.cuda.current_device()
+            )
+        dist.broadcast_object_list(container, src=0, **broadcast_kwargs)
+        return container[0]
+
+    def _run_rank_zero_operation(self, operation: Callable[[], object], *, label: str):
+        """Run filesystem mutation/validation once and propagate its status."""
+
+        if not dist.is_initialized():
+            return operation()
+        status = None
+        if dist.get_rank() == 0:
+            try:
+                status = {"ok": True, "result": operation()}
+            except Exception as exc:
+                status = {
+                    "ok": False,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+        status = self._broadcast_object_from_rank_zero(status)
+        if not isinstance(status, Mapping) or status.get("ok") is not True:
+            error = status.get("error") if isinstance(status, Mapping) else status
+            raise RuntimeError(f"Rank-0 {label} failed: {error}")
+        return status.get("result")
+
+    def _reconcile_same_step_heldout_eval_artifact(
+        self,
+        checkpoint_path: Path,
+        *,
+        trainer_state_best: tuple[float | None, int | None],
+        selection_state_required: bool,
+    ) -> bool:
+        """Finish selection/pruning if a kill followed artifact persistence."""
+
+        outcome = self._run_rank_zero_operation(
+            lambda: self._validated_same_step_heldout_eval_artifact(checkpoint_path),
+            label="same-step heldout eval validation",
+        )
+        if outcome is None:
+            if selection_state_required and (
+                self.best_metric_value,
+                self.best_metric_step,
+            ) != trainer_state_best:
+                raise RuntimeError(
+                    "Checkpoint selection state disagrees with trainer_state.json "
+                    "without an authenticated same-step heldout artifact."
+                )
+            return False
+        if not isinstance(outcome, Mapping):
+            raise RuntimeError("Malformed distributed heldout reconciliation result.")
+        if not selection_state_required:
+            raise RuntimeError(
+                "Authenticated same-step heldout reconciliation requires a "
+                "schema-v1 checkpoint selection state."
+            )
+
+        metric_value = outcome.get("metric_value")
+        current_state = (self.best_metric_value, self.best_metric_step)
+        if outcome.get("save_best_only_live_artifact") is True:
+            if current_state != trainer_state_best:
+                raise RuntimeError(
+                    "save_best_only checkpoint selection state disagrees with its "
+                    "post-evaluation trainer state."
+                )
+            if outcome.get("eligible") is True:
+                if not self._is_finite_json_number(metric_value):
+                    raise RuntimeError(
+                        "Eligible save_best_only artifact lacks a finite metric."
+                    )
+                metric_value = float(metric_value)
+                if self.best_metric_step == int(self.completed_steps):
+                    if float(self.best_metric_value) != metric_value:
+                        raise RuntimeError(
+                            "save_best_only selected checkpoint disagrees with its "
+                            "live-model heldout metric."
+                        )
+                elif self.best_metric_value is None or (
+                    metric_value < self.best_metric_value
+                    if self.best_metric_mode == "min"
+                    else metric_value > self.best_metric_value
+                ):
+                    raise RuntimeError(
+                        "save_best_only live-model metric should have selected the "
+                        "saved checkpoint but its authoritative state did not."
+                    )
+            elif self.best_metric_step == int(self.completed_steps):
+                raise RuntimeError(
+                    "Ineligible save_best_only artifact cannot authenticate the "
+                    "current checkpoint as selected best."
+                )
+            # This artifact intentionally predates the save. The checkpoint's
+            # trainer/selection state was written after evaluation and is
+            # authoritative; never reinterpret it as the unconditional-save
+            # crash window.
+            return False
+
+        expected_post_state = trainer_state_best
+        if outcome.get("eligible") is True:
+            if not self._is_finite_json_number(metric_value):
+                raise RuntimeError(
+                    "Selection-eligible same-step heldout reconciliation lacks a "
+                    "finite metric."
+                )
+            metric_value = float(metric_value)
+            pre_value, _ = trainer_state_best
+            is_better = pre_value is None or (
+                metric_value < pre_value
+                if self.best_metric_mode == "min"
+                else metric_value > pre_value
+            )
+            if is_better:
+                expected_post_state = (metric_value, int(self.completed_steps))
+        if current_state not in {trainer_state_best, expected_post_state}:
+            raise RuntimeError(
+                "Checkpoint selection state is neither the authenticated pre-eval "
+                "state nor the exact heldout-derived post-eval state."
+            )
+        self.best_metric_value, self.best_metric_step = expected_post_state
+
+        def persist_reconciled_state():
+            self._persist_checkpoint_selection_state(checkpoint_path)
+            if self.best_metric_step is not None:
+                self._persist_best_checkpoint_pointer()
+            self._prune_old_checkpoints()
+            return True
+
+        self._run_rank_zero_operation(
+            persist_reconciled_state,
+            label="same-step heldout eval reconciliation",
+        )
+        distributed_wait(self.accelerator)
+        return True
+
+    def _validated_in_memory_best_state(self, *, maximum_step: int) -> None:
+        value = getattr(self, "best_metric_value", None)
+        step = getattr(self, "best_metric_step", None)
+        if value is None and step is None:
+            return
+        if value is None or step is None:
+            raise RuntimeError(
+                "Best checkpoint metric value and step must be set together."
+            )
+        if not math.isfinite(float(value)):
+            raise RuntimeError("Best checkpoint metric must be finite.")
+        if int(step) < 0 or int(step) > int(maximum_step):
+            raise RuntimeError(
+                "Best checkpoint step is outside the completed training history: "
+                f"step={step}, completed={maximum_step}."
+            )
+
+    def _checkpoint_world_size(self) -> int:
+        runtime_world_size = getattr(self.accelerator, "num_processes", None)
+        recorded_world_size = self.config.trainer.get(
+            "_accelerate_num_processes", None
+        )
+        for label, value in (
+            ("runtime", runtime_world_size),
+            ("recorded", recorded_world_size),
+        ):
+            if value is not None and (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value <= 0
+            ):
+                raise RuntimeError(
+                    f"Checkpoint {label} world size is malformed: {value!r}"
+                )
+        if (
+            runtime_world_size is not None
+            and recorded_world_size is not None
+            and runtime_world_size != recorded_world_size
+        ):
+            raise RuntimeError(
+                "Checkpoint runtime and recorded world sizes disagree: "
+                f"runtime={runtime_world_size}, recorded={recorded_world_size}"
+            )
+        world_size = runtime_world_size or recorded_world_size
+        if world_size is None:
+            raise RuntimeError(
+                "Cannot validate full-state checkpoint RNG files without world size."
+            )
+        return int(world_size)
+
+    @staticmethod
+    def _require_nonempty_regular_checkpoint_file(path: Path) -> None:
+        try:
+            file_stat = path.lstat()
+        except FileNotFoundError as exc:
+            raise RuntimeError(f"Required checkpoint file is missing: {path}") from exc
+        if not stat.S_ISREG(file_stat.st_mode) or file_stat.st_size <= 0:
+            raise RuntimeError(
+                f"Required checkpoint file is not regular and non-empty: {path}"
+            )
+
+    def _validate_full_state_checkpoint_files(self, checkpoint_path: Path) -> None:
+        model_candidates = [
+            checkpoint_path / name
+            for name in ("model.safetensors", "pytorch_model.pt")
+            if (checkpoint_path / name).exists()
+        ]
+        if not model_candidates:
+            raise RuntimeError(
+                f"Checkpoint has no supported model state: {checkpoint_path}"
+            )
+        for model_path in model_candidates:
+            self._require_nonempty_regular_checkpoint_file(model_path)
+        for filename in ("optimizer.bin", "scheduler.bin", "trainer_state.json"):
+            self._require_nonempty_regular_checkpoint_file(
+                checkpoint_path / filename
+            )
+
+        world_size = self._checkpoint_world_size()
+        expected_rng_files = {
+            f"random_states_{rank}.pkl" for rank in range(world_size)
+        }
+        actual_rng_files = {
+            path.name for path in checkpoint_path.glob("random_states_*.pkl")
+        }
+        if actual_rng_files != expected_rng_files:
+            raise RuntimeError(
+                "Checkpoint RNG state files do not exactly match world size "
+                f"{world_size}: expected={sorted(expected_rng_files)}, "
+                f"actual={sorted(actual_rng_files)}"
+            )
+        for filename in sorted(expected_rng_files):
+            self._require_nonempty_regular_checkpoint_file(
+                checkpoint_path / filename
+            )
+
+    def _checkpoint_selection_dependency(
+        self,
+        checkpoint_step: int,
+        checkpoint_path: Path,
+    ) -> int | None:
+        """Return the historical-best checkpoint needed to resume this one.
+
+        This validates the resume-authoritative selection metadata. Accelerator
+        state completeness is validated by the production launcher; pruning is
+        responsible for ensuring that the metadata dependency graph itself is
+        complete and remains on disk.
+        """
+
+        if checkpoint_path.is_symlink() or not checkpoint_path.is_dir():
+            raise RuntimeError(
+                f"Checkpoint is not a regular directory: {checkpoint_path}"
+            )
+        self._validate_full_state_checkpoint_files(checkpoint_path)
+        trainer_state_path = checkpoint_path / "trainer_state.json"
+        if trainer_state_path.is_symlink() or not trainer_state_path.is_file():
+            raise RuntimeError(
+                f"Checkpoint lacks a regular trainer_state.json: {checkpoint_path}"
+            )
+        try:
+            trainer_state = json.loads(
+                trainer_state_path.read_text(encoding="utf-8")
+            )
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                f"Checkpoint trainer state is unreadable: {trainer_state_path}"
+            ) from exc
+        if not isinstance(trainer_state, Mapping):
+            raise RuntimeError(
+                f"Checkpoint trainer state is not a JSON object: {trainer_state_path}"
+            )
+        completed_steps = trainer_state.get("completed_steps")
+        if (
+            isinstance(completed_steps, bool)
+            or not isinstance(completed_steps, int)
+            or completed_steps != checkpoint_step
+        ):
+            raise RuntimeError(
+                "Checkpoint trainer completed_steps does not match its path: "
+                f"{trainer_state_path}"
+            )
+        selection_schema = trainer_state.get("selection_state_schema_version")
+        if selection_schema is not None and (
+            type(selection_schema) is not int or selection_schema != 1
+        ):
+            raise RuntimeError(
+                "Unsupported checkpoint selection-state schema version in "
+                f"{trainer_state_path}"
+            )
+        for field, expected in (
+            ("best_metric_name", self.best_metric_name),
+            ("best_metric_mode", self.best_metric_mode),
+        ):
+            if selection_schema == 1 and trainer_state.get(field) != expected:
+                raise RuntimeError(
+                    f"Checkpoint trainer state has inconsistent {field}: {trainer_state_path}"
+                )
+            if field in trainer_state and trainer_state[field] != expected:
+                raise RuntimeError(
+                    f"Legacy checkpoint trainer state has inconsistent {field}: {trainer_state_path}"
+                )
+
+        selection_state_path = checkpoint_path / "selection_state.json"
+        if selection_state_path.exists():
+            if selection_schema != 1:
+                raise RuntimeError(
+                    "Legacy checkpoint unexpectedly contains selection_state.json "
+                    f"without a schema marker: {checkpoint_path}"
+                )
+            if selection_state_path.is_symlink() or not selection_state_path.is_file():
+                raise RuntimeError(
+                    f"Checkpoint selection state is not a regular file: {selection_state_path}"
+                )
+            try:
+                selection_state = json.loads(
+                    selection_state_path.read_text(encoding="utf-8")
+                )
+            except (OSError, json.JSONDecodeError) as exc:
+                raise RuntimeError(
+                    f"Checkpoint selection state is unreadable: {selection_state_path}"
+                ) from exc
+            _, dependency_step = self._validated_checkpoint_selection_state(
+                selection_state,
+                source=selection_state_path,
+                maximum_step=checkpoint_step,
+            )
+            return dependency_step
+        if selection_schema == 1:
+            raise RuntimeError(
+                "Checkpoint trainer state requires selection_state.json: "
+                f"{checkpoint_path}"
+            )
+
+        # Pre-schema checkpoints used trainer_state.json directly. Preserve
+        # their dependency when it is unambiguous; reject half-populated or
+        # non-finite state instead of assuming it is safe to delete history.
+        raw_value = trainer_state.get("best_metric_value")
+        raw_step = trainer_state.get("best_metric_step")
+        if raw_value is None and raw_step is None:
+            return None
+        if raw_value is None:
+            raise RuntimeError(
+                f"Legacy checkpoint has best step without a metric value: {trainer_state_path}"
+            )
+        if not self._is_finite_json_number(raw_value):
+            raise RuntimeError(
+                f"Legacy checkpoint best metric is not finite: {trainer_state_path}"
+            )
+        if raw_step is None:
+            # Historical save-best-only checkpoints did not record the step;
+            # the checkpoint itself was necessarily the newly selected best.
+            return checkpoint_step
+        if isinstance(raw_step, bool) or not isinstance(raw_step, int):
+            raise RuntimeError(
+                f"Legacy checkpoint best step is malformed: {trainer_state_path}"
+            )
+        if raw_step < 0 or raw_step > checkpoint_step:
+            raise RuntimeError(
+                f"Legacy checkpoint best step is outside its history: {trainer_state_path}"
+            )
+        return raw_step
+
+    def _checkpoint_selection_inventory(
+        self,
+    ) -> tuple[list[tuple[int, Path]], dict[int, int | None]]:
+        checkpoints: list[tuple[int, Path]] = []
+        for name in os.listdir(self.checkpoint_dir):
+            if not name.startswith("steps_"):
+                continue
+            try:
+                step = int(name.split("_", 1)[1])
+            except ValueError:
+                continue
+            path = Path(self.checkpoint_dir) / name
+            if step < 0:
+                raise RuntimeError(f"Checkpoint step cannot be negative: {path}")
+            if name != f"steps_{step}":
+                raise RuntimeError(
+                    f"Checkpoint directory name is not canonical: {path}"
+                )
+            checkpoints.append((step, path))
+        checkpoints.sort(key=lambda item: item[0])
+        dependencies: dict[int, int | None] = {}
+        for step, path in checkpoints:
+            try:
+                dependencies[step] = self._checkpoint_selection_dependency(
+                    step, path
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    "Refusing checkpoint retention/pruning because checkpoint "
+                    f"steps_{step} is incomplete or inconsistent: {exc}"
+                ) from exc
+        return checkpoints, dependencies
+
+    @staticmethod
+    def _checkpoint_dependency_closure(
+        seed_steps: set[int],
+        dependencies: Mapping[int, int | None],
+    ) -> set[int]:
+        closure: set[int] = set()
+        pending = list(seed_steps)
+        while pending:
+            step = int(pending.pop())
+            if step in closure:
+                continue
+            if step not in dependencies:
+                raise RuntimeError(
+                    "Checkpoint selection dependency is missing: "
+                    f"steps_{step}"
+                )
+            closure.add(step)
+            dependency = dependencies[step]
+            if dependency is not None and dependency != step:
+                pending.append(int(dependency))
+        return closure
+
+    @staticmethod
+    def _serialized_json_payload(payload: Mapping) -> bytes:
+        return (
+            json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n"
+        ).encode("utf-8")
+
+    def _persist_checkpoint_selection_state(self, checkpoint_path: Path) -> None:
+        _atomic_write_bytes(
+            checkpoint_path / "selection_state.json",
+            self._serialized_json_payload(self._selection_state_payload()),
+        )
+
+    def _persist_best_checkpoint_pointer(self) -> None:
+        if self.best_metric_step is None:
+            return
+        _, dependencies = self._checkpoint_selection_inventory()
+        self._checkpoint_dependency_closure(
+            {int(self.best_metric_step)}, dependencies
+        )
+        _atomic_write_bytes(
+            Path(self.config.output_dir) / "best_checkpoint.json",
+            self._serialized_json_payload(self._selection_state_payload()),
+        )
+
+    def _save_checkpoint(self, *, prune: bool = True):
         """save current training state"""
         checkpoint_path = os.path.join(self.checkpoint_dir, f"steps_{self.completed_steps}")
         os.makedirs(checkpoint_path, exist_ok=True)
         self.accelerator.save_state(checkpoint_path)
         distributed_wait(self.accelerator)
-        if self.accelerator.is_main_process:
+
+        def persist_checkpoint_metadata():
             if bool(self.config.trainer.get("save_plain_weights_in_checkpoints", False)):
                 # Optional convenience artifact. Disabled by default because gathering and
                 # serializing a second full copy of the model can create a large rank-0
@@ -2648,12 +3895,18 @@ class VLATrainer(TrainerUtils):
 
             trainer_state = {
                 "completed_steps": self.completed_steps,
+                "selection_state_schema_version": 1,
                 "best_metric_name": self.best_metric_name,
                 "best_metric_mode": self.best_metric_mode,
                 "best_metric_value": self.best_metric_value,
+                "best_metric_step": self.best_metric_step,
             }
             with open(os.path.join(checkpoint_path, "trainer_state.json"), "w") as f:
                 json.dump(trainer_state, f, indent=2)
+
+            self._persist_checkpoint_selection_state(Path(checkpoint_path))
+            if self.best_metric_step is not None:
+                self._persist_best_checkpoint_pointer()
 
             # save training metadata
             summary_data = {
@@ -2668,59 +3921,178 @@ class VLATrainer(TrainerUtils):
                 _drop_file_cache_best_effort(checkpoint_path)
 
             self.accelerator.print(f"✅ Checkpoint saved at {checkpoint_path}")
-            self._prune_old_checkpoints()
+            if prune:
+                self._prune_old_checkpoints()
+            return True
 
+        self._run_rank_zero_operation(
+            persist_checkpoint_metadata,
+            label="checkpoint metadata persistence and retention",
+        )
         if bool(self.config.trainer.get("trim_process_memory_after_checkpoint", True)):
             _trim_process_memory_best_effort()
         distributed_wait(self.accelerator)
 
     def _prune_old_checkpoints(self):
         max_to_keep = int(self.config.trainer.get("checkpoint_max_to_keep", 0) or 0)
+        checkpoints, dependencies = self._checkpoint_selection_inventory()
+        if not checkpoints:
+            return
+        checkpoint_steps = {step for step, _ in checkpoints}
+        newest_step = checkpoints[-1][0]
+        mandatory_steps = {newest_step}
+        if self.best_metric_step is not None:
+            best_step = int(self.best_metric_step)
+            if best_step not in checkpoint_steps:
+                raise RuntimeError(
+                    "Refusing to prune because the selected best checkpoint is "
+                    f"already missing: steps_{best_step}"
+                )
+            mandatory_steps.add(best_step)
+        mandatory_closure = self._checkpoint_dependency_closure(
+            mandatory_steps, dependencies
+        )
+
         if max_to_keep <= 0:
+            # Unlimited retention still validates that every on-disk resume
+            # point has a complete historical-best dependency chain.
+            self._checkpoint_dependency_closure(checkpoint_steps, dependencies)
+            return
+        if len(mandatory_closure) > max_to_keep:
+            raise RuntimeError(
+                f"checkpoint_max_to_keep={max_to_keep} cannot preserve the "
+                "selected best, newest checkpoint, and their resume dependencies "
+                f"{sorted(mandatory_closure)}. Increase checkpoint_max_to_keep."
+            )
+        if len(checkpoints) <= max_to_keep:
+            self._checkpoint_dependency_closure(checkpoint_steps, dependencies)
             return
 
-        checkpoints = []
-        for name in os.listdir(self.checkpoint_dir):
-            if not name.startswith("steps_"):
+        keep_steps = set(mandatory_closure)
+        # Prefer the newest older resume points, but add one only when its full
+        # historical-best dependency closure fits under the cap. This prevents
+        # retaining a nominal checkpoint that immediately fails on resume.
+        for step, _ in reversed(checkpoints):
+            if step in keep_steps:
                 continue
-            try:
-                step = int(name.split("_", 1)[1])
-            except ValueError:
-                continue
-            checkpoints.append((step, os.path.join(self.checkpoint_dir, name)))
+            candidate_closure = self._checkpoint_dependency_closure(
+                {step}, dependencies
+            )
+            if len(keep_steps | candidate_closure) <= max_to_keep:
+                keep_steps.update(candidate_closure)
 
-        checkpoints.sort(key=lambda item: item[0])
-        for step, path in checkpoints[:-max_to_keep]:
-            if step == self.completed_steps:
+        if len(keep_steps) > max_to_keep:
+            raise RuntimeError(
+                "Internal checkpoint retention error: dependency closure exceeds "
+                f"the configured cap ({sorted(keep_steps)} > {max_to_keep})."
+            )
+        for step in keep_steps:
+            dependency = dependencies[step]
+            if dependency is not None and dependency not in keep_steps:
+                raise RuntimeError(
+                    "Internal checkpoint retention error: retained checkpoint "
+                    f"steps_{step} depends on pruned steps_{dependency}."
+                )
+
+        deletion_failures = []
+        for step, path in checkpoints:
+            if step in keep_steps:
                 continue
             try:
-                shutil.rmtree(path)
+                shutil.rmtree(str(path))
                 logger.info(f"Pruned old checkpoint at {path}")
             except FileNotFoundError:
                 pass
             except Exception as exc:
-                logger.warning(f"Unable to prune old checkpoint `{path}`: {exc}")
+                deletion_failures.append(f"{path}: {type(exc).__name__}: {exc}")
 
-    def _should_save_checkpoint(self, step_metrics: dict) -> bool:
+        remaining_checkpoints, remaining_dependencies = (
+            self._checkpoint_selection_inventory()
+        )
+        remaining_steps = {step for step, _ in remaining_checkpoints}
+        retention_errors = []
+        if remaining_steps != keep_steps:
+            retention_errors.append(
+                "remaining checkpoint set does not equal the planned dependency-"
+                f"closed set: expected={sorted(keep_steps)}, "
+                f"actual={sorted(remaining_steps)}"
+            )
+        if len(remaining_steps) > max_to_keep:
+            retention_errors.append(
+                f"remaining checkpoint count {len(remaining_steps)} exceeds cap {max_to_keep}"
+            )
+        if remaining_steps:
+            remaining_closure = self._checkpoint_dependency_closure(
+                remaining_steps, remaining_dependencies
+            )
+            if remaining_closure != remaining_steps:
+                retention_errors.append(
+                    "remaining checkpoint dependency closure is incomplete"
+                )
+        if deletion_failures or retention_errors:
+            details = "; ".join(deletion_failures + retention_errors)
+            raise RuntimeError(
+                f"Checkpoint pruning failed to establish retention invariants: {details}"
+            )
+
+    def _heldout_checkpoint_selection_is_eligible(self) -> bool:
+        if getattr(self, "legacy_underfilled_eval", False):
+            return False
+        unbiased_report = getattr(self, "heldout_eval_sampling_report", None)
+        reports = [unbiased_report]
+        if getattr(self, "vla_focused_eval_dataloader", None) is not None:
+            reports.append(
+                getattr(self, "heldout_focused_eval_sampling_report", None)
+            )
+        return bool(reports) and all(
+            isinstance(report, Mapping)
+            and report.get("production_valid") is True
+            and report.get("checkpoint_selection_eligible") is True
+            for report in reports
+        )
+
+    def _consider_best_checkpoint_metric(
+        self,
+        step_metrics: Mapping,
+        *,
+        require_heldout_eligibility: bool,
+    ) -> bool:
         if getattr(self, "legacy_underfilled_eval", False):
             raise RuntimeError(
                 "Legacy underfilled audit metrics are forbidden from checkpoint "
                 "selection."
             )
-        if not bool(self.config.trainer.get("save_best_only", False)):
-            return True
+        if require_heldout_eligibility and not (
+            self._heldout_checkpoint_selection_is_eligible()
+        ):
+            if (
+                self.accelerator.is_main_process
+                and not getattr(self, "_warned_ineligible_best_metric", False)
+            ):
+                logger.warning(
+                    "Heldout evaluation is not explicitly production-valid and "
+                    "checkpoint-selection-eligible; refusing to select a best "
+                    f"checkpoint at step {self.completed_steps}."
+                )
+                self._warned_ineligible_best_metric = True
+            return False
 
         metric_value = self._to_scalar(step_metrics.get(self.best_metric_name))
-        if metric_value is None:
-            if self.accelerator.is_main_process and not self._warned_missing_best_metric:
+        if metric_value is None or not math.isfinite(metric_value):
+            if (
+                self.accelerator.is_main_process
+                and not getattr(self, "_warned_missing_best_metric", False)
+            ):
                 logger.warning(
-                    f"save_best_only=true but metric `{self.best_metric_name}` is unavailable at step {self.completed_steps}; skipping interval checkpoint"
+                    f"Metric `{self.best_metric_name}` is missing or non-finite "
+                    f"at step {self.completed_steps}; refusing checkpoint selection."
                 )
                 self._warned_missing_best_metric = True
             return False
 
         if self.best_metric_mode not in {"min", "max"}:
             raise ValueError(f"Unsupported best_metric_mode: {self.best_metric_mode}")
+        self._validated_in_memory_best_state(maximum_step=self.completed_steps)
 
         is_better = (
             self.best_metric_value is None
@@ -2728,7 +4100,59 @@ class VLATrainer(TrainerUtils):
         )
         if is_better:
             self.best_metric_value = metric_value
+            self.best_metric_step = int(self.completed_steps)
         return is_better
+
+    def _should_save_checkpoint(self, step_metrics: dict) -> bool:
+        if not bool(self.config.trainer.get("save_best_only", False)):
+            return True
+        return self._consider_best_checkpoint_metric(
+            step_metrics,
+            require_heldout_eligibility=(
+                getattr(self, "vla_eval_dataloader", None) is not None
+            ),
+        )
+
+    def _finalize_deferred_checkpoint(
+        self,
+        step_metrics: Mapping,
+        *,
+        track_heldout_best: bool,
+    ) -> bool:
+        """Select, persist, then prune a pre-eval recovery checkpoint."""
+
+        selected = False
+        if track_heldout_best:
+            selected = self._consider_best_checkpoint_metric(
+                step_metrics,
+                require_heldout_eligibility=True,
+            )
+
+        def persist_deferred_selection():
+            checkpoint_path = (
+                Path(self.checkpoint_dir) / f"steps_{self.completed_steps}"
+            )
+            if not checkpoint_path.is_dir():
+                raise RuntimeError(
+                    "Deferred checkpoint selection cannot find the recovery "
+                    f"checkpoint: {checkpoint_path}"
+                )
+            # selection_state.json is intentionally separate from
+            # trainer_state.json. The heldout artifact hashes trainer_state at
+            # evaluation time; updating the separate selection file keeps that
+            # immutable evidence valid while making resume state current.
+            self._persist_checkpoint_selection_state(checkpoint_path)
+            if self.best_metric_step is not None:
+                self._persist_best_checkpoint_pointer()
+            self._prune_old_checkpoints()
+            return True
+
+        self._run_rank_zero_operation(
+            persist_deferred_selection,
+            label="deferred checkpoint selection finalization",
+        )
+        distributed_wait(self.accelerator)
+        return selected
 
     def _log_metrics(self, metrics):
         if self.completed_steps > 0 and self.completed_steps % self.config.trainer.logging_frequency == 0:
@@ -3020,6 +4444,13 @@ class VLATrainer(TrainerUtils):
                 and self.completed_steps % self.config.trainer.save_interval == 0
             )
             checkpoint_saved_this_step = False
+            deferred_checkpoint_pruning = False
+            force_checkpoint_requested = bool(
+                optimizer_step_completed
+                and self.completed_steps > 0
+                and self._force_checkpoint_requested()
+            )
+            effective_save_boundary = save_due or force_checkpoint_requested
 
             # A heldout evaluator is intentionally fail-closed.  At a
             # coincident unconditional save/eval boundary, make the completed
@@ -3029,11 +4460,15 @@ class VLATrainer(TrainerUtils):
             # whether a checkpoint should exist.
             if (
                 eval_due
-                and save_due
+                and effective_save_boundary
                 and not bool(self.config.trainer.get("save_best_only", False))
             ):
-                self._save_checkpoint()
+                # Selection is only known after heldout evaluation. Defer
+                # rotation so an older selected best is not deleted before the
+                # current checkpoint has had a chance to replace it.
+                self._save_checkpoint(prune=False)
                 checkpoint_saved_this_step = True
+                deferred_checkpoint_pruning = True
 
             # The legacy "eval" path consumes the next shuffled training batch.
             # Keep it available only as an explicitly named diagnostic; it is
@@ -3060,17 +4495,27 @@ class VLATrainer(TrainerUtils):
                     )
                     self._warned_training_stream_eval_disabled = True
 
+            if deferred_checkpoint_pruning:
+                self._finalize_deferred_checkpoint(
+                    step_metrics,
+                    track_heldout_best=(self.vla_eval_dataloader is not None),
+                )
+
             # record metrics
             step_metrics["data_time"] = t_end_data - t_start_data
             step_metrics["model_time"] = t_end_model - t_start_model
 
             # save checkpoint
             if optimizer_step_completed and self.completed_steps > 0:
-                force_checkpoint_requested = self._force_checkpoint_requested()
-                if save_due:
+                if effective_save_boundary:
                     if not checkpoint_saved_this_step:
-                        should_save_checkpoint = self._should_save_checkpoint(
-                            step_metrics
+                        should_consider_metric = save_due or (
+                            force_checkpoint_requested and eval_due
+                        )
+                        should_save_checkpoint = (
+                            self._should_save_checkpoint(step_metrics)
+                            if should_consider_metric
+                            else False
                         )
                         if should_save_checkpoint or force_checkpoint_requested:
                             if (
@@ -3090,15 +4535,7 @@ class VLATrainer(TrainerUtils):
                             "Force checkpoint request was satisfied by the "
                             f"already-saved step {self.completed_steps} checkpoint"
                         )
-                    if force_checkpoint_requested:
-                        self._clear_force_checkpoint_request()
-                elif force_checkpoint_requested:
-                    if self.accelerator.is_main_process:
-                        logger.info(
-                            f"Force checkpoint requested via `{self.force_checkpoint_path}` at step {self.completed_steps}"
-                        )
-                    self._save_checkpoint()
-                    checkpoint_saved_this_step = True
+                if force_checkpoint_requested:
                     self._clear_force_checkpoint_request()
 
             step_metrics["wall_step_time"] = time.perf_counter() - t_start_step
@@ -4252,40 +5689,28 @@ class VLATrainer(TrainerUtils):
     @staticmethod
     def _heldout_report_evidence(report: Mapping, *, label: str) -> dict:
         digest = report.get("window_selection_sha256")
-        if not isinstance(digest, str) or len(digest) != 64:
+        if (
+            not isinstance(digest, str)
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
             raise RuntimeError(
                 f"{label} sampling report lacks a valid window-selection digest."
             )
-        evidence_keys = (
-            "schema_version",
-            "purpose",
-            "view",
-            "algorithm",
-            "seed_sha256",
-            "window_selection_sha256",
-            "observation_count",
-            "action_evaluable_observation_count",
-            "valid_action_timestep_count",
-            "valid_action_element_count",
-            "subtask_observation_counts",
-            "subtask_evaluable_observation_counts",
-            "open_to_close_transition_count_h10",
-            "close_to_open_transition_count_h10",
-            "open_to_close_transition_window_count_h10",
-            "close_to_open_transition_window_count_h10",
-            "arm_movement_element_count_h10",
-            "arm_movement_hold_abs_sum_h10",
-            "movement_threshold_normalized",
-            "focused_subtasks",
-            "subtask_action_timestep_counts_by_horizon",
-            "subtask_valid_action_element_counts_by_horizon",
-            "zero_valid_action_episodes",
-            "production_valid",
-            "checkpoint_selection_eligible",
-            "legacy_underfilled_holdout",
-            "episode_split_provenance",
-        )
-        evidence = {key: report[key] for key in evidence_keys if key in report}
+        try:
+            # Round-trip through strict JSON so tuples and other JSON-compatible
+            # containers compare identically after the artifact is reloaded.
+            # Persisting the complete report binds observation offsets, action
+            # dimensions, and every selected window, not only aggregate counts.
+            evidence = json.loads(
+                json.dumps(report, sort_keys=True, allow_nan=False)
+            )
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"{label} sampling report is not strict JSON evidence."
+            ) from exc
+        if not isinstance(evidence, dict):
+            raise RuntimeError(f"{label} sampling report is not a JSON object.")
         if "episode_split_provenance" not in evidence:
             raise RuntimeError(
                 f"{label} sampling report lacks split/statistics provenance."
@@ -4319,11 +5744,9 @@ class VLATrainer(TrainerUtils):
             )
         return {"path": str(path), "sha256": actual_sha256}
 
-    def _persist_heldout_eval_artifact(self, metrics: Mapping) -> Path | None:
-        """Atomically persist machine-readable evidence independent of trackers."""
+    def _persist_heldout_eval_artifact_main(self, metrics: Mapping) -> Path | None:
+        """Rank-zero implementation for durable heldout evidence."""
 
-        if not getattr(self.accelerator, "is_main_process", True):
-            return None
         output_dir_value = self.config.get("output_dir", None)
         if not output_dir_value:
             # Object-level evaluator tests and ad-hoc probes may have no run dir.
@@ -4334,6 +5757,12 @@ class VLATrainer(TrainerUtils):
         output_dir = Path(str(output_dir_value)).expanduser().resolve()
         eval_only = bool(self.config.trainer.get("eval_only", False))
         config_path = output_dir / "config.yaml"
+        if config_path.is_symlink() or (
+            config_path.exists() and not config_path.is_file()
+        ):
+            raise RuntimeError(
+                f"Heldout eval run config is not a regular file: {config_path}"
+            )
         if config_path.is_file():
             config_sha256 = hashlib.sha256(config_path.read_bytes()).hexdigest()
             config_identity_path = "config.yaml"
@@ -4345,6 +5774,14 @@ class VLATrainer(TrainerUtils):
             config_identity_path = None
         resolved_schedule_path = output_dir / "resolved_training_schedule.json"
         resolved_schedule_evidence = None
+        if resolved_schedule_path.is_symlink() or (
+            resolved_schedule_path.exists()
+            and not resolved_schedule_path.is_file()
+        ):
+            raise RuntimeError(
+                "Heldout eval resolved schedule is not a regular file: "
+                f"{resolved_schedule_path}"
+            )
         if resolved_schedule_path.is_file():
             resolved_schedule_evidence = _validated_resolved_schedule_evidence(
                 resolved_schedule_path,
@@ -4462,6 +5899,13 @@ class VLATrainer(TrainerUtils):
         if source_checkpoint:
             checkpoint_root = Path(source_checkpoint)
             trainer_state_path = checkpoint_root / "trainer_state.json"
+            if trainer_state_path.is_symlink() or (
+                trainer_state_path.exists() and not trainer_state_path.is_file()
+            ):
+                raise RuntimeError(
+                    "Heldout eval source trainer state is not a regular file: "
+                    f"{trainer_state_path}"
+                )
             if trainer_state_path.is_file():
                 checkpoint_identity["trainer_state_sha256"] = hashlib.sha256(
                     trainer_state_path.read_bytes()
@@ -4469,12 +5913,28 @@ class VLATrainer(TrainerUtils):
             for candidate in ("model.safetensors", "pytorch_model.pt"):
                 model_path = checkpoint_root / candidate
                 if model_path.is_file():
+                    if model_path.is_symlink():
+                        raise RuntimeError(
+                            f"Heldout eval source model must not be a symlink: {model_path}"
+                        )
                     model_stat = model_path.stat()
+                    if model_stat.st_size <= 0:
+                        raise RuntimeError(
+                            f"Heldout eval source model is empty: {model_path}"
+                        )
                     checkpoint_identity["model_file"] = candidate
                     checkpoint_identity["model_file_size_bytes"] = int(
                         model_stat.st_size
                     )
+                    checkpoint_identity["model_file_sha256"] = _sha256_file(
+                        model_path
+                    )
                     break
+            if "model_file" not in checkpoint_identity:
+                raise RuntimeError(
+                    "Heldout eval source checkpoint has no supported model file: "
+                    f"{checkpoint_root}"
+                )
         selection_metric_name = str(
             getattr(
                 self,
@@ -4530,11 +5990,25 @@ class VLATrainer(TrainerUtils):
             },
         }
         artifact_dir = output_dir / "heldout_eval_metrics"
+        if artifact_dir.is_symlink() or (
+            artifact_dir.exists() and not artifact_dir.is_dir()
+        ):
+            raise RuntimeError(
+                "Heldout eval artifact directory is not a regular directory: "
+                f"{artifact_dir}"
+            )
         artifact_dir.mkdir(parents=True, exist_ok=True)
         artifact_path = artifact_dir / f"step_{step:08d}.json"
         serialized_payload = (
             json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n"
         ).encode("utf-8")
+        if artifact_path.is_symlink() or (
+            artifact_path.exists() and not artifact_path.is_file()
+        ):
+            raise RuntimeError(
+                "Heldout eval artifact path is not a regular file: "
+                f"{artifact_path}"
+            )
         if artifact_path.is_file():
             if artifact_path.read_bytes() != serialized_payload:
                 raise RuntimeError(
@@ -4545,6 +6019,16 @@ class VLATrainer(TrainerUtils):
             _atomic_write_bytes(artifact_path, serialized_payload)
         _make_artifact_tree_host_readable(artifact_dir)
         return artifact_path
+
+    def _persist_heldout_eval_artifact(self, metrics: Mapping) -> Path | None:
+        """Persist evidence on rank zero and propagate immutable conflicts."""
+
+        if not self.config.get("output_dir", None):
+            return None
+        return self._run_rank_zero_operation(
+            lambda: self._persist_heldout_eval_artifact_main(metrics),
+            label="heldout eval artifact persistence",
+        )
 
     def eval_heldout_action_model(self, step_metrics: dict = None) -> dict:
         if self.vla_eval_dataloader is None:

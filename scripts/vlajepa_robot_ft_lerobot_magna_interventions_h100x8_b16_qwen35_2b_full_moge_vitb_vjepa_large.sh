@@ -9,6 +9,8 @@ H100_DATA_ROOT="/mnt/vla-jepa/datasets/magna_training_data_with_interventions"
 H100_MANIFEST="${REPO_ROOT}/deployment/realman/eval_manifests/magna_internal_holdout_global_batch128_v1.json"
 H100_RUN_ROOT="/mnt/vla-jepa/checkpoints"
 H100_RUN_ID_PREFIX="robot_ft_lerobot_magna_interventions_h100x8_b16_"
+H100_BEST_METRIC_NAME="heldout_focused_eval_task_failure_score_h10"
+H100_BEST_METRIC_MODE="min"
 H100_LIFECYCLE_TEST="${STARVLA_H100_LIFECYCLE_TEST:-0}"
 
 reject_conflicting_env() {
@@ -145,18 +147,144 @@ validate_full_state_checkpoint() {
   done
   if ! "${H100_PYTHON_BIN}" -c '
 import json
+import math
+from pathlib import Path
+import stat
 import sys
 
-with open(sys.argv[1], encoding="utf-8") as handle:
-    completed_steps = json.load(handle)["completed_steps"]
-if isinstance(completed_steps, bool) or not isinstance(completed_steps, int):
-    raise TypeError("completed_steps must be an integer")
-if completed_steps != int(sys.argv[2]):
-    raise ValueError(f"completed_steps={completed_steps} does not match {sys.argv[2]}")
-' "${resolved_checkpoint}/trainer_state.json" "${expected_step}" 2>/dev/null; then
+checkpoint_path = Path(sys.argv[1])
+expected_step = int(sys.argv[2])
+expected_metric_name = sys.argv[3]
+expected_metric_mode = sys.argv[4]
+required_files = [
+    "model.safetensors",
+    "optimizer.bin",
+    "scheduler.bin",
+    "trainer_state.json",
+    *(f"random_states_{rank}.pkl" for rank in range(8)),
+]
+
+
+def exact_int(value, label):
+    if type(value) is not int:
+        raise TypeError(f"{label} must be an exact integer")
+    return value
+
+
+def finite_number(value, label):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"{label} must be numeric")
+    result = float(value)
+    if not math.isfinite(result):
+        raise ValueError(f"{label} must be finite")
+    return result
+
+
+def regular_nonempty(path):
+    info = path.lstat()
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise TypeError(f"checkpoint file must be regular: {path}")
+    if info.st_nlink != 1 or info.st_size <= 0:
+        raise ValueError(f"checkpoint file must be nonempty and unlinked: {path}")
+
+
+def load_object(path):
+    regular_nonempty(path)
+    with path.open(encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if not isinstance(payload, dict):
+        raise TypeError(f"checkpoint JSON must be an object: {path}")
+    return payload
+
+
+def validate_metric_identity(payload, label):
+    if payload.get("best_metric_name") != expected_metric_name:
+        raise ValueError(f"{label} uses the wrong best metric")
+    if payload.get("best_metric_mode") != expected_metric_mode:
+        raise ValueError(f"{label} uses the wrong best metric mode")
+
+
+def validate_selection(payload, containing_step):
+    if type(payload.get("schema_version")) is not int or payload["schema_version"] != 1:
+        raise ValueError("selection_state.json must use exact integer schema_version=1")
+    validate_metric_identity(payload, "selection state")
+    best_value = payload.get("best_metric_value")
+    best_step = payload.get("best_metric_step")
+    best_relative_path = payload.get("checkpoint_relative_path")
+    if best_value is None and best_step is None:
+        if best_relative_path is not None:
+            raise ValueError("empty selection state must not name a checkpoint")
+        return None
+    if best_value is None or best_step is None:
+        raise ValueError("best metric value and step must be set together")
+    finite_number(best_value, "best metric value")
+    best_step = exact_int(best_step, "best metric step")
+    if best_step < 0 or best_step > containing_step:
+        raise ValueError("best metric step is outside checkpoint history")
+    if best_relative_path != f"checkpoints/steps_{best_step}":
+        raise ValueError("best checkpoint path does not match its step")
+    return best_step
+
+
+def validate_legacy_dependency(trainer_state, containing_step):
+    value = trainer_state.get("best_metric_value")
+    step = trainer_state.get("best_metric_step")
+    if value is None and step is None:
+        return None
+    if value is None:
+        raise ValueError("legacy best step has no metric value")
+    finite_number(value, "legacy best metric value")
+    if step is None:
+        return containing_step
+    step = exact_int(step, "legacy best metric step")
+    if step < 0 or step > containing_step:
+        raise ValueError("legacy best metric step is outside checkpoint history")
+    return step
+
+
+validated = set()
+
+
+def validate_checkpoint(path, step):
+    resolved = path.resolve(strict=True)
+    if resolved != path or not path.is_dir() or path.name != f"steps_{step}":
+        raise ValueError(f"checkpoint dependency path is not canonical: {path}")
+    if step in validated:
+        return
+    for filename in required_files:
+        regular_nonempty(path / filename)
+    trainer_state = load_object(path / "trainer_state.json")
+    completed_steps = exact_int(
+        trainer_state.get("completed_steps"), "trainer_state.completed_steps"
+    )
+    if completed_steps != step:
+        raise ValueError("trainer_state.completed_steps does not match checkpoint suffix")
+    for field in ("best_metric_name", "best_metric_mode"):
+        if field in trainer_state:
+            validate_metric_identity(trainer_state, "trainer state")
+            break
+    marker = trainer_state.get("selection_state_schema_version")
+    if marker is not None and (type(marker) is not int or marker != 1):
+        raise ValueError("unsupported trainer selection-state schema")
+    selection_path = path / "selection_state.json"
+    if selection_path.exists() or selection_path.is_symlink():
+        dependency_step = validate_selection(load_object(selection_path), step)
+    elif marker == 1:
+        raise FileNotFoundError(f"required selection state is missing: {selection_path}")
+    else:
+        dependency_step = validate_legacy_dependency(trainer_state, step)
+    validated.add(step)
+    if dependency_step is None or dependency_step == step:
+        return
+    dependency_path = path.parent / f"steps_{dependency_step}"
+    validate_checkpoint(dependency_path, dependency_step)
+
+
+validate_checkpoint(checkpoint_path, expected_step)
+' "${resolved_checkpoint}" "${expected_step}" "${H100_BEST_METRIC_NAME}" "${H100_BEST_METRIC_MODE}" 2>/dev/null; then
     invalid_cli_override \
       "resume_from_checkpoint" \
-      "trainer_state.completed_steps must equal checkpoint suffix ${expected_step}: ${resolved_checkpoint}"
+      "checkpoint trainer/selection state is incomplete or inconsistent at step ${expected_step}: ${resolved_checkpoint}"
   fi
   H100_RESOLVED_CHECKPOINT="${resolved_checkpoint}"
 }

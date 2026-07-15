@@ -859,6 +859,7 @@ def test_checkpoint_eval_runs_two_views_and_atomically_persists_evidence(tmp_pat
         "trainer_state_sha256": hashlib.sha256(trainer_state_bytes).hexdigest(),
         "model_file": "model.safetensors",
         "model_file_size_bytes": len(b"fixture-model"),
+        "model_file_sha256": hashlib.sha256(b"fixture-model").hexdigest(),
     }
     assert payload["checkpoint_relative_path"] == (
         "source/checkpoints/steps_2500"
