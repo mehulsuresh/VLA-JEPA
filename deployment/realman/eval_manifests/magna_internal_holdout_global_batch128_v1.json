@@ -373,7 +373,7 @@
       "formula": "per_device_batch_size * world_size * gradient_accumulation_steps",
       "gradient_accumulation_steps": 1,
       "launcher_path": "/home/mehul/work/vjepa/VLA-JEPA/scripts/vlajepa_robot_ft_lerobot_magna_interventions_h100x8_b16_qwen35_2b_full_moge_vitb_vjepa_large.sh",
-      "launcher_sha256": "8c84602fdeb90c19e5202cc5c084f4bb40979cab2c7d18e343de74c0f48b5de7",
+      "launcher_sha256": "8c2b9ae9d71614c2256a46bb08d29ccea439c8ff0109295b9dcb0763b40600d4",
       "per_device_batch_size": 16,
       "world_size": 8
     },

@@ -2549,7 +2549,7 @@
     }
   },
   "manifest_path": "/home/mehul/work/vjepa/VLA-JEPA/deployment/realman/eval_manifests/magna_internal_holdout_global_batch128_v1.json",
-  "manifest_sha256": "9710668343b6ee501a4ce89e33f0c15403123a2954485a66583efd23f0077a6b",
+  "manifest_sha256": "fbf8f1a72b4ac45eee5c24b19eadeb018eebaf59ec5588f7c7b20c93ac4e0a6d",
   "schema_version": 1,
   "selection": {
     "eligibility": {
