@@ -1,7 +1,9 @@
 import argparse
 import importlib.util
+import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -107,6 +109,134 @@ def test_probe_requires_every_transformers_fast_path_binding():
         probe._require_modeling_bindings(complete)
 
 
+def test_default_transformers_binding_validation_still_fails_unbound():
+    probe = _load_probe_module()
+    package_bindings = {
+        name: (lambda: None) for name in probe.REQUIRED_MODELING_BINDINGS
+    }
+    unbound_modeling = SimpleNamespace(
+        **{name: None for name in probe.REQUIRED_MODELING_BINDINGS}
+    )
+
+    with pytest.raises(RuntimeError, match="did not bind every Qwen3.5 fast-path"):
+        probe._resolve_transformers_bindings(unbound_modeling, package_bindings)
+
+
+def test_cpu_build_mode_permits_only_unbound_transformers_globals_without_cuda(
+    monkeypatch,
+):
+    probe = _load_probe_module()
+    package_bindings = {
+        name: (lambda: None) for name in probe.REQUIRED_MODELING_BINDINGS
+    }
+    unbound_modeling = SimpleNamespace(
+        **{name: None for name in probe.REQUIRED_MODELING_BINDINGS}
+    )
+    monkeypatch.setattr(probe, "_cuda_is_available", lambda: False)
+
+    bindings, validation = probe._resolve_transformers_bindings(
+        unbound_modeling,
+        package_bindings,
+        allow_unbound_for_cpu_build=True,
+    )
+
+    assert bindings == package_bindings
+    assert validation == {
+        "mode": "cpu-build-no-cuda",
+        "bound": [],
+        "unbound": list(probe.REQUIRED_MODELING_BINDINGS),
+    }
+
+
+def test_cpu_build_exception_is_rejected_when_cuda_is_available(monkeypatch):
+    probe = _load_probe_module()
+    package_bindings = {
+        name: (lambda: None) for name in probe.REQUIRED_MODELING_BINDINGS
+    }
+    unbound_modeling = SimpleNamespace(
+        **{name: None for name in probe.REQUIRED_MODELING_BINDINGS}
+    )
+    monkeypatch.setattr(probe, "_cuda_is_available", lambda: True)
+
+    with pytest.raises(RuntimeError, match="valid only when CUDA is unavailable"):
+        probe._resolve_transformers_bindings(
+            unbound_modeling,
+            package_bindings,
+            allow_unbound_for_cpu_build=True,
+        )
+
+
+def test_cpu_build_mode_rejects_wrong_transformers_implementation(monkeypatch):
+    probe = _load_probe_module()
+    package_bindings = {
+        name: (lambda: None) for name in probe.REQUIRED_MODELING_BINDINGS
+    }
+    modeling_values = {name: None for name in probe.REQUIRED_MODELING_BINDINGS}
+    modeling_values["chunk_gated_delta_rule"] = lambda: None
+    monkeypatch.setattr(probe, "_cuda_is_available", lambda: False)
+
+    with pytest.raises(RuntimeError, match="unexpected implementations.*chunk_gated"):
+        probe._resolve_transformers_bindings(
+            SimpleNamespace(**modeling_values),
+            package_bindings,
+            allow_unbound_for_cpu_build=True,
+        )
+
+
+def test_cpu_build_mode_rejects_missing_transformers_global(monkeypatch):
+    probe = _load_probe_module()
+    package_bindings = {
+        name: (lambda: None) for name in probe.REQUIRED_MODELING_BINDINGS
+    }
+    modeling_values = {name: None for name in probe.REQUIRED_MODELING_BINDINGS}
+    del modeling_values["fused_recurrent_gated_delta_rule"]
+    monkeypatch.setattr(probe, "_cuda_is_available", lambda: False)
+
+    with pytest.raises(
+        RuntimeError,
+        match="missing required CPU-build globals.*fused_recurrent",
+    ):
+        probe._resolve_transformers_bindings(
+            SimpleNamespace(**modeling_values),
+            package_bindings,
+            allow_unbound_for_cpu_build=True,
+        )
+
+
+def test_cpu_build_main_flag_skips_kernel_probe(monkeypatch, capsys):
+    probe = _load_probe_module()
+    received = {}
+
+    def fake_load_integrations(*_args, **kwargs):
+        received.update(kwargs)
+        return (
+            {"flash-linear-attention": "0.5.1"},
+            SimpleNamespace(),
+            type("FakeQwenConfig", (), {}),
+            {},
+            {"mode": "cpu-build-no-cuda", "bound": [], "unbound": []},
+            {},
+        )
+
+    monkeypatch.setattr(probe, "_load_integrations", fake_load_integrations)
+    monkeypatch.setattr(
+        probe,
+        "_run_kernel_probe",
+        lambda *_args, **_kwargs: pytest.fail("CPU build mode ran CUDA kernels"),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [str(PROBE_PATH), "--cpu-build-imports-only"],
+    )
+
+    assert probe.main() == 0
+    result = json.loads(capsys.readouterr().out)
+    assert received["allow_unbound_transformers_for_cpu_build"] is True
+    assert result["mode"] == "cpu-build-imports-only"
+    assert "kernel_probe" not in result
+
+
 def test_probe_fails_closed_on_transformers_version_mismatch(monkeypatch):
     probe = _load_probe_module()
     monkeypatch.setattr(probe.importlib.metadata, "version", lambda _distribution: "5.14.0")
@@ -179,7 +309,14 @@ def test_imports_only_loads_tilelang_tvm_ffi_and_qwen35_bindings(monkeypatch):
 
     monkeypatch.setattr(probe.importlib, "import_module", fake_import)
 
-    versions, modeling, config_cls, bindings, import_report = probe._load_integrations(
+    (
+        versions,
+        modeling,
+        config_cls,
+        bindings,
+        binding_validation,
+        import_report,
+    ) = probe._load_integrations(
         "0.5.1", "1.6.2.post1", "5.13.1", "0.1.9", "0.1.10"
     )
 
@@ -187,6 +324,11 @@ def test_imports_only_loads_tilelang_tvm_ffi_and_qwen35_bindings(monkeypatch):
     assert config_cls is FakeQwenConfig
     assert modeling is modules["transformers.models.qwen3_5.modeling_qwen3_5"]
     assert bindings == binding_values
+    assert binding_validation == {
+        "mode": "strict-transformers-identity",
+        "bound": list(probe.REQUIRED_MODELING_BINDINGS),
+        "unbound": [],
+    }
     assert "tilelang" in imported
     assert "tvm_ffi" in imported
     assert "transformers.models.qwen3_5.modeling_qwen3_5" in imported
@@ -314,6 +456,7 @@ def test_probe_help_does_not_require_ml_runtime_imports():
 
     assert result.returncode == 0, result.stderr
     assert "--imports-only" in result.stdout
+    assert "--cpu-build-imports-only" in result.stdout
     assert "--expected-compute-capability" in result.stdout
 
 
@@ -417,7 +560,8 @@ def test_dockerfile_forces_source_build_and_import_probe_when_enabled():
     assert "PIP_NO_BINARY=causal-conv1d" in dockerfile
     assert 'SHELL ["/bin/bash", "-Eeuo", "pipefail", "-c"]' in dockerfile
     assert "probe_qwen35_fast_linear_attention.py" in dockerfile
-    assert "--imports-only" in dockerfile
+    assert "--cpu-build-imports-only" in dockerfile
+    assert "--imports-only" not in dockerfile
     assert '"${FAST_LINEAR_ATTN_TVM_FFI_SPEC}" "${FAST_LINEAR_ATTN_TILELANG_SPEC}"' in dockerfile
     assert "python -m pip check" not in dockerfile
     assert "--check-python-dependencies" in dockerfile

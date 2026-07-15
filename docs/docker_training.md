@@ -58,14 +58,18 @@ IMAGE=vla-jepa:h100-fla \
 ./scripts/docker_build_training.sh
 ```
 
-The build imports every pinned runtime module and confirms that Transformers'
-Qwen3.5 implementation is bound to those fused functions. The final image runs
-a fail-closed `pip check`; when MoGe is installed, only its two known missing
-optional dependencies (`gradio` and `opencv-python`) are allowed, and every
-other diagnostic still fails the build. Before selecting the FLA image for
-training, run its probe on an H100. It includes a 65-token fused backward pass
-compared with a pure-PyTorch gated-delta recurrence, so it exercises the first
-64-token chunk boundary instead of accepting merely finite gradients:
+The build's explicit CPU-only import probe checks every pinned package, compiled
+extension function, and Qwen3.5 module. Normal Docker builds do not expose a GPU,
+so only in that mode may Transformers' CUDA-gated globals remain unbound; the
+mode rejects CUDA-capable runtimes and still rejects missing package functions.
+The final image runs a fail-closed `pip check`; when MoGe is installed, only its
+two known missing optional dependencies (`gradio` and `opencv-python`) are
+allowed, and every other diagnostic still fails the build. Before selecting the
+FLA image for training, run its normal probe on an H100. That runtime gate
+requires all five Transformers bindings to be identical to the installed fused
+functions and includes a 65-token fused backward pass compared with a pure-
+PyTorch gated-delta recurrence, so it exercises the first 64-token chunk boundary
+instead of accepting merely finite gradients:
 
 ```bash
 ./scripts/docker_run_training.sh \

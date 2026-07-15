@@ -136,7 +136,7 @@ RUN case "${INSTALL_FAST_LINEAR_ATTN}" in 0|1) ;; \
         "${FAST_LINEAR_ATTN_TVM_FFI_SPEC}" "${FAST_LINEAR_ATTN_TILELANG_SPEC}" \
         "${FAST_LINEAR_ATTN_SPEC}"; \
       python /tmp/probe_qwen35_fast_linear_attention.py \
-        --imports-only \
+        --cpu-build-imports-only \
         --expected-fla-version "${FAST_LINEAR_ATTN_SPEC##*==}" \
         --expected-causal-conv1d-version "${CAUSAL_CONV1D_SPEC##*==}" \
         --expected-transformers-version "${FAST_LINEAR_ATTN_TRANSFORMERS_SPEC##*==}" \

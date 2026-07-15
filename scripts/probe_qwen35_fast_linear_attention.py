@@ -83,6 +83,78 @@ def _require_modeling_bindings(modeling: ModuleType | Any) -> dict[str, Any]:
     return {name: getattr(modeling, name) for name in REQUIRED_MODELING_BINDINGS}
 
 
+def _cuda_is_available() -> bool:
+    torch_module = _import_runtime_module("torch", "torch")
+    cuda_module = getattr(torch_module, "cuda", None)
+    is_available = getattr(cuda_module, "is_available", None)
+    if not callable(is_available):
+        raise RuntimeError("torch.cuda.is_available is unavailable or not callable")
+    return bool(is_available())
+
+
+def _resolve_transformers_bindings(
+    modeling: ModuleType | Any,
+    package_bindings: dict[str, Any],
+    *,
+    allow_unbound_for_cpu_build: bool = False,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    if not allow_unbound_for_cpu_build:
+        bindings = _require_modeling_bindings(modeling)
+        mismatched = [
+            name
+            for name in REQUIRED_MODELING_BINDINGS
+            if bindings[name] is not package_bindings[name]
+        ]
+        if mismatched:
+            raise RuntimeError(
+                "Transformers Qwen3.5 bindings do not reference the installed "
+                "fused packages: " + ", ".join(mismatched)
+            )
+        return bindings, {
+            "mode": "strict-transformers-identity",
+            "bound": list(REQUIRED_MODELING_BINDINGS),
+            "unbound": [],
+        }
+
+    if _cuda_is_available():
+        raise RuntimeError(
+            "--cpu-build-imports-only is valid only when CUDA is unavailable"
+        )
+
+    missing = [
+        name for name in REQUIRED_MODELING_BINDINGS if not hasattr(modeling, name)
+    ]
+    if missing:
+        raise RuntimeError(
+            "Transformers Qwen3.5 module is missing required CPU-build globals: "
+            + ", ".join(missing)
+        )
+    transformers_values = {
+        name: getattr(modeling, name) for name in REQUIRED_MODELING_BINDINGS
+    }
+    mismatched = [
+        name
+        for name, value in transformers_values.items()
+        if value is not None and value is not package_bindings[name]
+    ]
+    if mismatched:
+        raise RuntimeError(
+            "Transformers Qwen3.5 CPU-build globals reference unexpected "
+            "implementations: " + ", ".join(mismatched)
+        )
+    bound = [
+        name
+        for name, value in transformers_values.items()
+        if value is package_bindings[name]
+    ]
+    unbound = [name for name, value in transformers_values.items() if value is None]
+    return package_bindings, {
+        "mode": "cpu-build-no-cuda",
+        "bound": bound,
+        "unbound": unbound,
+    }
+
+
 def _import_runtime_module(distribution: str, module_name: str) -> ModuleType:
     try:
         return importlib.import_module(module_name)
@@ -170,6 +242,8 @@ def _load_integrations(
     expected_transformers_version: str,
     expected_tilelang_version: str,
     expected_tvm_ffi_version: str,
+    *,
+    allow_unbound_transformers_for_cpu_build: bool = False,
 ):
     versions = {
         "flash-linear-attention": _require_exact_package_version(
@@ -226,22 +300,27 @@ def _load_integrations(
             "Transformers Qwen3.5 configuration module did not expose Qwen3_5TextConfig"
         )
 
-    bindings = _require_modeling_bindings(modeling_qwen3_5)
-    mismatched = [
-        name for name in REQUIRED_MODELING_BINDINGS if bindings[name] is not package_bindings[name]
-    ]
-    if mismatched:
-        raise RuntimeError(
-            "Transformers Qwen3.5 bindings do not reference the installed fused packages: "
-            + ", ".join(mismatched)
-        )
+    bindings, binding_validation = _resolve_transformers_bindings(
+        modeling_qwen3_5,
+        package_bindings,
+        allow_unbound_for_cpu_build=(
+            allow_unbound_transformers_for_cpu_build
+        ),
+    )
     imported_modules = {
         "tilelang": _describe_import(tilelang_module),
         "apache-tvm-ffi": _describe_import(tvm_ffi_module),
         "transformers-qwen3.5-modeling": _describe_import(modeling_qwen3_5),
         "transformers-qwen3.5-configuration": _describe_import(configuration_qwen3_5),
     }
-    return versions, modeling_qwen3_5, Qwen3_5TextConfig, bindings, imported_modules
+    return (
+        versions,
+        modeling_qwen3_5,
+        Qwen3_5TextConfig,
+        bindings,
+        binding_validation,
+        imported_modules,
+    )
 
 
 def _require_finite(torch: Any, name: str, tensor: Any) -> None:
@@ -656,6 +735,15 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     mode.add_argument(
+        "--cpu-build-imports-only",
+        action="store_true",
+        help=(
+            "for a CUDA-less Docker build only, import and validate every pinned "
+            "runtime and fused package function while permitting Transformers' "
+            "CUDA-gated Qwen3.5 globals to remain unbound"
+        ),
+    )
+    mode.add_argument(
         "--check-python-dependencies",
         action="store_true",
         help="run pip check through the fail-closed Docker dependency policy",
@@ -722,21 +810,38 @@ def main() -> int:
         )
         return 0
 
-    versions, modeling, config_cls, bindings, imported_modules = _load_integrations(
+    (
+        versions,
+        modeling,
+        config_cls,
+        bindings,
+        binding_validation,
+        imported_modules,
+    ) = _load_integrations(
         args.expected_fla_version,
         args.expected_causal_conv1d_version,
         args.expected_transformers_version,
         args.expected_tilelang_version,
         args.expected_tvm_ffi_version,
+        allow_unbound_transformers_for_cpu_build=(
+            args.cpu_build_imports_only
+        ),
     )
+    if args.cpu_build_imports_only:
+        mode_name = "cpu-build-imports-only"
+    elif args.imports_only:
+        mode_name = "imports-only"
+    else:
+        mode_name = "sm90-kernels"
     result: dict[str, Any] = {
         "status": "ok",
-        "mode": "imports-only" if args.imports_only else "sm90-kernels",
+        "mode": mode_name,
         "versions": versions,
         "runtime_imports": imported_modules,
-        "transformers_bindings": list(bindings),
+        "transformers_bindings": binding_validation["bound"],
+        "transformers_binding_validation": binding_validation,
     }
-    if not args.imports_only:
+    if not args.imports_only and not args.cpu_build_imports_only:
         result["kernel_probe"] = _run_kernel_probe(
             modeling,
             config_cls,
