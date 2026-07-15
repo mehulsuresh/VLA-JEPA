@@ -2253,7 +2253,17 @@ class VLATrainer(TrainerUtils):
                     self.completed_steps = int(checkpoint_name.split("_", 1)[1])
                 except ValueError:
                     logger.warning(f"Unable to parse completed_steps from checkpoint path: {checkpoint_path}")
-        if self.completed_steps > 0 and self.lr_scheduler is not None:
+        # Accelerate restores the scheduler together with the optimizer during
+        # a full-state resume. Stepping it again would preserve ``last_epoch``
+        # but increment ``_step_count`` a second time, so the resumed scheduler
+        # would no longer be state-identical to uninterrupted training. Only a
+        # model-only resume needs to reconstruct schedule position from the
+        # completed-step counter.
+        if (
+            not load_optimizer_state
+            and self.completed_steps > 0
+            and self.lr_scheduler is not None
+        ):
             try:
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore")
