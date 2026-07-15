@@ -754,6 +754,29 @@ def test_checkpoint_eval_runs_two_views_and_atomically_persists_evidence(tmp_pat
     trainer.config.trainer.eval_only = True
     config_bytes = b"run_id: focused-eval-fixture\nseed: 42\n"
     (tmp_path / "config.yaml").write_bytes(config_bytes)
+    schedule_bytes = (
+        json.dumps(
+            {
+                "schema_version": 1,
+                "resolved": {
+                    "effective_global_batch_size": 96,
+                    "eval_interval": 2500,
+                    "max_train_steps": 7500,
+                    "num_warmup_steps": 3000,
+                    "save_interval": 2500,
+                },
+                "source_config": {
+                    "path": "config.yaml",
+                    "sha256": hashlib.sha256(config_bytes).hexdigest(),
+                },
+            },
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode("utf-8")
+    (tmp_path / "resolved_training_schedule.json").write_bytes(
+        schedule_bytes
+    )
     trainer.config.trainer.eval_source_training_config_path = str(
         tmp_path / "config.yaml"
     )
@@ -846,6 +869,10 @@ def test_checkpoint_eval_runs_two_views_and_atomically_persists_evidence(tmp_pat
         "seed": 42,
         "config_path": "config.yaml",
         "config_sha256": hashlib.sha256(config_bytes).hexdigest(),
+        "resolved_training_schedule": {
+            "path": "resolved_training_schedule.json",
+            "sha256": hashlib.sha256(schedule_bytes).hexdigest(),
+        },
         "source_training_config": {
             "path": str((tmp_path / "config.yaml").resolve()),
             "sha256": hashlib.sha256(config_bytes).hexdigest(),
@@ -879,6 +906,11 @@ def test_legacy_artifact_is_explicitly_production_invalid(tmp_path):
     trainer.completed_steps = 2500
     trainer.config.output_dir = str(tmp_path)
     trainer.config.run_id = "legacy-audit"
+    trainer.config.trainer.eval_only = True
+    trainer.eval_source_training_config_evidence = {
+        "path": "/fixture/source/config.yaml",
+        "sha256": "c" * 64,
+    }
     trainer.legacy_underfilled_eval = True
     trainer.vla_focused_eval_dataloader = object()
     legacy = {
@@ -928,6 +960,29 @@ def test_step_zero_artifact_does_not_claim_a_nonexistent_checkpoint(tmp_path):
     trainer.config.output_dir = str(tmp_path)
     trainer.config.run_id = "step-zero-live-eval"
     trainer.config.trainer.best_metric_name = "heldout_eval_normalized_action_mae"
+    config_bytes = b"run_id: step-zero-live-eval\n"
+    (tmp_path / "config.yaml").write_bytes(config_bytes)
+    (tmp_path / "resolved_training_schedule.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "resolved": {
+                    "effective_global_batch_size": 2,
+                    "eval_interval": 5,
+                    "max_train_steps": 15,
+                    "num_warmup_steps": 2250,
+                    "save_interval": 5,
+                },
+                "source_config": {
+                    "path": "config.yaml",
+                    "sha256": hashlib.sha256(config_bytes).hexdigest(),
+                },
+            },
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     trainer.heldout_eval_sampling_report = {
         "window_selection_sha256": "a" * 64,
         "production_valid": True,
@@ -946,6 +1001,27 @@ def test_step_zero_artifact_does_not_claim_a_nonexistent_checkpoint(tmp_path):
         "source_path": None,
         "source_kind": "live_in_memory_model",
     }
+
+    original_bytes = path.read_bytes()
+    assert trainer._persist_heldout_eval_artifact(
+        {"heldout_eval_normalized_action_mae": 0.4}
+    ) == path
+    assert path.read_bytes() == original_bytes
+    with pytest.raises(RuntimeError, match="evidence is immutable"):
+        trainer._persist_heldout_eval_artifact(
+            {"heldout_eval_normalized_action_mae": 0.5}
+        )
+    assert path.read_bytes() == original_bytes
+
+    schedule_path = tmp_path / "resolved_training_schedule.json"
+    tampered_schedule = json.loads(schedule_path.read_text(encoding="utf-8"))
+    tampered_schedule["source_config"]["sha256"] = "d" * 64
+    schedule_path.write_text(json.dumps(tampered_schedule), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="not bound to the immutable source config"):
+        trainer._persist_heldout_eval_artifact(
+            {"heldout_eval_normalized_action_mae": 0.4}
+        )
+    assert path.read_bytes() == original_bytes
 
 
 def test_training_entrypoint_rejects_legacy_underfilled_mode_before_setup():

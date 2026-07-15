@@ -367,6 +367,7 @@ def test_vla_jepa_configs_declare_state_tokens_and_ordered_prompts():
         qwenvl_cfg = framework_cfg["qwenvl"]
         is_qwen35_lora_experiment = "qwen35_08b_lora" in path.name
         is_qwen35_full_experiment = "qwen35_2b_full" in path.name
+        is_h100_magna_fla = "magna_interventions_h100x8_b16" in path.name
         if is_qwen35_lora_experiment:
             assert qwenvl_cfg["base_vlm"] == "Qwen/Qwen3.5-0.8B", path
             assert bool(qwenvl_cfg.get("lora", {}).get("enabled", False)), path
@@ -376,7 +377,13 @@ def test_vla_jepa_configs_declare_state_tokens_and_ordered_prompts():
             assert qwenvl_cfg["base_vlm"] == "Qwen/Qwen3.5-2B", path
             assert not bool(qwenvl_cfg.get("lora", {}).get("enabled", False)), path
             assert not bool(qwenvl_cfg.get("blockwise_attention", {}).get("enabled", False)), path
-            assert not bool(qwenvl_cfg.get("enable_fast_linear_attention", True)), path
+            if is_h100_magna_fla:
+                assert qwenvl_cfg["attn_implementation"] == "flash_attention_2", path
+                assert bool(qwenvl_cfg.get("strict_attn_implementation", False)), path
+                assert bool(qwenvl_cfg.get("enable_fast_linear_attention", False)), path
+                assert bool(qwenvl_cfg.get("strict_fast_linear_attention", False)), path
+            else:
+                assert not bool(qwenvl_cfg.get("enable_fast_linear_attention", True)), path
         else:
             assert qwenvl_cfg["base_vlm"] == "Qwen/Qwen3-VL-2B-Instruct", path
         assert qwenvl_cfg["vl_hidden_dim"] == "auto", path

@@ -76,7 +76,6 @@ os.environ.setdefault("OPENBLAS_NUM_THREADS", os.environ.get("VLA_JEPA_MAIN_TORC
 os.environ.setdefault("NUMEXPR_NUM_THREADS", os.environ.get("VLA_JEPA_MAIN_TORCH_THREADS", "1"))
 import torch
 import torch.distributed as dist
-import yaml
 from accelerate import Accelerator, DeepSpeedPlugin
 from accelerate.logging import get_logger
 from accelerate.tracking import LoggerType
@@ -580,21 +579,216 @@ def load_fast_tokenizer():
     return fast_tokenizer
 
 
+_RESUME_TRANSPORT_CONFIG_PATHS = (
+    ("output_dir",),
+    ("is_resume",),
+    ("resume_from_checkpoint",),
+    ("trainer", "is_resume"),
+    ("trainer", "resume_from_checkpoint"),
+)
+_PENDING_RESUME_INVOCATION_YAML: dict[str, bytes] = {}
+
+
+def _atomic_write_bytes(path: Path, payload: bytes) -> None:
+    """Durably replace a small provenance file without exposing partial bytes."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = path.parent / (
+        f".{path.name}.tmp-{os.getpid()}-{threading.get_ident()}"
+    )
+    try:
+        with temporary_path.open("wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if temporary_path.exists():
+            temporary_path.unlink()
+
+
+def _plain_config(config) -> dict:
+    if OmegaConf.is_config(config):
+        plain = OmegaConf.to_container(config, resolve=True)
+    else:
+        plain = OmegaConf.to_container(OmegaConf.create(config), resolve=True)
+    if not isinstance(plain, dict):
+        raise TypeError(f"Expected a mapping config, got {type(plain).__name__}.")
+    return plain
+
+
+def _remove_nested_config_path(config: dict, path: tuple[str, ...]) -> None:
+    current = config
+    for component in path[:-1]:
+        next_value = current.get(component)
+        if not isinstance(next_value, dict):
+            return
+        current = next_value
+    current.pop(path[-1], None)
+
+
+def _canonical_resume_config(config) -> dict:
+    canonical = _plain_config(config)
+    for path in _RESUME_TRANSPORT_CONFIG_PATHS:
+        _remove_nested_config_path(canonical, path)
+    return canonical
+
+
+def _config_difference_summaries(source: Mapping, invocation: Mapping) -> list[str]:
+    source_flat = flatten_tracker_config(source)
+    invocation_flat = flatten_tracker_config(invocation)
+    differences = []
+    for key in sorted(set(source_flat) | set(invocation_flat)):
+        if key not in source_flat:
+            differences.append(f"{key}: missing from source config")
+        elif key not in invocation_flat:
+            differences.append(f"{key}: missing from resume invocation")
+        elif source_flat[key] != invocation_flat[key]:
+            differences.append(
+                f"{key}: source={source_flat[key]!r} resume={invocation_flat[key]!r}"
+            )
+        if len(differences) == 8:
+            break
+    return differences
+
+
+def _persist_resume_invocation_snapshot(
+    output_dir: Path,
+    cfg,
+    yaml_payload: bytes,
+) -> Path:
+    trainer_cfg = cfg.get("trainer", {})
+    checkpoint = cfg.get("resume_from_checkpoint", None) or trainer_cfg.get(
+        "resume_from_checkpoint", None
+    )
+    label = Path(str(checkpoint)).name if checkpoint else "resume"
+    safe_label = "".join(
+        character if character.isalnum() or character in "-_." else "_"
+        for character in str(label)
+    )
+    invocation_sha256 = hashlib.sha256(yaml_payload).hexdigest()
+    snapshot_path = (
+        output_dir
+        / "resume_invocations"
+        / f"{safe_label}-{invocation_sha256[:12]}.yaml"
+    )
+    if snapshot_path.is_file():
+        if snapshot_path.read_bytes() != yaml_payload:
+            raise RuntimeError(
+                "Resume invocation snapshot is immutable and its content does "
+                f"not match the validated invocation: {snapshot_path}"
+            )
+    else:
+        _atomic_write_bytes(snapshot_path, yaml_payload)
+    return snapshot_path
+
+
+def _persist_pending_resume_invocation_snapshot(output_dir: Path, cfg) -> Path:
+    key = str(output_dir.expanduser().resolve())
+    yaml_payload = _PENDING_RESUME_INVOCATION_YAML.pop(key, None)
+    if yaml_payload is None:
+        raise RuntimeError(
+            "Missing the validated pre-resolution resume invocation snapshot "
+            f"for {output_dir}."
+        )
+    return _persist_resume_invocation_snapshot(output_dir, cfg, yaml_payload)
+
+
+def _validate_resume_config(source_config_path: Path, cfg) -> None:
+    source_config = OmegaConf.load(source_config_path)
+    source_json_path = source_config_path.with_suffix(".json")
+    if not source_json_path.is_file():
+        raise RuntimeError(
+            f"Resume output is missing immutable {source_json_path.name}: "
+            f"{source_json_path.parent}"
+        )
+    try:
+        source_json = json.loads(source_json_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"Immutable source config JSON is unreadable: {source_json_path}"
+        ) from exc
+    json_normalized_source = json.loads(
+        json.dumps(_plain_config(source_config), allow_nan=False)
+    )
+    if json_normalized_source != source_json:
+        raise RuntimeError(
+            "Immutable source config YAML/JSON mismatch; refusing resume: "
+            f"{source_config_path} vs {source_json_path}"
+        )
+    canonical_source = _canonical_resume_config(source_config)
+    canonical_invocation = _canonical_resume_config(cfg)
+    if canonical_source == canonical_invocation:
+        return
+    differences = _config_difference_summaries(
+        canonical_source,
+        canonical_invocation,
+    )
+    detail = "; ".join(differences) if differences else "unknown difference"
+    raise RuntimeError(
+        "Resume configuration drift detected outside the permitted resume "
+        "transport fields; refusing to overwrite the immutable source config. "
+        f"Differences: {detail}"
+    )
+
+
 def setup_directories(cfg) -> Path:
-    """create output directory and save config"""
+    """Create output directories and preserve immutable run provenance."""
     cfg.output_dir = os.path.join(cfg.run_root_dir, cfg.run_id)
     output_dir = Path(cfg.output_dir)
 
     if not dist.is_initialized() or dist.get_rank() == 0:
-        # create output directory and checkpoint directory
+        preexisting_entries = (
+            list(output_dir.iterdir()) if output_dir.is_dir() else []
+        )
+        yaml_payload = OmegaConf.to_yaml(cfg, resolve=True).encode("utf-8")
+        json_payload = (
+            json.dumps(_plain_config(cfg), indent=2, allow_nan=False) + "\n"
+        ).encode("utf-8")
+        config_yaml_path = output_dir / "config.yaml"
+        config_json_path = output_dir / "config.json"
+        trainer_cfg = cfg.get("trainer", {})
+        is_resume = bool(trainer_cfg.get("is_resume", False))
+        eval_only = bool(trainer_cfg.get("eval_only", False))
+        pending_key = str(output_dir.expanduser().resolve())
+        _PENDING_RESUME_INVOCATION_YAML.pop(pending_key, None)
+
+        if is_resume:
+            if config_yaml_path.is_file():
+                _validate_resume_config(config_yaml_path, cfg)
+            elif preexisting_entries:
+                raise RuntimeError(
+                    "Resume output directory is missing its immutable source "
+                    f"config.yaml: {output_dir}"
+                )
+        elif preexisting_entries:
+            raise RuntimeError(
+                "Fresh training output directory is not empty; use a new run_id "
+                f"or an explicit validated resume: {output_dir}"
+            )
+
         os.makedirs(output_dir, exist_ok=True)
         os.makedirs(output_dir / "checkpoints", exist_ok=True)
 
-        # save config
-        OmegaConf.save(cfg, output_dir / "config.yaml")
-        with open(output_dir / "config.yaml", "r") as f_yaml, open(output_dir / "config.json", "w") as f_json:
-            yaml_cfg = yaml.safe_load(f_yaml)
-            json.dump(yaml_cfg, f_json, indent=2)
+        if is_resume:
+            if not config_yaml_path.is_file():
+                # A checkpoint audit or branch into a new RUN_ID has no local
+                # source run yet. Its invocation becomes that new output's
+                # immutable source config.
+                _atomic_write_bytes(config_yaml_path, yaml_payload)
+                _atomic_write_bytes(config_json_path, json_payload)
+            if eval_only:
+                _persist_resume_invocation_snapshot(output_dir, cfg, yaml_payload)
+            else:
+                _PENDING_RESUME_INVOCATION_YAML[pending_key] = yaml_payload
+        else:
+            _atomic_write_bytes(config_yaml_path, yaml_payload)
+            _atomic_write_bytes(config_json_path, json_payload)
 
     return output_dir
 
@@ -1179,9 +1373,166 @@ def _raw_dataloader_batches_per_rank(vla_train_dataloader, num_processes: int) -
     return max(1, math.ceil(raw_batches / num_processes))
 
 
-def resolve_training_schedule(cfg, vla_train_dataloader, num_processes: int = 1) -> None:
+def _resolved_training_schedule_payload(
+    cfg,
+    *,
+    num_processes: int,
+    configured_schedule: Mapping,
+) -> dict:
+    trainer_cfg = cfg.trainer
+    data_cfg = cfg.datasets.vla_data
+    per_device_batch_size = int(data_cfg.per_device_batch_size)
+    grad_accum = int(trainer_cfg.get("gradient_accumulation_steps", 1))
+    max_train_steps = int(trainer_cfg.max_train_steps)
+    framework_cfg = cfg.get("framework", {})
+    depth_teacher_cfg = framework_cfg.get("depth_teacher_aux", {})
+    detach_floor = max(int(depth_teacher_cfg.get("detach_vlm_steps", 0) or 0), 0)
+    detach_fraction = float(
+        depth_teacher_cfg.get("detach_vlm_fraction", 0.0) or 0.0
+    )
+    fraction_detach = int(math.ceil(detach_fraction * max_train_steps))
+    rtc_cfg = framework_cfg.get("action_model", {}).get("rtc_training", {})
+    loss_scale_cfg = trainer_cfg.get("loss_scale", {})
+    return _plain_config({
+        "schema_version": 1,
+        "configured": dict(configured_schedule),
+        "resolved": {
+            "epochs": int(trainer_cfg.epochs),
+            "micro_batches_per_epoch": int(trainer_cfg.micro_batches_per_epoch),
+            "steps_per_epoch": int(trainer_cfg.steps_per_epoch),
+            "max_train_steps": max_train_steps,
+            "num_warmup_steps": int(trainer_cfg.num_warmup_steps),
+            "save_interval": int(trainer_cfg.save_interval),
+            "eval_interval": int(trainer_cfg.eval_interval),
+            "gradient_accumulation_steps": grad_accum,
+            "per_device_batch_size": per_device_batch_size,
+            "num_processes": int(num_processes),
+            "effective_global_batch_size": (
+                per_device_batch_size * int(num_processes) * grad_accum
+            ),
+            "step_scheduler_with_optimizer": bool(
+                trainer_cfg.get("step_scheduler_with_optimizer", False)
+            ),
+            "wm_warmup_steps": int(loss_scale_cfg.get("wm_warmup_steps", 0)),
+            "depth_teacher_detach_steps": max(detach_floor, fraction_detach),
+            "depth_teacher_detach_steps_floor": detach_floor,
+            "depth_teacher_detach_fraction": detach_fraction,
+            "rtc_enabled": bool(rtc_cfg.get("enabled", False)),
+            "rtc_warmup_steps": int(
+                rtc_cfg.get("warmup_steps", rtc_cfg.get("start_step", 0)) or 0
+            ),
+            "rtc_ramp_steps": int(rtc_cfg.get("ramp_steps", 0) or 0),
+        },
+    })
+
+
+def persist_resolved_training_schedule(cfg, schedule: Mapping) -> dict:
+    """Write once, then fail closed if a resume resolves a different schedule."""
+
+    output_dir = Path(str(cfg.output_dir)).expanduser().resolve()
+    source_config_path = output_dir / "config.yaml"
+    if not source_config_path.is_file():
+        raise RuntimeError(
+            "Cannot bind the resolved schedule to a missing immutable source "
+            f"config: {source_config_path}"
+        )
+    payload = _plain_config(schedule)
+    payload["source_config"] = {
+        "path": "config.yaml",
+        "sha256": hashlib.sha256(source_config_path.read_bytes()).hexdigest(),
+    }
+    schedule_path = output_dir / "resolved_training_schedule.json"
+    serialized = (
+        json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n"
+    ).encode("utf-8")
+    if schedule_path.is_file():
+        try:
+            existing_payload = json.loads(
+                schedule_path.read_text(encoding="utf-8")
+            )
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                f"Existing resolved training schedule is unreadable: {schedule_path}"
+            ) from exc
+        if existing_payload != payload:
+            differences = _config_difference_summaries(
+                existing_payload,
+                payload,
+            )
+            detail = "; ".join(differences) if differences else "unknown difference"
+            raise RuntimeError(
+                "Resolved training schedule drift detected; refusing to "
+                f"overwrite {schedule_path}. Differences: {detail}"
+            )
+    else:
+        _atomic_write_bytes(schedule_path, serialized)
+    return {
+        "path": "resolved_training_schedule.json",
+        "sha256": hashlib.sha256(schedule_path.read_bytes()).hexdigest(),
+    }
+
+
+def _validated_resolved_schedule_evidence(
+    schedule_path: Path,
+    *,
+    config_sha256: str,
+) -> dict[str, str]:
+    try:
+        payload = json.loads(schedule_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"Resolved training schedule provenance is unreadable: {schedule_path}"
+        ) from exc
+    schema_version = payload.get("schema_version") if isinstance(payload, dict) else None
+    resolved = payload.get("resolved") if isinstance(payload, dict) else None
+    source_config = (
+        payload.get("source_config") if isinstance(payload, dict) else None
+    )
+    required_resolved_fields = {
+        "effective_global_batch_size",
+        "eval_interval",
+        "max_train_steps",
+        "num_warmup_steps",
+        "save_interval",
+    }
+    missing_fields = (
+        sorted(required_resolved_fields - set(resolved))
+        if isinstance(resolved, dict)
+        else sorted(required_resolved_fields)
+    )
+    if (
+        schema_version != 1
+        or not isinstance(resolved, dict)
+        or not isinstance(source_config, dict)
+        or source_config.get("path") != "config.yaml"
+        or source_config.get("sha256") != config_sha256
+        or missing_fields
+    ):
+        raise RuntimeError(
+            "Resolved training schedule provenance is invalid or is not bound "
+            f"to the immutable source config: {schedule_path}; "
+            f"missing_resolved_fields={missing_fields}"
+        )
+    return {
+        "path": "resolved_training_schedule.json",
+        "sha256": hashlib.sha256(schedule_path.read_bytes()).hexdigest(),
+    }
+
+
+def resolve_training_schedule(
+    cfg,
+    vla_train_dataloader,
+    num_processes: int = 1,
+) -> dict:
     """Resolve epoch-based training schedule once the dataloader length is known."""
     trainer_cfg = cfg.trainer
+    configured_schedule = {
+        "epochs": trainer_cfg.get("epochs", None),
+        "max_train_steps": trainer_cfg.get("max_train_steps", None),
+        "num_warmup_steps": trainer_cfg.get("num_warmup_steps", None),
+        "save_interval": trainer_cfg.get("save_interval", None),
+        "eval_interval": trainer_cfg.get("eval_interval", None),
+    }
     micro_batches_per_epoch = _raw_dataloader_batches_per_rank(vla_train_dataloader, num_processes)
     grad_accum_steps = max(int(trainer_cfg.get("gradient_accumulation_steps", 1)), 1)
     steps_per_epoch = math.ceil(micro_batches_per_epoch / grad_accum_steps)
@@ -1232,6 +1583,11 @@ def resolve_training_schedule(cfg, vla_train_dataloader, num_processes: int = 1)
         f"num_warmup_steps={trainer_cfg.num_warmup_steps}, "
         f"save_interval={trainer_cfg.save_interval}, "
         f"eval_interval={trainer_cfg.eval_interval}"
+    )
+    return _resolved_training_schedule_payload(
+        cfg,
+        num_processes=num_processes,
+        configured_schedule=configured_schedule,
     )
 
 
@@ -2602,7 +2958,10 @@ class VLATrainer(TrainerUtils):
         # prepare data iterators
         self._create_data_iterators()
         self.optimizer.zero_grad(set_to_none=True)
-        if bool(self.config.trainer.get("eval_before_train", False)):
+        eval_before_train = bool(
+            self.config.trainer.get("eval_before_train", False)
+        )
+        if eval_before_train and self.completed_steps == 0:
             if self.vla_eval_dataloader is not None:
                 baseline_metrics = self.eval_heldout_action_model({})
             else:
@@ -2613,6 +2972,13 @@ class VLATrainer(TrainerUtils):
                 if self.accelerator.trackers:
                     self.accelerator.log(baseline_metrics, step=0)
                 logger.info(f"Step 0 Eval Metrics: {baseline_metrics}")
+        elif eval_before_train and self.completed_steps > 0:
+            if self.accelerator.is_main_process:
+                logger.info(
+                    "Skipping eval_before_train after resume at completed step "
+                    f"{self.completed_steps}; the immutable step-0 baseline "
+                    "belongs to the fresh run only."
+                )
 
         # create progress bar
         progress_bar = tqdm(
@@ -3966,6 +4332,7 @@ class VLATrainer(TrainerUtils):
             raise RuntimeError("Cannot persist heldout eval without its sampling report.")
 
         output_dir = Path(str(output_dir_value)).expanduser().resolve()
+        eval_only = bool(self.config.trainer.get("eval_only", False))
         config_path = output_dir / "config.yaml"
         if config_path.is_file():
             config_sha256 = hashlib.sha256(config_path.read_bytes()).hexdigest()
@@ -3976,6 +4343,19 @@ class VLATrainer(TrainerUtils):
             )
             config_sha256 = hashlib.sha256(serialized_config).hexdigest()
             config_identity_path = None
+        resolved_schedule_path = output_dir / "resolved_training_schedule.json"
+        resolved_schedule_evidence = None
+        if resolved_schedule_path.is_file():
+            resolved_schedule_evidence = _validated_resolved_schedule_evidence(
+                resolved_schedule_path,
+                config_sha256=config_sha256,
+            )
+        elif not eval_only:
+            raise RuntimeError(
+                "Live training heldout evaluation requires immutable resolved "
+                "schedule provenance at "
+                f"{resolved_schedule_path}."
+            )
 
         def metric_group(prefix: str) -> dict[str, float]:
             result: dict[str, float] = {}
@@ -4029,7 +4409,6 @@ class VLATrainer(TrainerUtils):
             )
 
         step = int(self.completed_steps)
-        eval_only = bool(self.config.trainer.get("eval_only", False))
         source_training_config_evidence = None
         if eval_only:
             source_training_config_evidence = getattr(
@@ -4129,6 +4508,7 @@ class VLATrainer(TrainerUtils):
                 "seed": int(self.config.get("seed", 0)),
                 "config_path": config_identity_path,
                 "config_sha256": config_sha256,
+                "resolved_training_schedule": resolved_schedule_evidence,
                 "source_training_config": source_training_config_evidence,
             },
             "sampling_reports": sampling_reports,
@@ -4152,24 +4532,17 @@ class VLATrainer(TrainerUtils):
         artifact_dir = output_dir / "heldout_eval_metrics"
         artifact_dir.mkdir(parents=True, exist_ok=True)
         artifact_path = artifact_dir / f"step_{step:08d}.json"
-        temporary_path = artifact_dir / (
-            f".{artifact_path.name}.tmp-{os.getpid()}-{threading.get_ident()}"
-        )
-        try:
-            with temporary_path.open("w", encoding="utf-8") as handle:
-                json.dump(payload, handle, indent=2, sort_keys=True, allow_nan=False)
-                handle.write("\n")
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temporary_path, artifact_path)
-            directory_fd = os.open(artifact_dir, os.O_RDONLY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
-        finally:
-            if temporary_path.exists():
-                temporary_path.unlink()
+        serialized_payload = (
+            json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n"
+        ).encode("utf-8")
+        if artifact_path.is_file():
+            if artifact_path.read_bytes() != serialized_payload:
+                raise RuntimeError(
+                    "Heldout evaluation evidence is immutable and a different "
+                    f"payload already exists for step {step}: {artifact_path}"
+                )
+        else:
+            _atomic_write_bytes(artifact_path, serialized_payload)
         _make_artifact_tree_host_readable(artifact_dir)
         return artifact_path
 
@@ -4745,11 +5118,22 @@ def main(cfg) -> None:
             optimizer = None
             lr_scheduler = None
         else:
-            resolve_training_schedule(
+            resolved_training_schedule = resolve_training_schedule(
                 cfg=cfg,
                 vla_train_dataloader=vla_train_dataloader,
                 num_processes=accelerator.num_processes,
             )
+            if accelerator.is_main_process:
+                persist_resolved_training_schedule(
+                    cfg,
+                    resolved_training_schedule,
+                )
+                if bool(cfg.trainer.get("is_resume", False)):
+                    _persist_pending_resume_invocation_snapshot(
+                        Path(str(cfg.output_dir)).expanduser().resolve(),
+                        cfg,
+                    )
+            distributed_wait(accelerator)
             optimizer, lr_scheduler = setup_optimizer_and_scheduler(
                 model=vla, cfg=cfg
             )

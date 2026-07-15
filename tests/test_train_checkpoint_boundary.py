@@ -42,6 +42,8 @@ def _loop_trainer(
     eval_before_train=False,
     eval_error=None,
     force_requests=(),
+    completed_steps=0,
+    interrupt_at_completed_steps=None,
 ):
     trainer = object.__new__(VLATrainer)
     trainer.config = OmegaConf.create(
@@ -60,7 +62,7 @@ def _loop_trainer(
     )
     trainer.accelerator = _Accelerator()
     trainer.optimizer = _Optimizer()
-    trainer.completed_steps = 0
+    trainer.completed_steps = completed_steps
     trainer.vla_eval_dataloader = object()
     trainer.total_batch_size = 1
     trainer.progress_eta_warmup_steps = 10_000
@@ -77,6 +79,9 @@ def _loop_trainer(
     trainer._get_next_batch = lambda: object()
 
     def train_step(_batch):
+        if trainer.completed_steps == interrupt_at_completed_steps:
+            events.append(("interrupt", trainer.completed_steps))
+            raise KeyboardInterrupt
         if not remaining_sync:
             raise AssertionError("test exhausted its sync_gradients sequence")
         trainer.accelerator.sync_gradients = remaining_sync.popleft()
@@ -238,3 +243,52 @@ def test_baseline_eval_failure_happens_before_training_or_checkpointing():
 
     assert trainer.completed_steps == 0
     assert events == [("eval", 0)]
+
+
+def test_lifecycle_resume_keeps_five_step_cadence_without_repeating_step_ten_eval():
+    fresh, fresh_events = _loop_trainer(
+        sync_sequence=[True] * 12,
+        max_train_steps=15,
+        eval_interval=5,
+        save_interval=5,
+        eval_before_train=True,
+        interrupt_at_completed_steps=12,
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        fresh.train()
+
+    assert fresh.completed_steps == 12
+    assert ("interrupt", 12) in fresh_events
+    assert [event for event in fresh_events if event[0] == "save"] == [
+        ("save", 5),
+        ("save", 10),
+    ]
+    assert [event for event in fresh_events if event[0] == "eval"] == [
+        ("eval", 0),
+        ("eval", 5),
+        ("eval", 10),
+    ]
+    assert fresh_events.index(("save", 5)) < fresh_events.index(("eval", 5))
+    assert fresh_events.index(("save", 10)) < fresh_events.index(("eval", 10))
+
+    resumed, resumed_events = _loop_trainer(
+        sync_sequence=[True] * 5,
+        completed_steps=10,
+        max_train_steps=15,
+        eval_interval=5,
+        save_interval=5,
+        eval_before_train=True,
+    )
+
+    resumed.train()
+
+    assert [event for event in resumed_events if event[0] == "save"] == [
+        ("save", 15)
+    ]
+    assert [event for event in resumed_events if event[0] == "eval"] == [
+        ("eval", 15)
+    ]
+    assert resumed_events.index(("save", 15)) < resumed_events.index(
+        ("eval", 15)
+    )
