@@ -130,6 +130,12 @@ CHECKPOINT_HANDOFF_SMOKE_CONTRACT = {
     "expected_global_batch_rows": 128,
     "expected_optimizer_steps": 1,
 }
+PRODUCTION_HANDOFF_VALIDATION_CONTRACT = {
+    "schema": "realman-production-handoff-validation-stage-v1",
+    "scope": "checkpoint_handoff_only",
+    "model_quality_claim_allowed": False,
+    "production_frozen_view_required": True,
+}
 
 
 class PlanError(RuntimeError):
@@ -159,11 +165,32 @@ def _git_remote_identity(url: str) -> str:
     return normalized
 
 
-def _is_checkpoint_handoff_smoke(payload: Mapping[str, Any]) -> bool:
-    contract = payload.get("checkpoint_handoff_smoke")
+def _is_checkpoint_handoff_validation(
+    payload: Mapping[str, Any],
+) -> bool:
+    smoke = payload.get("checkpoint_handoff_smoke")
+    if (
+        isinstance(smoke, Mapping)
+        and dict(smoke) == CHECKPOINT_HANDOFF_SMOKE_CONTRACT
+    ):
+        return True
+    production = payload.get("production_handoff_validation")
+    if not isinstance(production, Mapping):
+        return False
+    expected_steps = production.get("expected_optimizer_steps")
+    if (
+        isinstance(expected_steps, bool)
+        or not isinstance(expected_steps, int)
+        or expected_steps <= 0
+    ):
+        return False
+    required = {
+        **PRODUCTION_HANDOFF_VALIDATION_CONTRACT,
+        "expected_optimizer_steps": expected_steps,
+    }
     return (
-        isinstance(contract, Mapping)
-        and dict(contract) == CHECKPOINT_HANDOFF_SMOKE_CONTRACT
+        dict(production) == required
+        and _get(payload, "trainer.max_train_steps") == expected_steps
     )
 
 
@@ -2181,12 +2208,12 @@ def _validate_realman_manifest(
         for key, value in expected_derivation.items()
         if derivation.get(key) != value
     }
-    if _is_checkpoint_handoff_smoke(payload):
-        # A handoff smoke makes no model-quality claim and does not rebuild or
-        # reselect the frozen holdout. Permit only the provenance launcher's
-        # byte hash to drift as human-launch plumbing evolves; the exact
-        # selection contract, episode/window allocation, manifest bytes,
-        # statistics, and source-view bindings remain mandatory below.
+    if _is_checkpoint_handoff_validation(payload):
+        # A handoff-only validation makes no model-quality claim and does not
+        # rebuild or reselect the frozen holdout. Permit only the provenance
+        # launcher's byte hash to drift as human-launch plumbing evolves; the
+        # exact selection contract, episode/window allocation, manifest
+        # bytes, statistics, and source-view bindings remain mandatory below.
         mismatches.pop("launcher_sha256", None)
     if mismatches:
         raise PlanError(
