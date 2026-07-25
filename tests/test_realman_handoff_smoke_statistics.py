@@ -19,18 +19,22 @@ from starVLA.dataloader import dataset_view
 
 def _write_parent(tmp_path: Path) -> dataset_view.FrozenDatasetViewBuild:
     catalog_sha256 = "a" * 64
-    content = dataset_view.make_episode_content_id(
-        frame_content_sha256="b" * 64,
-        length=256,
-        content_contract="handoff-smoke-fixture-v1",
-    )
-    lineage = dataset_view.make_episode_lineage_id(
-        backend="lerobot",
-        source_id="fixture",
-        catalog_sha256=catalog_sha256,
-        episode_index=7,
-        length=256,
-    )
+    episode_identities = {}
+    for episode_index, frame_digest in ((7, "b" * 64), (8, "e" * 64)):
+        episode_identities[episode_index] = {
+            "content": dataset_view.make_episode_content_id(
+                frame_content_sha256=frame_digest,
+                length=256,
+                content_contract="handoff-smoke-fixture-v1",
+            ),
+            "lineage": dataset_view.make_episode_lineage_id(
+                backend="lerobot",
+                source_id="fixture",
+                catalog_sha256=catalog_sha256,
+                episode_index=episode_index,
+                length=256,
+            ),
+        }
     contract_sha256 = REALMAN_18D_ACTION_CONTRACT.sha256()
     descriptor = {
         "view_name": "handoff_smoke_parent_fixture",
@@ -44,6 +48,18 @@ def _write_parent(tmp_path: Path) -> dataset_view.FrozenDatasetViewBuild:
                 "catalog_sha256": catalog_sha256,
                 "annotation_sha256": "c" * 64,
                 "source_content_sha256": "d" * 64,
+                "selected_data_shards": [
+                    {
+                        "path": "data/chunk-001/file-000.parquet",
+                        "sha256": "1" * 64,
+                        "size_bytes": 101,
+                    },
+                    {
+                        "path": "data/chunk-002/file-000.parquet",
+                        "sha256": "2" * 64,
+                        "size_bytes": 202,
+                    },
+                ],
             }
         ],
         "representation": {
@@ -68,29 +84,36 @@ def _write_parent(tmp_path: Path) -> dataset_view.FrozenDatasetViewBuild:
         },
         "usage_contract": {"training_allowed": True},
     }
-    rows = [
-        {
-            "backend": "lerobot",
-            "source_id": "fixture",
-            "episode_index": 7,
-            "episode_length": 256,
-            "base_index": base_index,
-            "horizon": 50,
-            "target_fps": 20,
-            "end_clamp_policy": "repeat_last",
-            "episode_lineage_id": lineage,
-            "episode_content_id": content,
-            "sample_id": dataset_view.make_sample_id(
-                episode_content_id=content,
-                base_index=base_index,
-                horizon=50,
-                target_fps=20,
-                representation_contract_sha256=contract_sha256,
-                end_clamp=True,
-            ),
-        }
-        for base_index in range(160)
-    ]
+    rows = []
+    for episode_index, count, data_file in (
+        (7, 128, "data/chunk-001/file-000.parquet"),
+        (8, 32, "data/chunk-002/file-000.parquet"),
+    ):
+        identity = episode_identities[episode_index]
+        for base_index in range(count):
+            rows.append(
+                {
+                    "backend": "lerobot",
+                    "source_id": "fixture",
+                    "episode_index": episode_index,
+                    "episode_length": 256,
+                    "base_index": base_index,
+                    "horizon": 50,
+                    "target_fps": 20,
+                    "end_clamp_policy": "repeat_last",
+                    "data_file": data_file,
+                    "episode_lineage_id": identity["lineage"],
+                    "episode_content_id": identity["content"],
+                    "sample_id": dataset_view.make_sample_id(
+                        episode_content_id=identity["content"],
+                        base_index=base_index,
+                        horizon=50,
+                        target_fps=20,
+                        representation_contract_sha256=contract_sha256,
+                        end_clamp=True,
+                    ),
+                }
+            )
     return dataset_view.write_frozen_view(
         tmp_path / "parent.json",
         descriptor=descriptor,
@@ -111,6 +134,12 @@ def test_smoke_parent_is_rederived_not_just_hash_copied(tmp_path: Path):
     authenticated = smoke_stats._authenticate_smoke_parent(smoke)
     assert authenticated.manifest_sha256 == parent.manifest_sha256
     assert built.row_count == 128
+    assert [
+        binding["path"]
+        for binding in smoke.descriptor["sources"][0][
+            "selected_data_shards"
+        ]
+    ] == ["data/chunk-001/file-000.parquet"]
 
     payload = json.loads(smoke_path.read_text(encoding="utf-8"))
     payload["selection"]["parent_manifest_sha256"] = "f" * 64
@@ -119,6 +148,34 @@ def test_smoke_parent_is_rederived_not_just_hash_copied(tmp_path: Path):
     mutated = dataset_view.load_frozen_view(smoke_path)
     with pytest.raises(ValueError, match="parent manifest SHA-256 mismatch"):
         smoke_stats._authenticate_smoke_parent(mutated)
+
+
+def test_frozen_view_rejects_overbroad_lerobot_shard_commitment(
+    tmp_path: Path,
+):
+    parent = _write_parent(tmp_path)
+    smoke_path = tmp_path / "smoke.json"
+    build_realman_handoff_smoke_view.build_handoff_smoke_view(
+        parent_manifest=parent.manifest_path,
+        output_manifest=smoke_path,
+        logical_rows=128,
+    )
+    payload = json.loads(smoke_path.read_text(encoding="utf-8"))
+    payload["sources"][0]["selected_data_shards"].append(
+        {
+            "path": "data/chunk-002/file-000.parquet",
+            "sha256": "2" * 64,
+            "size_bytes": 202,
+        }
+    )
+    payload["view_id"] = dataset_view.descriptor_view_id(payload)
+    smoke_path.write_bytes(dataset_view.canonical_json_bytes(payload) + b"\n")
+
+    with pytest.raises(
+        ValueError,
+        match="selected_data_shards do not exactly cover ledger",
+    ):
+        dataset_view.load_frozen_view(smoke_path)
 
 
 def test_population_is_marked_handoff_only_for_exact_source_order(

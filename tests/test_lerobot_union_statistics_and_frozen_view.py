@@ -287,6 +287,7 @@ def _write_frozen_view(
                 "source_id": source_id,
                 "episode_index": 0,
                 "episode_length": 3,
+                "data_file": "data/chunk-000/file-000.parquet",
                 "base_index": base_index,
                 "end_index": end_index,
                 "horizon": horizon,

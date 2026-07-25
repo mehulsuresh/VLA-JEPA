@@ -827,10 +827,18 @@ def _validate_training_contract(
         raise PlanError(
             "trainer.checkpoint_eval_milestones_only must be a boolean"
         )
-    if milestone_only and milestone_fractions is None:
+    if (
+        milestone_only
+        and milestone_fractions is None
+        and not (
+            isinstance(milestone_steps, list)
+            and bool(milestone_steps)
+        )
+    ):
         raise PlanError(
             "trainer.checkpoint_eval_milestones_only=true requires "
-            "config-owned checkpoint_eval_milestone_fractions"
+            "config-owned checkpoint_eval_milestone_fractions or an "
+            "explicit non-empty checkpoint_eval_milestone_steps list"
         )
 
     pretrained_checkpoint = trainer.get("pretrained_checkpoint", None)

@@ -100,6 +100,57 @@ def _range_prefix(
     return selected
 
 
+def _exact_selected_sources(
+    *,
+    parent_sources: Sequence[Mapping[str, Any]],
+    selected: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Copy referenced sources while narrowing LeRobot shard commitments."""
+
+    referenced_sources = {str(row["source_id"]) for row in selected}
+    rows_by_source: dict[str, list[Mapping[str, Any]]] = {}
+    for row in selected:
+        rows_by_source.setdefault(str(row["source_id"]), []).append(row)
+    result: list[dict[str, Any]] = []
+    for raw_source in parent_sources:
+        source_id = str(raw_source["source_id"])
+        if source_id not in referenced_sources:
+            continue
+        source = deepcopy(dict(raw_source))
+        if source.get("backend") == "lerobot":
+            bindings = source.get("selected_data_shards")
+            if not isinstance(bindings, list) or not bindings:
+                raise ValueError(
+                    f"LeRobot parent source {source_id!r} must bind "
+                    "selected_data_shards."
+                )
+            by_path = {str(binding["path"]): binding for binding in bindings}
+            selected_paths: set[str] = set()
+            for row in rows_by_source[source_id]:
+                data_file = row.get("data_file")
+                if not isinstance(data_file, str) or not data_file:
+                    raise ValueError(
+                        f"Selected LeRobot row for {source_id!r} lacks "
+                        "data_file shard identity."
+                    )
+                selected_paths.add(data_file)
+            missing = selected_paths - set(by_path)
+            if missing:
+                raise ValueError(
+                    f"Selected LeRobot rows for {source_id!r} reference "
+                    "shards absent from the authenticated parent: "
+                    f"{sorted(missing)}."
+                )
+            source["selected_data_shards"] = [
+                deepcopy(dict(by_path[path]))
+                for path in sorted(selected_paths)
+            ]
+        result.append(source)
+    if {str(source["source_id"]) for source in result} != referenced_sources:
+        raise ValueError("Selected rows reference a source absent from parent.")
+    return result
+
+
 def _descriptor(
     parent: dataset_view.FrozenDatasetView,
     *,
@@ -107,14 +158,11 @@ def _descriptor(
     logical_rows: int,
 ) -> dict[str, Any]:
     descriptor = parent.descriptor
+    sources = _exact_selected_sources(
+        parent_sources=descriptor["sources"],
+        selected=selected,
+    )
     referenced_sources = {str(row["source_id"]) for row in selected}
-    sources = [
-        deepcopy(source)
-        for source in descriptor["sources"]
-        if str(source["source_id"]) in referenced_sources
-    ]
-    if {str(source["source_id"]) for source in sources} != referenced_sources:
-        raise ValueError("Selected rows reference a source absent from parent.")
     episode_indices = sorted(
         {int(row["episode_index"]) for row in selected}
     )

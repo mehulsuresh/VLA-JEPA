@@ -1,0 +1,24 @@
+# Production-data checkpoint handoff validation only.
+#
+# The complete HQ production view remains the loader population.  Training
+# intentionally stops after ten optimizer steps solely to validate an
+# authenticated Stage B -> Stage C model-only handoff.
+extends:
+  - ../hq_finetune_v1.yaml
+
+run_id: robot_ft_magna_hq_handoff10_18d_delta_h100x8_b16
+
+production_handoff_validation:
+  schema: realman-production-handoff-validation-stage-v1
+  scope: checkpoint_handoff_only
+  model_quality_claim_allowed: false
+  production_frozen_view_required: true
+  expected_optimizer_steps: 10
+
+trainer:
+  max_train_steps: 10
+  eval_before_train: false
+  checkpoint_eval_milestone_fractions: null
+  checkpoint_eval_milestone_steps: [10]
+  checkpoint_eval_include_full_epoch_boundaries: false
+  checkpoint_eval_milestones_only: true

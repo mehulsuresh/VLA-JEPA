@@ -471,6 +471,75 @@ def _validate_source(source: Any, *, index: int) -> None:
             )
 
 
+def _validate_selected_data_shard_coverage(
+    *,
+    sources: Sequence[Mapping[str, Any]],
+    referenced_paths: Mapping[str, set[str]],
+    context: str,
+) -> None:
+    """Require LeRobot shard bindings to equal the ledger's shard references.
+
+    ``selected_data_shards`` is a byte-level commitment to the parquet files
+    that can contribute rows to a frozen view.  A derived view must therefore
+    narrow a production parent's bindings when its selected rows touch fewer
+    shards.  Accepting a superset weakens provenance and also disagrees with
+    the training loader's exact selected-episode verification.
+    """
+
+    for source in sources:
+        if source.get("backend") != "lerobot":
+            continue
+        raw_bindings = source.get("selected_data_shards")
+        if raw_bindings is None:
+            continue
+        source_id = str(source["source_id"])
+        bound_paths = {
+            str(binding["path"])
+            for binding in raw_bindings
+        }
+        expected_paths = referenced_paths.get(source_id, set())
+        if bound_paths != expected_paths:
+            raise ValueError(
+                f"{context} source {source_id!r} selected_data_shards do not "
+                "exactly cover ledger data_file paths: "
+                f"expected {sorted(expected_paths)}, "
+                f"found {sorted(bound_paths)}."
+            )
+
+
+def _record_selected_data_shard_reference(
+    *,
+    row: Mapping[str, Any],
+    source_backends: Mapping[str, str],
+    sources_with_bindings: frozenset[str],
+    referenced_paths: dict[str, set[str]],
+    context: str,
+) -> None:
+    source_id = str(row["source_id"])
+    if (
+        source_backends[source_id] != "lerobot"
+        or source_id not in sources_with_bindings
+    ):
+        return
+    raw_path = row.get("data_file")
+    if not isinstance(raw_path, str) or not raw_path:
+        raise ValueError(
+            f"{context}.data_file must identify the selected LeRobot "
+            "parquet shard when selected_data_shards is present."
+        )
+    parsed = Path(raw_path)
+    if (
+        parsed.is_absolute()
+        or parsed.as_posix() != raw_path
+        or ".." in parsed.parts
+        or "." in parsed.parts
+    ):
+        raise ValueError(
+            f"{context}.data_file must be a normalized relative POSIX path."
+        )
+    referenced_paths.setdefault(source_id, set()).add(raw_path)
+
+
 def _validate_descriptor(payload: Any, *, require_rows: bool) -> None:
     if not isinstance(payload, Mapping):
         raise ValueError("Dataset-view descriptor must be a JSON object.")
@@ -969,6 +1038,12 @@ def load_frozen_view(
             str(source["source_id"]): str(source["backend"])
             for source in payload["sources"]
         }
+        sources_with_shard_bindings = frozenset(
+            str(source["source_id"])
+            for source in payload["sources"]
+            if source.get("selected_data_shards") is not None
+        )
+        referenced_data_shards: dict[str, set[str]] = {}
         excluded_lineages, excluded_contents = _validate_holdout(
             payload["holdout_exclusions"]
         )
@@ -1011,6 +1086,13 @@ def load_frozen_view(
                         source_backends=source_backends,
                         representation=payload["representation"],
                     )
+                _record_selected_data_shard_reference(
+                    row=row,
+                    source_backends=source_backends,
+                    sources_with_bindings=sources_with_shard_bindings,
+                    referenced_paths=referenced_data_shards,
+                    context=f"Ledger row {ordinal}",
+                )
                 _validate_ledger_holdout_membership(
                     row,
                     descriptor_purpose=payload.get("purpose"),
@@ -1078,6 +1160,11 @@ def load_frozen_view(
                     f"Dataset-view {key} mismatch: expected "
                     f"{expected_rows[key]}, found {value}."
                 )
+        _validate_selected_data_shard_coverage(
+            sources=payload["sources"],
+            referenced_paths=referenced_data_shards,
+            context="Dataset-view ledger",
+        )
 
     return FrozenDatasetView(
         manifest_path=manifest,

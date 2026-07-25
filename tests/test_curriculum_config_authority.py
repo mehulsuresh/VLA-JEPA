@@ -27,6 +27,17 @@ SMOKE_STAGE_CONFIGS = (
     / "scripts/config/h100/realman_curriculum/handoff_smoke/"
     "hq_one_step_v1.yaml",
 )
+PRODUCTION_HANDOFF_STAGE_CONFIGS = (
+    REPO_ROOT
+    / "scripts/config/h100/realman_curriculum/handoff_validation/"
+    "realsource_ten_steps_v1.yaml",
+    REPO_ROOT
+    / "scripts/config/h100/realman_curriculum/handoff_validation/"
+    "intervention_ten_steps_v1.yaml",
+    REPO_ROOT
+    / "scripts/config/h100/realman_curriculum/handoff_validation/"
+    "hq_ten_steps_v1.yaml",
+)
 
 
 def _sha256(path: Path) -> str:
@@ -65,6 +76,30 @@ def test_handoff_smoke_source_yaml_owns_exact_one_step_schedule(
     assert payload["trainer"]["warmup_ratio"] == 0.0
     assert payload["trainer"]["checkpoint_eval_milestone_steps"] == [1]
     assert payload["trainer"]["checkpoint_eval_milestones_only"] is True
+
+
+@pytest.mark.parametrize("config_path", PRODUCTION_HANDOFF_STAGE_CONFIGS)
+def test_production_handoff_source_yaml_owns_exact_ten_step_schedule(
+    config_path: Path,
+):
+    _, payload = h100_training._load_config(config_path)
+
+    assert payload["trainer"]["max_train_steps"] == 10
+    assert payload["trainer"]["eval_before_train"] is False
+    assert payload["trainer"]["checkpoint_eval_milestone_fractions"] is None
+    assert payload["trainer"]["checkpoint_eval_milestone_steps"] == [10]
+    assert (
+        payload["trainer"]["checkpoint_eval_include_full_epoch_boundaries"]
+        is False
+    )
+    assert payload["trainer"]["checkpoint_eval_milestones_only"] is True
+    assert payload["production_handoff_validation"] == {
+        "schema": "realman-production-handoff-validation-stage-v1",
+        "scope": "checkpoint_handoff_only",
+        "model_quality_claim_allowed": False,
+        "production_frozen_view_required": True,
+        "expected_optimizer_steps": 10,
+    }
 
 
 def test_stage_materialization_changes_only_runtime_identity_and_handoff(

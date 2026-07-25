@@ -154,10 +154,11 @@ if missing:
 if workflow_kind not in {
     "production_curriculum",
     "checkpoint_handoff_smoke",
+    "production_handoff_validation",
 }:
     raise SystemExit(
         "workflow_kind must be explicitly set to production_curriculum "
-        "or checkpoint_handoff_smoke"
+        "checkpoint_handoff_smoke, or production_handoff_validation"
     )
 stage = Path(values["stage_config"]).expanduser()
 if not stage.is_absolute():

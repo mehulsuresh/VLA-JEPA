@@ -30,6 +30,7 @@ from omegaconf import DictConfig, OmegaConf
 from starVLA.action_representation import (
     load_openpi_realman_union_statistics,
 )
+from starVLA.dataloader import dataset_view
 
 try:
     import h100_training
@@ -48,7 +49,11 @@ APPROVED_ROLE_SEQUENCES = {
 NATURAL_FINAL_HANDOFF = "natural_final"
 PRODUCTION_CURRICULUM = "production_curriculum"
 CHECKPOINT_HANDOFF_SMOKE = "checkpoint_handoff_smoke"
+PRODUCTION_HANDOFF_VALIDATION = "production_handoff_validation"
 HANDOFF_SMOKE_STAGE_SCHEMA = "realman-checkpoint-handoff-smoke-stage-v1"
+PRODUCTION_HANDOFF_STAGE_SCHEMA = (
+    "realman-production-handoff-validation-stage-v1"
+)
 CURRICULUM_RESUME_POLICY = "newest_complete_full_state_same_stage"
 SEMANTIC_ENVIRONMENT_OVERRIDES = (
     h100_training.AUTHORITATIVE_SEMANTIC_ENV_VARS
@@ -478,9 +483,16 @@ def _validate_exhaustive_view(
             f"{stage_id} frozen train-view SHA mismatch: "
             f"{actual_view_sha} != {expected_manifest_sha256}"
         )
-    view = json.loads(view_path.read_text(encoding="utf-8"))
-    if not isinstance(view, Mapping):
-        raise CurriculumError(f"{stage_id} frozen train view must be an object")
+    try:
+        frozen = dataset_view.load_frozen_view(
+            view_path,
+            verify_ledger=True,
+        )
+    except (OSError, ValueError) as exc:
+        raise CurriculumError(
+            f"{stage_id} frozen train view is invalid: {exc}"
+        ) from exc
+    view = frozen.descriptor
     epoch_contract = _require_mapping(
         view.get("epoch_contract"),
         field=f"{stage_id}.frozen_view.epoch_contract",
@@ -1181,11 +1193,25 @@ def _validate_source_stage(
         stage_payload,
         "trainer.max_train_steps",
     )
+    validation_optimizer_steps: int | None = None
     if workflow_kind == CHECKPOINT_HANDOFF_SMOKE:
         if configured_max_train_steps != 1:
             raise CurriculumError(
                 f"{stage_id} checkpoint-handoff smoke must explicitly set "
                 "trainer.max_train_steps=1"
+            )
+    elif workflow_kind == PRODUCTION_HANDOFF_VALIDATION:
+        validation_optimizer_steps = _require_int(
+            stage.get("expected_optimizer_steps"),
+            field=f"{prefix}.expected_optimizer_steps",
+            minimum=1,
+        )
+        if configured_max_train_steps != validation_optimizer_steps:
+            raise CurriculumError(
+                f"{stage_id} production-handoff validation must explicitly "
+                "set trainer.max_train_steps equal to "
+                f"stages[].expected_optimizer_steps="
+                f"{validation_optimizer_steps}"
             )
     elif configured_max_train_steps != "auto":
         raise CurriculumError(
@@ -1261,18 +1287,16 @@ def _validate_source_stage(
     eval_before_train = _nested(
         stage_payload, "trainer.eval_before_train"
     )
-    expected_eval_before_train = (
-        workflow_kind != CHECKPOINT_HANDOFF_SMOKE
-    )
+    expected_eval_before_train = workflow_kind == PRODUCTION_CURRICULUM
     if eval_before_train is not expected_eval_before_train:
         if expected_eval_before_train:
             raise CurriculumError(
                 f"{stage_id} must evaluate the frozen holdout before training"
             )
         raise CurriculumError(
-            f"{stage_id} checkpoint-handoff smoke must set "
-            "trainer.eval_before_train=false; this workflow validates only "
-            "the natural-final A→B→C checkpoint transfer"
+            f"{stage_id} handoff validation must set "
+            "trainer.eval_before_train=false; this workflow validates the "
+            "natural-final A→B→C checkpoint transfer, not model quality"
         )
     if _nested(stage_payload, "trainer.allow_training_stream_eval") is not False:
         raise CurriculumError(
@@ -1394,6 +1418,28 @@ def _validate_source_stage(
                 f"{stage_id} checkpoint_handoff_smoke contract must be "
                 f"exactly {expected_smoke_contract}"
             )
+    elif workflow_kind == PRODUCTION_HANDOFF_VALIDATION:
+        if view_purpose == CHECKPOINT_HANDOFF_SMOKE:
+            raise CurriculumError(
+                f"{stage_id} production-handoff validation must consume the "
+                "real production frozen view, not a derived smoke view"
+            )
+        validation_contract = _require_mapping(
+            stage_payload.get("production_handoff_validation"),
+            field=f"{stage_id}.production_handoff_validation",
+        )
+        expected_validation_contract = {
+            "schema": PRODUCTION_HANDOFF_STAGE_SCHEMA,
+            "scope": "checkpoint_handoff_only",
+            "model_quality_claim_allowed": False,
+            "production_frozen_view_required": True,
+            "expected_optimizer_steps": validation_optimizer_steps,
+        }
+        if dict(validation_contract) != expected_validation_contract:
+            raise CurriculumError(
+                f"{stage_id} production_handoff_validation contract must be "
+                f"exactly {expected_validation_contract}"
+            )
     elif view_purpose == CHECKPOINT_HANDOFF_SMOKE:
         raise CurriculumError(
             f"{stage_id} production curriculum cannot consume a "
@@ -1475,92 +1521,132 @@ def _validate_source_stage(
         stage.get("monitoring"),
         field=f"{prefix}.monitoring",
     )
-    raw_fractions = monitoring.get("first_epoch_exposure_fractions")
-    if not isinstance(raw_fractions, Sequence) or isinstance(
-        raw_fractions, (str, bytes)
-    ):
-        raise CurriculumError(
-            f"{prefix}.monitoring.first_epoch_exposure_fractions must be a list"
-        )
-    fractions: list[float] = []
-    for fraction in raw_fractions:
-        if isinstance(fraction, bool) or not isinstance(fraction, (int, float)):
-            raise CurriculumError(
-                f"{prefix}.monitoring exposure fractions must be numeric"
-            )
-        value = float(fraction)
-        if not math.isfinite(value) or value <= 0.0 or value > 1.0:
-            raise CurriculumError(
-                f"{prefix}.monitoring exposure fractions must be in (0, 1]"
-            )
-        fractions.append(value)
-    if fractions != sorted(set(fractions)) or not fractions or fractions[-1] != 1.0:
-        raise CurriculumError(
-            f"{prefix}.monitoring exposure fractions must be sorted, unique, "
-            "and end at 1.0"
-        )
-    if monitoring.get("full_epoch_required") is not True:
-        raise CurriculumError(
-            f"{prefix}.monitoring.full_epoch_required must be true"
-        )
-    if monitoring.get("partial_pass_is_epoch") is not False:
-        raise CurriculumError(
-            f"{prefix}.monitoring.partial_pass_is_epoch must be false"
-        )
     configured_fractions = _optional_nested(
         stage_payload,
         "trainer.checkpoint_eval_milestone_fractions",
     )
-    if configured_fractions != raw_fractions:
-        raise CurriculumError(
-            f"{stage_id} trainer.checkpoint_eval_milestone_fractions must "
-            "exactly match curriculum monitoring fractions"
-        )
     include_full_epoch_boundaries = _optional_nested(
         stage_payload,
         "trainer.checkpoint_eval_include_full_epoch_boundaries",
         False,
     )
-    if include_full_epoch_boundaries is not True:
-        raise CurriculumError(
-            f"{stage_id} must set "
-            "trainer.checkpoint_eval_include_full_epoch_boundaries=true"
-        )
-    first_epoch_checkpoints = sorted(
-        {
-            min(
-                steps_per_epoch,
-                max(1, math.ceil(steps_per_epoch * fraction)),
-            )
-            for fraction in fractions
-        }
-    )
-    full_epoch_boundaries = [
-        steps_per_epoch * epoch
-        for epoch in range(1, expected_epochs + 1)
-    ]
-    checkpoint_eval_milestone_steps = sorted(
-        set(first_epoch_checkpoints) | set(full_epoch_boundaries)
-    )
     configured_milestone_steps = _optional_nested(
         stage_payload,
         "trainer.checkpoint_eval_milestone_steps",
     )
-    if workflow_kind == CHECKPOINT_HANDOFF_SMOKE:
+    if workflow_kind == PRODUCTION_HANDOFF_VALIDATION:
+        expected_monitoring = {
+            "checkpoint_steps": [validation_optimizer_steps],
+            "full_epoch_required": False,
+            "partial_pass_is_epoch": False,
+        }
+        if dict(monitoring) != expected_monitoring:
+            raise CurriculumError(
+                f"{prefix}.monitoring must be exactly "
+                f"{expected_monitoring} for production-handoff validation"
+            )
+        if configured_fractions not in (None, []):
+            raise CurriculumError(
+                f"{stage_id} production-handoff validation must disable "
+                "fractional/full-epoch evaluation milestones"
+            )
+        if include_full_epoch_boundaries is not False:
+            raise CurriculumError(
+                f"{stage_id} production-handoff validation must set "
+                "checkpoint_eval_include_full_epoch_boundaries=false"
+            )
+        checkpoint_eval_milestone_steps = [validation_optimizer_steps]
         if configured_milestone_steps != checkpoint_eval_milestone_steps:
             raise CurriculumError(
-                f"{stage_id} checkpoint-handoff smoke must explicitly own "
-                "its exact trainer.checkpoint_eval_milestone_steps; expected "
-                f"{checkpoint_eval_milestone_steps}, got "
-                f"{configured_milestone_steps!r}"
+                f"{stage_id} production-handoff validation must explicitly "
+                "own checkpoint_eval_milestone_steps="
+                f"{checkpoint_eval_milestone_steps}"
             )
-    elif configured_milestone_steps != "auto":
-        raise CurriculumError(
-            f"{stage_id} production stage must set "
-            "trainer.checkpoint_eval_milestone_steps=auto; the trainer, not "
-            "the curriculum launcher, resolves the YAML-owned fractions and "
-            "full-epoch-boundary policy"
+        fractions: list[float] = []
+        first_epoch_checkpoints: list[int] = []
+        full_epoch_boundaries: list[int] = []
+    else:
+        raw_fractions = monitoring.get("first_epoch_exposure_fractions")
+        if not isinstance(raw_fractions, Sequence) or isinstance(
+            raw_fractions, (str, bytes)
+        ):
+            raise CurriculumError(
+                f"{prefix}.monitoring.first_epoch_exposure_fractions must "
+                "be a list"
+            )
+        fractions = []
+        for fraction in raw_fractions:
+            if isinstance(fraction, bool) or not isinstance(
+                fraction, (int, float)
+            ):
+                raise CurriculumError(
+                    f"{prefix}.monitoring exposure fractions must be numeric"
+                )
+            value = float(fraction)
+            if not math.isfinite(value) or value <= 0.0 or value > 1.0:
+                raise CurriculumError(
+                    f"{prefix}.monitoring exposure fractions must be in "
+                    "(0, 1]"
+                )
+            fractions.append(value)
+        if (
+            fractions != sorted(set(fractions))
+            or not fractions
+            or fractions[-1] != 1.0
+        ):
+            raise CurriculumError(
+                f"{prefix}.monitoring exposure fractions must be sorted, "
+                "unique, and end at 1.0"
+            )
+        if monitoring.get("full_epoch_required") is not True:
+            raise CurriculumError(
+                f"{prefix}.monitoring.full_epoch_required must be true"
+            )
+        if monitoring.get("partial_pass_is_epoch") is not False:
+            raise CurriculumError(
+                f"{prefix}.monitoring.partial_pass_is_epoch must be false"
+            )
+        if configured_fractions != raw_fractions:
+            raise CurriculumError(
+                f"{stage_id} trainer.checkpoint_eval_milestone_fractions must "
+                "exactly match curriculum monitoring fractions"
+            )
+        if include_full_epoch_boundaries is not True:
+            raise CurriculumError(
+                f"{stage_id} must set "
+                "trainer.checkpoint_eval_include_full_epoch_boundaries=true"
+            )
+        first_epoch_checkpoints = sorted(
+            {
+                min(
+                    steps_per_epoch,
+                    max(1, math.ceil(steps_per_epoch * fraction)),
+                )
+                for fraction in fractions
+            }
         )
+        full_epoch_boundaries = [
+            steps_per_epoch * epoch
+            for epoch in range(1, expected_epochs + 1)
+        ]
+        checkpoint_eval_milestone_steps = sorted(
+            set(first_epoch_checkpoints) | set(full_epoch_boundaries)
+        )
+        if workflow_kind == CHECKPOINT_HANDOFF_SMOKE:
+            if configured_milestone_steps != checkpoint_eval_milestone_steps:
+                raise CurriculumError(
+                    f"{stage_id} checkpoint-handoff smoke must explicitly "
+                    "own its exact trainer.checkpoint_eval_milestone_steps; "
+                    f"expected {checkpoint_eval_milestone_steps}, got "
+                    f"{configured_milestone_steps!r}"
+                )
+        elif configured_milestone_steps != "auto":
+            raise CurriculumError(
+                f"{stage_id} production stage must set "
+                "trainer.checkpoint_eval_milestone_steps=auto; the trainer, "
+                "not the curriculum launcher, resolves the YAML-owned "
+                "fractions and full-epoch-boundary policy"
+            )
     model_architecture_sha256 = _model_architecture_sha256(stage_payload)
     return {
         "id": stage_id,
@@ -1581,7 +1667,11 @@ def _validate_source_stage(
         "expected_full_dataset_epochs": expected_epochs,
         "eligible_window_count": int(eligible_windows),
         "steps_per_epoch": steps_per_epoch,
-        "planned_optimizer_steps": steps_per_epoch * expected_epochs,
+        "planned_optimizer_steps": (
+            validation_optimizer_steps
+            if workflow_kind == PRODUCTION_HANDOFF_VALIDATION
+            else steps_per_epoch * expected_epochs
+        ),
         "seed": seed,
         "global_batch_size": global_batch,
         "subtask_prompt_append_probability": float(
@@ -1637,10 +1727,12 @@ def resolve_curriculum(
     if workflow_kind not in {
         PRODUCTION_CURRICULUM,
         CHECKPOINT_HANDOFF_SMOKE,
+        PRODUCTION_HANDOFF_VALIDATION,
     }:
         raise CurriculumError(
-            "workflow_kind must be production_curriculum or "
-            "checkpoint_handoff_smoke"
+            "workflow_kind must be production_curriculum, "
+            "checkpoint_handoff_smoke, or "
+            "production_handoff_validation"
         )
     state_root = Path(
         _require_string(payload.get("state_root_dir"), field="state_root_dir")
@@ -2623,12 +2715,20 @@ def _materialize_stage_config(
             "local_evaluation_manifest_sha256"
         ],
         "epoch_contract": {
+            "workflow_kind": stage.get(
+                "workflow_kind", PRODUCTION_CURRICULUM
+            ),
             "one_epoch_is_entire_frozen_view": True,
             "eligible_window_count": stage["eligible_window_count"],
             "steps_per_epoch": stage["steps_per_epoch"],
             "expected_full_dataset_epochs": stage[
                 "expected_full_dataset_epochs"
             ],
+            "planned_optimizer_steps": stage.get(
+                "planned_optimizer_steps",
+                int(stage["steps_per_epoch"])
+                * int(stage["expected_full_dataset_epochs"]),
+            ),
             "first_epoch_exposure_fractions": stage[
                 "first_epoch_exposure_fractions"
             ],
@@ -2802,12 +2902,20 @@ def _authenticate_stage_handoff_input(
             "local_evaluation_manifest_sha256"
         ],
         "epoch_contract": {
+            "workflow_kind": stage.get(
+                "workflow_kind", PRODUCTION_CURRICULUM
+            ),
             "one_epoch_is_entire_frozen_view": True,
             "eligible_window_count": stage["eligible_window_count"],
             "steps_per_epoch": stage["steps_per_epoch"],
             "expected_full_dataset_epochs": stage[
                 "expected_full_dataset_epochs"
             ],
+            "planned_optimizer_steps": stage.get(
+                "planned_optimizer_steps",
+                int(stage["steps_per_epoch"])
+                * int(stage["expected_full_dataset_epochs"]),
+            ),
             "first_epoch_exposure_fractions": stage[
                 "first_epoch_exposure_fractions"
             ],
