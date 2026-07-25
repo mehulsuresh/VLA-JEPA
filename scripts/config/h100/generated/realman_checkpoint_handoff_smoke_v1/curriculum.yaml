@@ -15,10 +15,10 @@ shared_contract:
   gripper_action_type: absolute
   state_action_normalization: q01_q99_unclipped
   normalization_statistics_artifact: /data/mehul-vla-jepa/data_contracts/handoff_smoke_openpi_q01q99_v1/openpi_q01q99_unclipped.json
-  normalization_statistics_artifact_sha256: 0257b9309c66ff3be6ba359b00a1d7db8cb5303111460af34f38d84a38191b6c
+  normalization_statistics_artifact_sha256: 5901adc8b7783fb4148ba5aa02e3976ab42ae3bab3593779bc44ade05ca5b493
   action_representation_contract_sha256: 9e1df348fb137c206b42a183892e29ec6247595fffc232bb2d73d94b5f5f91ac
   statistics_holdout_manifest: /data/mehul-vla-jepa/data_contracts/handoff_smoke_openpi_q01q99_v1/holdout.json
-  statistics_holdout_manifest_sha256: d4613f7706eafd63586bd0f7466c6131488033a6bb191853741fe4cdf12c3d99
+  statistics_holdout_manifest_sha256: 4d1d8a30edf21b3ef692dd1c329fb90122a64493e80f4790033607599e603a35
 stages:
 - id: realsource_handoff_smoke
   role: pretrain
@@ -39,7 +39,7 @@ stages:
   config: scripts/config/h100/generated/realman_checkpoint_handoff_smoke_v1/02_intervention_one_step_v1.yaml
   expected_full_dataset_epochs: 1
   require_verified_action_supervision: true
-  local_evaluation_manifest_sha256: 8836ffca045363d04fed2fb491c14cce1973ec5def924acbf750780841b232b1
+  local_evaluation_manifest_sha256: c0f64465eff57ff7e253cbf15bb3c612eb6befa5ce3e81bd12a32f9baa24e72b
   monitoring:
     first_epoch_exposure_fractions:
     - 1.0
@@ -51,7 +51,7 @@ stages:
   handoff_checkpoint: natural_final
   config: scripts/config/h100/generated/realman_checkpoint_handoff_smoke_v1/03_hq_one_step_v1.yaml
   expected_full_dataset_epochs: 1
-  local_evaluation_manifest_sha256: 60c71b84228fbf6a296a39eadbd712efc720a71e24a6dfde2ec4990b5e186389
+  local_evaluation_manifest_sha256: 9730807c0ba8688c6ae525126fdf306cfbadb3d67366392c5f6eefe3399292a2
   monitoring:
     first_epoch_exposure_fractions:
     - 1.0

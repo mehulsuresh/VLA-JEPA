@@ -3,7 +3,6 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
-import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -15,10 +14,13 @@ except ImportError:
     flash_attn_func = None
 
 
-def _should_use_flash_attn(q: torch.Tensor, attn_mask: torch.Tensor | None) -> bool:
-    if os.getenv("STARVLA_ENABLE_FLASH_ATTN_WORLD_MODEL", "0") != "1":
-        return False
-    if os.getenv("STARVLA_DISABLE_FLASH_ATTN_WORLD_MODEL", "0") == "1":
+def _should_use_flash_attn(
+    q: torch.Tensor,
+    attn_mask: torch.Tensor | None,
+    *,
+    enabled: bool,
+) -> bool:
+    if not enabled:
         return False
     if flash_attn_func is None or attn_mask is not None:
         return False
@@ -37,8 +39,13 @@ def _run_attention(
     dropout_p: float,
     is_causal: bool,
     attn_mask: torch.Tensor | None = None,
+    use_flash_attention: bool = False,
 ):
-    if _should_use_flash_attn(q, attn_mask):
+    if _should_use_flash_attn(
+        q,
+        attn_mask,
+        enabled=use_flash_attention,
+    ):
         out = flash_attn_func(
             q.transpose(1, 2).contiguous(),
             k.transpose(1, 2).contiguous(),
@@ -176,6 +183,7 @@ class ACRoPEAttention(nn.Module):
         is_causal=False,
         grid_size=16,
         use_legacy_rope_bug=True,
+        use_flash_attention=False,
     ):
         super().__init__()
         self.num_heads = num_heads
@@ -194,6 +202,7 @@ class ACRoPEAttention(nn.Module):
         self.grid_size = grid_size
         self.is_causal = is_causal
         self.use_legacy_rope_bug = use_legacy_rope_bug
+        self.use_flash_attention = bool(use_flash_attention)
 
     def _get_frame_pos(self, ids, H_patches, W_patches):
         tokens_per_frame = int(H_patches * W_patches)
@@ -311,6 +320,7 @@ class ACRoPEAttention(nn.Module):
                 dropout_p=self.proj_drop_prob,
                 is_causal=self.is_causal,
                 attn_mask=attn_mask,
+                use_flash_attention=self.use_flash_attention,
             )
             attn = None
         else:
@@ -338,6 +348,7 @@ class RoPEAttention(nn.Module):
         grid_size=14,
         is_causal=False,
         use_legacy_rope_bug=True,
+        use_flash_attention=False,
     ):
         super().__init__()
         self.num_heads = num_heads
@@ -356,6 +367,7 @@ class RoPEAttention(nn.Module):
         self.grid_size = grid_size
         self.is_causal = is_causal
         self.use_legacy_rope_bug = use_legacy_rope_bug
+        self.use_flash_attention = bool(use_flash_attention)
 
     def _get_frame_pos(self, ids, H_patches=None, W_patches=None):
         if H_patches is None or W_patches is None:
@@ -441,6 +453,7 @@ class RoPEAttention(nn.Module):
                 dropout_p=self.proj_drop_prob,
                 is_causal=self.is_causal,
                 attn_mask=attn_mask,
+                use_flash_attention=self.use_flash_attention,
             )
             attn = None
         else:
@@ -466,6 +479,7 @@ class Attention(nn.Module):
         proj_drop=0.0,
         use_sdpa=True,
         is_causal=False,
+        use_flash_attention=False,
     ):
         super().__init__()
         self.num_heads = num_heads
@@ -478,6 +492,7 @@ class Attention(nn.Module):
         self.proj_drop = nn.Dropout(proj_drop)
         self.use_sdpa = use_sdpa
         self.is_causal = is_causal
+        self.use_flash_attention = bool(use_flash_attention)
 
     def forward(self, x, mask=None, attn_mask=None):
         B, N, C = x.shape
@@ -492,6 +507,7 @@ class Attention(nn.Module):
                 dropout_p=self.proj_drop_prob,
                 is_causal=self.is_causal,
                 attn_mask=attn_mask,
+                use_flash_attention=self.use_flash_attention,
             )
             attn = None
         else:
@@ -525,6 +541,7 @@ class ACBlock(nn.Module):
         grid_size=16,
         use_rope=False,
         use_legacy_rope_bug=True,
+        use_flash_attention=False,
         **kwargs,
     ):
         super().__init__()
@@ -540,6 +557,7 @@ class ACBlock(nn.Module):
                 is_causal=is_causal,
                 grid_size=grid_size,
                 use_legacy_rope_bug=use_legacy_rope_bug,
+                use_flash_attention=use_flash_attention,
                 proj_drop=drop,
             )
         else:
@@ -551,6 +569,7 @@ class ACBlock(nn.Module):
                 attn_drop=attn_drop,
                 use_sdpa=use_sdpa,
                 is_causal=is_causal,
+                use_flash_attention=use_flash_attention,
                 proj_drop=drop,
             )
 
@@ -595,6 +614,7 @@ class Block(nn.Module):
         grid_size=16,
         use_rope=False,
         use_legacy_rope_bug=True,
+        use_flash_attention=False,
         **kwargs,
     ):
         super().__init__()
@@ -610,6 +630,7 @@ class Block(nn.Module):
                 is_causal=is_causal,
                 grid_size=grid_size,
                 use_legacy_rope_bug=use_legacy_rope_bug,
+                use_flash_attention=use_flash_attention,
                 proj_drop=drop,
             )
         else:
@@ -621,6 +642,7 @@ class Block(nn.Module):
                 attn_drop=attn_drop,
                 use_sdpa=use_sdpa,
                 is_causal=is_causal,
+                use_flash_attention=use_flash_attention,
                 proj_drop=drop,
             )
 
@@ -645,7 +667,14 @@ class Block(nn.Module):
 
 
 class CrossAttention(nn.Module):
-    def __init__(self, dim, num_heads=12, qkv_bias=False, use_sdpa=True):
+    def __init__(
+        self,
+        dim,
+        num_heads=12,
+        qkv_bias=False,
+        use_sdpa=True,
+        use_flash_attention=False,
+    ):
         super().__init__()
         self.num_heads = num_heads
         head_dim = dim // num_heads
@@ -654,6 +683,7 @@ class CrossAttention(nn.Module):
         self.kv = nn.Linear(dim, int(dim * 2), bias=qkv_bias)
         # self.proj = nn.Linear(dim, dim)
         self.use_sdpa = use_sdpa
+        self.use_flash_attention = bool(use_flash_attention)
 
     def forward(self, q, x):
         B, n, C = q.shape
@@ -664,7 +694,15 @@ class CrossAttention(nn.Module):
         k, v = kv[0], kv[1]  # (batch_size, num_heads, seq_len, feature_dim_per_head)
 
         if self.use_sdpa:
-            q = _run_attention(q, k, v, dropout_p=0.0, is_causal=False, attn_mask=None)
+            q = _run_attention(
+                q,
+                k,
+                v,
+                dropout_p=0.0,
+                is_causal=False,
+                attn_mask=None,
+                use_flash_attention=self.use_flash_attention,
+            )
         else:
             xattn = (q @ k.transpose(-2, -1)) * self.scale
             xattn = xattn.softmax(dim=-1)  # (batch_size, num_heads, query_len, seq_len)
@@ -675,10 +713,24 @@ class CrossAttention(nn.Module):
 
 
 class CrossAttentionBlock(nn.Module):
-    def __init__(self, dim, num_heads, mlp_ratio=4.0, qkv_bias=False, act_layer=nn.GELU, norm_layer=nn.LayerNorm):
+    def __init__(
+        self,
+        dim,
+        num_heads,
+        mlp_ratio=4.0,
+        qkv_bias=False,
+        act_layer=nn.GELU,
+        norm_layer=nn.LayerNorm,
+        use_flash_attention=False,
+    ):
         super().__init__()
         self.norm1 = norm_layer(dim)
-        self.xattn = CrossAttention(dim, num_heads=num_heads, qkv_bias=qkv_bias)
+        self.xattn = CrossAttention(
+            dim,
+            num_heads=num_heads,
+            qkv_bias=qkv_bias,
+            use_flash_attention=use_flash_attention,
+        )
         self.norm2 = norm_layer(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = MLP(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer)

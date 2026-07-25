@@ -128,7 +128,7 @@ def test_stage_a_checkpoint_contract_is_stage_b_input_contract():
             "realman_union_openpi_q01q99_v1.json"
         ),
         "normalization_statistics_artifact_sha256": (
-            "REPLACE_WITH_MATERIALIZED_UNION_STATS_SHA256"
+            "e843ad26fb153c2abcd3ec6b4fdb2b89082b36093ed6f1ddda61216aef05ce2e"
         ),
         "action_representation_contract_sha256": (
             REALMAN_18D_ACTION_CONTRACT.sha256()

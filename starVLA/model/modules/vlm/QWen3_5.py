@@ -1,7 +1,6 @@
 # Copyright 2025 starVLA community. All rights reserved.
 # Licensed under the MIT License, Version 1.0 (the "License");
 
-import os
 import importlib.util
 import torch
 import torch.nn.functional as F
@@ -167,17 +166,14 @@ class _QWen3_5_Interface(nn.Module):
                 "blockwise attention, or disable framework.qwenvl.blockwise_attention."
             )
 
-        flash2_available = torch.cuda.is_available() and is_flash_attn_2_available()
+        # Non-Flash backends are exact config requests. In particular, an
+        # explicit SDPA request must not be promoted by machine-local package
+        # availability or an ambient environment variable.
+        if normalized not in {"flash_attention_2", "flash_attention_4"}:
+            return normalized
+
         flash4_installed = torch.cuda.is_available() and is_flash_attn_4_available()
         flash4_available = flash4_installed and _QWen3_5_Interface._prepare_flash_attn_4(max_head_dim=max_head_dim)
-        prefer_flash = os.getenv("STARVLA_DISABLE_FLASH_ATTN_PROMOTION", "0") != "1"
-
-        if normalized == "sdpa" and prefer_flash and (flash4_available or flash2_available):
-            promoted_backend = "flash_attention_4" if flash4_available else "flash_attention_2"
-            _QWen3_5_Interface._safe_log(
-                "info", f"Promoting requested `sdpa` attention to `{promoted_backend}` for Qwen3.5"
-            )
-            normalized = promoted_backend
 
         if normalized == "flash_attention_2":
             if not torch.cuda.is_available():

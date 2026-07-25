@@ -4,23 +4,33 @@ extends:
 
 run_id: robot_ft_magna_hq_finetune_18d_delta_h100x8_b16
 
+curriculum_stage:
+  initialization: previous_stage_final
+  optimizer_scheduler_rng_reset: true
+  resume_policy: newest_complete_full_state_same_stage
+
+framework:
+  vj2_model:
+    predictor_attention_backend: torch_sdpa
+
 datasets:
   vla_data:
     normalization_statistics_artifact: /data/mehul-vla-jepa/data_contracts/realman_union_openpi_q01q99_v1.json
-    normalization_statistics_artifact_sha256: REPLACE_WITH_MATERIALIZED_UNION_STATS_SHA256
+    normalization_statistics_artifact_sha256: e843ad26fb153c2abcd3ec6b4fdb2b89082b36093ed6f1ddda61216aef05ce2e
     action_representation_contract_sha256: 9e1df348fb137c206b42a183892e29ec6247595fffc232bb2d73d94b5f5f91ac
     frozen_train_view_manifest: /data/mehul-vla-jepa/data_contracts/views/magna_hq_clean_h50_v1.json
-    frozen_train_view_manifest_sha256: 4a22a659112654f5369cf1845d630278a8e1ecdd7b8b98c2c027c1919f286688
+    frozen_train_view_manifest_sha256: d0b77b52f975f16c1ecaf6a55d562c7e7b7dd27a88e82532fa65de08ecd93824
     subtask_prompt_append_probability: 0.7
 
 trainer:
   epochs: 4
   max_train_steps: auto
   checkpoint_eval_milestone_fractions: [1.0]
-  checkpoint_eval_milestone_steps: null
+  checkpoint_eval_milestone_steps: auto
+  checkpoint_eval_include_full_epoch_boundaries: true
   checkpoint_eval_milestones_only: true
   checkpoint_max_to_keep: 0
-  num_warmup_steps: 0
+  num_warmup_steps: auto
   warmup_ratio: 0.05
   learning_rate:
     base: 4.0e-06

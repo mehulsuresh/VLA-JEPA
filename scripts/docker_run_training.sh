@@ -47,11 +47,18 @@ DOCKER_ARGS=(
   --ulimit stack=67108864
   -w "${CONTAINER_WORKDIR}"
   -v "${REPO_ROOT}:${CONTAINER_WORKDIR}"
-  -e "WANDB_MODE=${WANDB_MODE:-disabled}"
-  -e "TOKENIZERS_PARALLELISM=${TOKENIZERS_PARALLELISM:-false}"
-  -e "OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}"
-  -e "FFMPEG_THREADS=${FFMPEG_THREADS:-1}"
 )
+# These values historically came from the shell wrapper.  Preserve that
+# behavior for legacy launchers, but do not let ambient shell state override a
+# human-reviewed YAML contract.
+if [[ "${STARVLA_CONFIG_IS_AUTHORITATIVE:-0}" != "1" ]]; then
+  DOCKER_ARGS+=(
+    -e "WANDB_MODE=${WANDB_MODE:-disabled}"
+    -e "TOKENIZERS_PARALLELISM=${TOKENIZERS_PARALLELISM:-false}"
+    -e "OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}"
+    -e "FFMPEG_THREADS=${FFMPEG_THREADS:-1}"
+  )
+fi
 if [[ "${DOCKER_AUTO_REMOVE}" == "1" ]]; then
   DOCKER_ARGS=(--rm "${DOCKER_ARGS[@]}")
 fi
@@ -179,20 +186,32 @@ if [[ -n "${WANDB_API_KEY:-}" ]]; then
   DOCKER_ARGS+=(-e "WANDB_API_KEY=${WANDB_API_KEY}")
 fi
 
-OPTIONAL_TRAINING_ENV_VARS=(
-  RUN_ID
-  CONFIG_YAML
-  NUM_PROCESSES
-  MAIN_PROCESS_PORT
+OPTIONAL_RUNTIME_ENV_VARS=(
   VLA_JEPA_SCRATCH
   HF_HUB_CACHE
   TORCH_HOME
   PIP_CACHE_DIR
   TMPDIR
-  ACCELERATE_BIN
   STARVLA_CONTAINER_IMAGE
+  STARVLA_CONTAINER_IMAGE_ID
   STARVLA_CONTAINER_IMAGE_DIGEST
   STARVLA_CONFIG_IS_AUTHORITATIVE
+)
+for env_var in "${OPTIONAL_RUNTIME_ENV_VARS[@]}"; do
+  if [[ -n "${!env_var:-}" ]]; then
+    DOCKER_ARGS+=(-e "${env_var}=${!env_var}")
+  fi
+done
+
+# The human/curriculum launchers mark reviewed YAML as authoritative. In that
+# mode, never forward stale shell-era training knobs into the container.
+# Generic legacy launchers retain their existing opt-in environment behavior.
+OPTIONAL_LEGACY_TRAINING_ENV_VARS=(
+  RUN_ID
+  CONFIG_YAML
+  NUM_PROCESSES
+  MAIN_PROCESS_PORT
+  ACCELERATE_BIN
   STARVLA_USE_DEEPSPEED
   STARVLA_ALLOW_TORCH_COMPILE
   STARVLA_DISABLE_TORCH_COMPILE
@@ -222,20 +241,24 @@ OPTIONAL_TRAINING_ENV_VARS=(
   STARVLA_DATASET_TIMING_EVERY
   STARVLA_DATASET_TIMING_SLOW_SECONDS
 )
-for env_var in "${OPTIONAL_TRAINING_ENV_VARS[@]}"; do
-  if [[ -n "${!env_var:-}" ]]; then
-    DOCKER_ARGS+=(-e "${env_var}=${!env_var}")
-  fi
-done
+if [[ "${STARVLA_CONFIG_IS_AUTHORITATIVE:-0}" != "1" ]]; then
+  for env_var in "${OPTIONAL_LEGACY_TRAINING_ENV_VARS[@]}"; do
+    if [[ -n "${!env_var:-}" ]]; then
+      DOCKER_ARGS+=(-e "${env_var}=${!env_var}")
+    fi
+  done
+fi
 
-if [[ -n "${NCCL_SOCKET_IFNAME:-}" ]]; then
-  DOCKER_ARGS+=(-e "NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME}")
-fi
-if [[ -n "${GLOO_SOCKET_IFNAME:-}" ]]; then
-  DOCKER_ARGS+=(-e "GLOO_SOCKET_IFNAME=${GLOO_SOCKET_IFNAME}")
-fi
-if [[ -n "${NCCL_IB_DISABLE:-}" ]]; then
-  DOCKER_ARGS+=(-e "NCCL_IB_DISABLE=${NCCL_IB_DISABLE}")
+if [[ "${STARVLA_CONFIG_IS_AUTHORITATIVE:-0}" != "1" ]]; then
+  if [[ -n "${NCCL_SOCKET_IFNAME:-}" ]]; then
+    DOCKER_ARGS+=(-e "NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME}")
+  fi
+  if [[ -n "${GLOO_SOCKET_IFNAME:-}" ]]; then
+    DOCKER_ARGS+=(-e "GLOO_SOCKET_IFNAME=${GLOO_SOCKET_IFNAME}")
+  fi
+  if [[ -n "${NCCL_IB_DISABLE:-}" ]]; then
+    DOCKER_ARGS+=(-e "NCCL_IB_DISABLE=${NCCL_IB_DISABLE}")
+  fi
 fi
 
 if [[ "$#" -eq 0 ]]; then

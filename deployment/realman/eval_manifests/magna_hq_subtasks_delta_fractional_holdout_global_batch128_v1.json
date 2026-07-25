@@ -7,7 +7,7 @@
         "frame_count": 360052,
         "normalization": "q01_q99_unclipped",
         "path": "artifacts/magna_hq_subtasks_delta_fractional_holdout_global_batch128_v1_openpi_realman18_stats.json",
-        "sha256": "0e755a7c2a3518f1c4e7b97c5e830cb48f00f7253297cd53ca2ec5643be3120c"
+        "sha256": "89d3822411eebd9bec568d0b608edcbae47ade7e9e638db134a4155416c900cb"
       },
       "dataset_name": "latest_high_quality_magna_data_final_subtask_labelled",
       "dataset_root": "/data/mehul-vla-jepa/datasets/latest_high_quality_magna_data_final_subtask_labelled",
@@ -524,7 +524,7 @@
       },
       "holdout_selection_contract_schema": "realman-holdout-selection-contract-v1",
       "holdout_selection_contract_sha256": "d72aab224104f6e1bef9c62fd6227ed1691061be8f85526b0dd1e2ef2795df48",
-      "launcher_sha256": "800f39d0eabc33859e423a69c433647a40ca5171d46a50aa6ef03cb4bac693a5",
+      "launcher_sha256": "2e8ca32b9b0ef014379994ad827b935db2e35d9b76c9cce4b4693040a0f08788",
       "maximum_frames_per_episode": 4,
       "per_device_batch_size": 16,
       "window_allocation_algorithm": "balanced_digest_rank_v1",

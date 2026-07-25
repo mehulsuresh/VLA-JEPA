@@ -46,6 +46,7 @@ def _cfg(tmp_path, *, resume=False, max_train_steps=15):
             "seed": 42,
             "human_launch": {
                 "container_image": "test-image:latest",
+                "container_image_id": "sha256:" + "d" * 64,
             },
             "framework": {
                 "action_model": {
@@ -239,7 +240,7 @@ def _resume_runtime_metadata(
         "source_commit": "1" * 40,
         "generated_utc": "2026-07-24T04:00:00+00:00",
         "container_image": "test-image:latest",
-        "container_image_digest": None,
+        "container_image_digest": "sha256:" + "d" * 64,
         "runtime_config_path": str(source.resolve()),
         "runtime_config_sha256": hashlib.sha256(
             source.read_bytes()
@@ -678,6 +679,45 @@ def test_resolved_schedule_validates_and_records_checkpoint_eval_milestones(
         schedule["configured"]["checkpoint_eval_milestones_only"] is True
     )
     assert schedule["resolved"]["checkpoint_eval_milestones_only"] is True
+
+
+def test_config_owned_fraction_policy_resolves_first_epoch_and_all_epoch_boundaries(
+    tmp_path,
+):
+    cfg = _cfg(tmp_path, max_train_steps="auto")
+    cfg.trainer.checkpoint_eval_milestone_fractions = [0.25, 0.5, 1.0]
+    cfg.trainer.checkpoint_eval_milestone_steps = "auto"
+    cfg.trainer.checkpoint_eval_include_full_epoch_boundaries = True
+    cfg.trainer.checkpoint_eval_milestones_only = True
+    cfg.trainer.checkpoint_max_to_keep = 0
+
+    schedule = train_starvla.resolve_training_schedule(
+        cfg,
+        _SizedLoader(32),
+        num_processes=8,
+    )
+
+    assert schedule["configured"][
+        "checkpoint_eval_milestone_fractions"
+    ] == [0.25, 0.5, 1.0]
+    assert (
+        schedule["configured"]["checkpoint_eval_milestone_steps"] == "auto"
+    )
+    assert (
+        schedule["configured"][
+            "checkpoint_eval_include_full_epoch_boundaries"
+        ]
+        is True
+    )
+    assert schedule["resolved"]["steps_per_epoch"] == 4
+    assert schedule["resolved"]["max_train_steps"] == 12
+    assert schedule["resolved"]["checkpoint_eval_milestone_steps"] == [
+        1,
+        2,
+        4,
+        8,
+        12,
+    ]
 
 
 def test_milestone_only_schedule_rejects_retention_that_would_prune_evidence(

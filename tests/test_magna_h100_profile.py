@@ -104,6 +104,15 @@ def test_h100_profile_is_only_sample_scaled_strict_attention_variant():
     normalized = copy.deepcopy(h100)
     normalized.pop("runtime")
     normalized["run_id"] = a100["run_id"]
+    assert (
+        normalized["framework"]["vj2_model"][
+            "predictor_attention_backend"
+        ]
+        == "torch_sdpa"
+    )
+    normalized["framework"]["vj2_model"].pop(
+        "predictor_attention_backend"
+    )
     normalized_qwen = normalized["framework"]["qwenvl"]
     for key in (
         "strict_attn_implementation",
@@ -117,6 +126,10 @@ def test_h100_profile_is_only_sample_scaled_strict_attention_variant():
     normalized_data["epoch_sampling_strategy"] = a100_data[
         "epoch_sampling_strategy"
     ]
+    # These fields are now explicitly owned by the human-facing H100 config;
+    # the legacy A100 shell launcher inferred them from global batch size.
+    normalized_data.pop("holdout_episode_count")
+    normalized_data.pop("eval_per_device_batch_size")
     normalized_trainer = normalized["trainer"]
     for key in ("num_warmup_steps", "save_interval", "eval_interval"):
         normalized_trainer[key] = a100_trainer[key]
@@ -128,6 +141,10 @@ def test_h100_profile_is_only_sample_scaled_strict_attention_variant():
         "resume_load_optimizer_state",
         "save_final_model",
         "enable_force_checkpoint_file",
+        "checkpoint_eval_milestone_fractions",
+        "checkpoint_eval_milestone_steps",
+        "checkpoint_eval_include_full_epoch_boundaries",
+        "checkpoint_eval_milestones_only",
     ):
         normalized_trainer.pop(key)
     expected_a100 = copy.deepcopy(a100)

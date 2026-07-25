@@ -3,7 +3,6 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd -P)"
-DEFAULT_CONFIG="${REPO_ROOT}/scripts/config/h100/realman_realsource_intervention_hq_curriculum_v1.yaml"
 CONTAINER_REPO="/workspace/VLA-JEPA"
 
 usage() {
@@ -11,10 +10,10 @@ usage() {
     "Config-owned RealMan H100 curriculum" \
     "" \
     "Usage:" \
-    "  ./scripts/h100_curriculum.sh setup [--config YAML] [--skip-build]" \
-    "  ./scripts/h100_curriculum.sh plan [--config YAML] [--json]" \
-    "  ./scripts/h100_curriculum.sh check [--config YAML]" \
-    "  ./scripts/h100_curriculum.sh start [--config YAML] [--run-id ID] [--detach]" \
+    "  ./scripts/h100_curriculum.sh setup --config YAML [--skip-build]" \
+    "  ./scripts/h100_curriculum.sh plan --config YAML [--json]" \
+    "  ./scripts/h100_curriculum.sh check --config YAML" \
+    "  ./scripts/h100_curriculum.sh start --config YAML [--run-id ID] [--detach]" \
     "  ./scripts/h100_curriculum.sh resume --config YAML --run-id ORIGINAL [--detach]" \
     "  ./scripts/h100_curriculum.sh status" \
     "  ./scripts/h100_curriculum.sh logs [CONTAINER]" \
@@ -32,11 +31,13 @@ die() {
 [[ $# -ge 1 ]] || { usage; exit 2; }
 COMMAND="$1"
 shift
-CONFIG="${DEFAULT_CONFIG}"
+CONFIG=""
+SEEN_CONFIG=0
 RUN_ID=""
 DETACH=0
 SKIP_BUILD=0
 JSON=0
+CONTAINER_IMAGE_ID=""
 POSITIONAL=()
 
 while (( $# > 0 )); do
@@ -44,6 +45,7 @@ while (( $# > 0 )); do
     --config)
       (( $# >= 2 )) || die "--config requires a value"
       CONFIG="$2"
+      SEEN_CONFIG=1
       shift 2
       ;;
     --run-id)
@@ -77,13 +79,32 @@ while (( $# > 0 )); do
   esac
 done
 
+case "${COMMAND}" in
+  setup|plan|check|start|resume)
+    [[ "${SEEN_CONFIG}" == "1" ]] \
+      || die "${COMMAND} requires explicit --config YAML"
+    ;;
+esac
+
 require_command() {
   command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
+}
+
+resolve_container_image_id() {
+  require_command docker
+  CONTAINER_IMAGE_ID="$(
+    docker image inspect "${IMAGE}" --format '{{.Id}}' 2>/dev/null
+  )" || die "configured container image does not exist locally: ${IMAGE}"
+  [[ "${CONTAINER_IMAGE_ID}" =~ ^sha256:[0-9a-f]{64}$ ]] \
+    || die "docker returned an invalid Image.Id for ${IMAGE}: ${CONTAINER_IMAGE_ID}"
+  printf 'Container image ID         : %s\n' "${CONTAINER_IMAGE_ID}"
 }
 
 load_bootstrap() {
   require_command python3
   local resolved output
+  [[ -f "${CONFIG}" && ! -L "${CONFIG}" ]] \
+    || die "curriculum config must be a regular non-symlink file: ${CONFIG}"
   resolved="$(realpath -e -- "${CONFIG}")" || die "config does not exist: ${CONFIG}"
   [[ "${resolved}" == "${REPO_ROOT}/"* ]] \
     || die "curriculum config must live inside the repository"
@@ -97,8 +118,17 @@ import sys
 config = Path(sys.argv[1]).resolve()
 repo = Path(sys.argv[2]).resolve()
 values = {}
+workflow_kind = None
 inside = False
 for number, line in enumerate(config.read_text(encoding="utf-8").splitlines(), 1):
+    workflow_match = re.fullmatch(
+        r"workflow_kind:[ ]+([^#]+?)[ ]*",
+        line,
+    )
+    if workflow_match:
+        if workflow_kind is not None:
+            raise SystemExit("duplicate workflow_kind")
+        workflow_kind = workflow_match.group(1).strip().strip("\"'")
     if line == "bootstrap:":
         if inside:
             raise SystemExit("duplicate bootstrap block")
@@ -121,9 +151,19 @@ for number, line in enumerate(config.read_text(encoding="utf-8").splitlines(), 1
 missing = {"stage_config", "container_image", "scratch_root"} - values.keys()
 if missing:
     raise SystemExit(f"missing bootstrap keys: {sorted(missing)}")
+if workflow_kind not in {
+    "production_curriculum",
+    "checkpoint_handoff_smoke",
+}:
+    raise SystemExit(
+        "workflow_kind must be explicitly set to production_curriculum "
+        "or checkpoint_handoff_smoke"
+    )
 stage = Path(values["stage_config"]).expanduser()
 if not stage.is_absolute():
     stage = repo / stage
+if stage.is_symlink():
+    raise SystemExit(f"invalid bootstrap stage config symlink: {stage}")
 stage = stage.resolve()
 if not stage.is_relative_to(repo) or not stage.is_file() or stage.is_symlink():
     raise SystemExit(f"invalid bootstrap stage config: {stage}")
@@ -148,11 +188,16 @@ run_curriculum_container() {
   local gpu_mode="$2"
   shift 2
   local auto_remove=1
+  local configured_image="${IMAGE}"
+  local image_reference="${CONTAINER_IMAGE_ID:-${configured_image}}"
   [[ "${DETACH}" == "0" ]] || auto_remove=0
-  IMAGE="${IMAGE}" \
+  IMAGE="${image_reference}" \
   VLA_JEPA_SCRATCH="${SCRATCH}" \
   CHECKPOINT_ROOT="${SCRATCH}/checkpoints" \
-  STARVLA_CONTAINER_IMAGE="${IMAGE}" \
+  STARVLA_CONTAINER_IMAGE="${configured_image}" \
+  STARVLA_CONTAINER_IMAGE_ID="${CONTAINER_IMAGE_ID}" \
+  STARVLA_CONTAINER_IMAGE_DIGEST="${CONTAINER_IMAGE_ID}" \
+  STARVLA_CONFIG_IS_AUTHORITATIVE=1 \
   DOCKER_NAME="${name}" \
   DOCKER_TTY=0 \
   DOCKER_DETACH="${DETACH}" \
@@ -171,7 +216,12 @@ case "${COMMAND}" in
     load_bootstrap
     args=(setup --config "${STAGE_CONFIG}")
     [[ "${SKIP_BUILD}" == "0" ]] || args+=(--skip-build)
-    exec "${SCRIPT_DIR}/h100_training.sh" "${args[@]}"
+    "${SCRIPT_DIR}/h100_training.sh" "${args[@]}"
+    printf '%s\n' \
+      "Installing and validating every unique curriculum-stage dependency."
+    run_curriculum_container "starvla-curriculum-setup-$$" none \
+      python scripts/h100_curriculum.py setup \
+      --config "${CONFIG_IN_CONTAINER}"
     ;;
   plan)
     (( ${#POSITIONAL[@]} == 0 )) || die "plan takes no positional arguments"
@@ -187,6 +237,7 @@ case "${COMMAND}" in
     [[ -z "${RUN_ID}" && "${DETACH}" == 0 && "${SKIP_BUILD}" == 0 && "${JSON}" == 0 ]] \
       || die "check accepts only --config"
     load_bootstrap
+    resolve_container_image_id
     run_curriculum_container "starvla-curriculum-check-$$" gpus \
       python scripts/h100_curriculum.py check --config "${CONFIG_IN_CONTAINER}"
     ;;
@@ -195,6 +246,7 @@ case "${COMMAND}" in
     [[ "${SKIP_BUILD}" == 0 && "${JSON}" == 0 ]] \
       || die "start accepts only --config, --run-id, and --detach"
     load_bootstrap
+    resolve_container_image_id
     name="starvla-curriculum-$(date -u +%Y%m%d-%H%M%S)"
     args=(python scripts/h100_curriculum.py run --config "${CONFIG_IN_CONTAINER}")
     [[ -z "${RUN_ID}" ]] || args+=(--run-id "${RUN_ID}")
@@ -208,6 +260,7 @@ case "${COMMAND}" in
     [[ -n "${RUN_ID}" ]] \
       || die "resume requires the original --run-id"
     load_bootstrap
+    resolve_container_image_id
     name="starvla-curriculum-resume-$(date -u +%Y%m%d-%H%M%S)"
     args=(
       python scripts/h100_curriculum.py run
@@ -220,7 +273,8 @@ case "${COMMAND}" in
     ;;
   status)
     (( ${#POSITIONAL[@]} == 0 )) || die "status takes no positional arguments"
-    [[ -z "${RUN_ID}" && "${DETACH}" == 0 && "${SKIP_BUILD}" == 0 && "${JSON}" == 0 ]] \
+    [[ "${SEEN_CONFIG}" == 0 && -z "${RUN_ID}" && "${DETACH}" == 0 \
+      && "${SKIP_BUILD}" == 0 && "${JSON}" == 0 ]] \
       || die "status accepts no options"
     require_command docker
     docker ps -a \
@@ -229,7 +283,8 @@ case "${COMMAND}" in
     ;;
   logs)
     (( ${#POSITIONAL[@]} <= 1 )) || die "logs accepts at most one container"
-    [[ -z "${RUN_ID}" && "${DETACH}" == 0 && "${SKIP_BUILD}" == 0 && "${JSON}" == 0 ]] \
+    [[ "${SEEN_CONFIG}" == 0 && -z "${RUN_ID}" && "${DETACH}" == 0 \
+      && "${SKIP_BUILD}" == 0 && "${JSON}" == 0 ]] \
       || die "logs accepts no options"
     require_command docker
     container="${POSITIONAL[0]:-}"

@@ -43,6 +43,7 @@ class VisionTransformerPredictorAC(nn.Module):
         use_activation_checkpointing=False,
         use_rope=True,
         use_legacy_rope_bug=True,
+        use_flash_attention=False,
         action_embed_dim=7,
         use_extrinsics=False,
         # added
@@ -92,6 +93,7 @@ class VisionTransformerPredictorAC(nn.Module):
                 Block(
                     use_rope=use_rope,
                     use_legacy_rope_bug=use_legacy_rope_bug,
+                    use_flash_attention=use_flash_attention,
                     grid_size=self.grid_height,
                     dim=predictor_embed_dim,
                     num_heads=num_heads,

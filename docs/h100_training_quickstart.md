@@ -83,16 +83,13 @@ cannot see.
 From the repository root:
 
 ```bash
-./scripts/h100_training.sh setup
-```
-
-Select another profile by passing the same `--config` to every config-aware
-command:
-
-```bash
 CONFIG=scripts/config/h100/vlajepa_robot_ft_libero_plus_h100x8_qwen35_2b_full_moge_vitb_vjepa_large.yaml
 ./scripts/h100_training.sh setup --config "$CONFIG"
 ```
+
+There is intentionally no default training profile. Choose one reviewed YAML
+and pass the same explicit `--config "$CONFIG"` to every setup, plan, prepare,
+check, start, and resume command.
 
 `setup` performs the host hardware/runtime checks, creates the configured
 scratch layout, builds the exact image recipe declared in `runtime`, and checks
@@ -100,16 +97,10 @@ out MoGe and V-JEPA 2 at the full commits declared in
 `runtime.helper_repositories`. To reuse an already-built image:
 
 ```bash
-./scripts/h100_training.sh setup --skip-build
+./scripts/h100_training.sh setup --config "$CONFIG" --skip-build
 ```
 
 ## 3. Read the complete plan
-
-```bash
-./scripts/h100_training.sh plan
-```
-
-For a selected profile:
 
 ```bash
 ./scripts/h100_training.sh plan --config "$CONFIG"
@@ -129,15 +120,9 @@ split, rebuild its data contract once, review the result, and commit the
 reviewed config/artifacts:
 
 ```bash
-./scripts/h100_training.sh prepare --yes-rebuild-data-contract
+./scripts/h100_training.sh prepare --config "$CONFIG" --yes-rebuild-data-contract
 git diff --check
 git status --short
-```
-
-For a selected non-default profile, preserve the same config explicitly:
-
-```bash
-./scripts/h100_training.sh prepare --config "$CONFIG" --yes-rebuild-data-contract
 ```
 
 Do not run `prepare` merely to make a check pass without reviewing why the
@@ -156,12 +141,11 @@ training-stream checkpoint selection.
 The source checkout must now be clean and committed:
 
 ```bash
-./scripts/h100_training.sh check
+./scripts/h100_training.sh check --config "$CONFIG"
 ```
 
-Use `--config "$CONFIG"` when a non-default profile is selected. `check` also
-verifies canonical manifest/source hashes and the pinned canonicalization
-checkout for GCS profiles.
+`check` also verifies canonical manifest/source hashes and the pinned
+canonicalization checkout for GCS profiles.
 
 This checks the config and artifact hash chain, exact helper commits, dataset
 and checkpoint mounts, all eight H100 names and SM90 capabilities, launch port,
@@ -173,19 +157,13 @@ backward probe. Training does not start if any gate fails.
 Foreground mode is the simplest and shows logs directly:
 
 ```bash
-./scripts/h100_training.sh start
-```
-
-For a selected profile:
-
-```bash
 ./scripts/h100_training.sh start --config "$CONFIG"
 ```
 
 For a named, detached Docker container:
 
 ```bash
-./scripts/h100_training.sh start --detach
+./scripts/h100_training.sh start --config "$CONFIG" --detach
 ./scripts/h100_training.sh status
 ./scripts/h100_training.sh logs
 ```
@@ -194,6 +172,7 @@ An optional run ID may be supplied, but it must keep the config-owned prefix:
 
 ```bash
 ./scripts/h100_training.sh start \
+  --config "$CONFIG" \
   --run-id robot_ft_lerobot_magna_interventions_h100x8_b16_20260722_120000 \
   --detach
 ```
@@ -209,6 +188,7 @@ all eight rank RNG states before launch:
 
 ```bash
 ./scripts/h100_training.sh resume \
+  --config "$CONFIG" \
   --checkpoint /mnt/vla-jepa/checkpoints/RUN_ID/checkpoints/steps_N \
   --detach
 ```

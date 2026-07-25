@@ -15,6 +15,11 @@ run_id: robot_ft_realsource_18d_delta_h100x8_b16
 run_root_dir: /data/mehul-vla-jepa/checkpoints
 canonical_eval_split_id: realsource_strict_valid_fractional_eval128_v1
 
+curriculum_stage:
+  initialization: upstream
+  optimizer_scheduler_rng_reset: true
+  resume_policy: newest_complete_full_state_same_stage
+
 runtime:
   scratch_root: /data/mehul-vla-jepa
   helper_repositories:
@@ -32,6 +37,7 @@ framework:
     moge_repo_path: /data/mehul-vla-jepa/src/MoGe
   vj2_model:
     hub_repo_or_dir: /data/mehul-vla-jepa/src/vjepa2
+    predictor_attention_backend: torch_sdpa
   action_model:
     state_dim: 18
     action_dim: 18
@@ -50,6 +56,7 @@ datasets:
     data_root_dir: null
     data_mix: null
     episode_split_manifest: null
+    holdout_episode_count: null
     dataset_canonicalization_root: /data/mehul-vla-jepa/src/dataset-canonicalization-training-d9c3298
     manifest_path: /data/mehul-vla-jepa/src/dataset-canonicalization-training-d9c3298/configs/manifests/dataset_manifests.jsonl.gz
     adapter_dir: /data/mehul-vla-jepa/src/dataset-canonicalization-training-d9c3298/configs/dataset_adapters
@@ -89,7 +96,7 @@ datasets:
     sidecar_normalization: q01_q99_unclipped
     action_representation_contract_sha256: 9e1df348fb137c206b42a183892e29ec6247595fffc232bb2d73d94b5f5f91ac
     normalization_statistics_artifact: /data/mehul-vla-jepa/data_contracts/realman_union_openpi_q01q99_v1.json
-    normalization_statistics_artifact_sha256: REPLACE_WITH_MATERIALIZED_UNION_STATS_SHA256
+    normalization_statistics_artifact_sha256: e843ad26fb153c2abcd3ec6b4fdb2b89082b36093ed6f1ddda61216aef05ce2e
     sample_stride: 1
     sidecar_dtype: float16
     video_decode_backend: pyav
@@ -112,6 +119,9 @@ datasets:
     subtask_prompt_append_probability: 0.7
     per_device_batch_size: 16
     num_workers: 4
+    enforce_worker_memory_budget: true
+    estimated_worker_memory_gb: 5.0
+    worker_memory_budget_fraction: 0.65
     eval_num_workers: 0
     prefetch_factor: 2
     persistent_workers: true
@@ -121,10 +131,11 @@ trainer:
   epochs: 1
   max_train_steps: auto
   checkpoint_eval_milestone_fractions: [0.25, 0.5, 1.0]
-  checkpoint_eval_milestone_steps: null
+  checkpoint_eval_milestone_steps: auto
+  checkpoint_eval_include_full_epoch_boundaries: true
   checkpoint_eval_milestones_only: true
   checkpoint_max_to_keep: 0
-  num_warmup_steps: 0
+  num_warmup_steps: auto
   warmup_ratio: 0.05
   learning_rate:
     base: 2.0e-05

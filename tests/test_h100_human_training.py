@@ -52,6 +52,18 @@ CANONICAL_HOLDOUT_POLICY = {
     "max_episode_count": 128,
     "evaluation_observation_count": 128,
 }
+TEST_IMAGE_ID = "sha256:" + "d" * 64
+
+
+def _set_test_image_identity(
+    monkeypatch,
+    *,
+    image: str = "test-image:latest",
+    image_id: str = TEST_IMAGE_ID,
+) -> None:
+    monkeypatch.setenv("STARVLA_CONTAINER_IMAGE", image)
+    monkeypatch.setenv("STARVLA_CONTAINER_IMAGE_ID", image_id)
+    monkeypatch.setenv("STARVLA_CONTAINER_IMAGE_DIGEST", image_id)
 
 
 def _payload() -> dict:
@@ -251,6 +263,14 @@ def test_h100_plan_resolves_complete_config_owned_contract():
     assert plan["runtime"]["mixed_precision"] == "bf16"
     assert plan["runtime"]["use_deepspeed"] is False
     assert plan["runtime"]["torch_compile_environment"] == "disabled"
+    assert plan["runtime"]["main_torch_threads"] == 1
+    assert plan["runtime"]["main_torch_interop_threads"] == 1
+    assert plan["runtime"]["disable_autograd_multithreading"] is True
+    assert (
+        plan["runtime"]["pytorch_cuda_alloc_conf"]
+        == "expandable_segments:True"
+    )
+    assert plan["runtime"]["tokenizers_parallelism"] is False
     assert set(plan["runtime"]["helper_repositories"]) == {"moge", "vjepa2"}
     assert all(
         len(entry["commit"]) == 40
@@ -328,6 +348,44 @@ def test_h100_plan_rejects_invalid_checkpoint_eval_milestones(
         match=field,
     ):
         h100_training.resolve_plan(config, validate_artifacts=False)
+
+
+@pytest.mark.parametrize(
+    ("num_warmup_steps", "warmup_ratio", "accepted"),
+    (
+        ("auto", 0.05, True),
+        (0, 0.0, True),
+        (25, 0.0, True),
+        (0, 0.05, False),
+        (25, 0.05, False),
+        ("auto", 0.0, False),
+        ("AUTO", 0.05, False),
+        (-1, 0.0, False),
+    ),
+)
+def test_h100_warmup_policy_is_explicit_and_unambiguous(
+    tmp_path,
+    num_warmup_steps,
+    warmup_ratio,
+    accepted,
+):
+    payload = copy.deepcopy(_payload())
+    payload["trainer"]["num_warmup_steps"] = num_warmup_steps
+    payload["trainer"]["warmup_ratio"] = warmup_ratio
+    config = _temporary_config(tmp_path, payload)
+
+    if accepted:
+        plan = h100_training.resolve_plan(
+            config,
+            validate_artifacts=False,
+        )
+        assert plan["training"]["warmup_steps"] == num_warmup_steps
+    else:
+        with pytest.raises(h100_training.PlanError, match="warmup"):
+            h100_training.resolve_plan(
+                config,
+                validate_artifacts=False,
+            )
 
 
 def test_h100_plan_rejects_milestone_after_explicit_training_end(tmp_path):
@@ -408,7 +466,7 @@ def test_realman_train_statistics_contract_rejects_missing_loader_columns():
         )
 
 
-def test_realman_explicit_null_holdout_sampling_uses_legacy_batch_contract(
+def test_realman_rejects_implicit_global_batch_holdout_contract(
     tmp_path,
 ):
     _, payload = h100_training._load_config(CONFIG)
@@ -417,11 +475,11 @@ def test_realman_explicit_null_holdout_sampling_uses_legacy_batch_contract(
     data.pop("holdout_episode_count", None)
     config = _temporary_config(tmp_path, payload)
 
-    plan = h100_training.resolve_plan(config, validate_artifacts=False)
-
-    assert plan["training"]["holdout_sampling_policy"] is None
-    assert plan["training"]["holdout_episode_count"] == 128
-    assert plan["training"]["evaluation_observation_count"] == 128
+    with pytest.raises(
+        h100_training.PlanError,
+        match="explicit immutable holdout",
+    ):
+        h100_training.resolve_plan(config, validate_artifacts=False)
 
 
 def _legacy_realman_evaluation_sampling() -> dict:
@@ -1191,6 +1249,24 @@ def test_h100_rejects_dataset_path_outside_mounted_scratch(tmp_path):
             "trainer.save_interval",
         ),
         (
+            lambda cfg: cfg["trainer"].pop(
+                "checkpoint_eval_milestone_steps"
+            ),
+            "trainer.checkpoint_eval_milestone_steps",
+        ),
+        (
+            lambda cfg: cfg["trainer"].pop(
+                "checkpoint_eval_include_full_epoch_boundaries"
+            ),
+            "trainer.checkpoint_eval_include_full_epoch_boundaries",
+        ),
+        (
+            lambda cfg: cfg["datasets"]["vla_data"].pop(
+                "multiprocessing_context"
+            ),
+            "datasets.vla_data.multiprocessing_context",
+        ),
+        (
             lambda cfg: cfg["runtime"]["container_build"]["arguments"].__setitem__(
                 "INSTALL_FLASH_ATTN", "0"
             ),
@@ -1207,6 +1283,83 @@ def test_h100_plan_fails_closed_when_critical_setting_is_missing_or_wrong(
 
     with pytest.raises(h100_training.PlanError, match=message):
         h100_training.resolve_plan(config, validate_artifacts=False)
+
+
+def test_h100_plan_requires_explicit_vj_predictor_attention_backend(
+    tmp_path,
+):
+    payload = copy.deepcopy(_payload())
+    payload["framework"]["vj2_model"].pop(
+        "predictor_attention_backend"
+    )
+
+    with pytest.raises(
+        h100_training.PlanError,
+        match="framework.vj2_model.predictor_attention_backend",
+    ):
+        h100_training.resolve_plan(
+            _temporary_config(tmp_path, payload),
+            validate_artifacts=False,
+        )
+
+
+@pytest.mark.parametrize(
+    "field",
+    ("prefetch_factor", "worker_torch_threads", "worker_cv2_threads"),
+)
+def test_h100_plan_requires_explicit_positive_worker_knobs(
+    tmp_path,
+    field,
+):
+    payload = copy.deepcopy(_payload())
+    payload["datasets"]["vla_data"].pop(field)
+    with pytest.raises(
+        h100_training.PlanError,
+        match=rf"datasets.vla_data.{field}",
+    ):
+        h100_training.resolve_plan(
+            _temporary_config(tmp_path, payload),
+            validate_artifacts=False,
+        )
+
+    payload = copy.deepcopy(_payload())
+    payload["datasets"]["vla_data"][field] = 0
+    with pytest.raises(
+        h100_training.PlanError,
+        match=rf"datasets.vla_data.{field} must be a positive integer",
+    ):
+        h100_training.resolve_plan(
+            _temporary_config(tmp_path, payload),
+            validate_artifacts=False,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("estimated_worker_memory_gb", 0.0),
+        ("estimated_worker_memory_gb", float("inf")),
+        ("worker_memory_budget_fraction", 0.0),
+        ("worker_memory_budget_fraction", 1.01),
+        ("worker_memory_budget_fraction", float("nan")),
+    ),
+)
+def test_canonical_h100_plan_rejects_invalid_worker_memory_budget(
+    tmp_path,
+    field,
+    value,
+):
+    _, payload = h100_training._load_config(CANONICAL_H100_CONFIG)
+    payload["datasets"]["vla_data"][field] = value
+
+    with pytest.raises(
+        h100_training.PlanError,
+        match=rf"datasets.vla_data.{field}",
+    ):
+        h100_training.resolve_plan(
+            _temporary_config(tmp_path, payload),
+            validate_artifacts=False,
+        )
 
 
 def test_accelerate_receives_only_one_resolved_trainer_config():
@@ -1263,12 +1416,22 @@ def _resume_checkpoint_fixture(
                     )
                 ),
                 "container_image": "test-image:latest",
+                "container_image_id": TEST_IMAGE_ID,
             },
         }
     )
     immutable_path = run_dir / "config.yaml"
     immutable_path.write_text(
         OmegaConf.to_yaml(immutable_config, resolve=True),
+        encoding="utf-8",
+    )
+    immutable_path.with_suffix(".json").write_text(
+        json.dumps(
+            OmegaConf.to_container(immutable_config, resolve=True),
+            indent=2,
+            allow_nan=False,
+        )
+        + "\n",
         encoding="utf-8",
     )
     return checkpoint, immutable_path
@@ -1278,6 +1441,7 @@ def test_resume_runtime_config_is_applied_after_immutable_config_load(
     tmp_path,
     monkeypatch,
 ):
+    _set_test_image_identity(monkeypatch)
     monkeypatch.setattr(h100_resume_runtime, "_git_commit", lambda: "b" * 40)
     source_sha = "a" * 64
     checkpoint, immutable_path = _resume_checkpoint_fixture(
@@ -1322,7 +1486,7 @@ def test_resume_runtime_config_is_applied_after_immutable_config_load(
         assert metadata.source_commit == "b" * 40
         assert metadata.generated_utc
         assert metadata.container_image == "test-image:latest"
-        assert metadata.container_image_digest is None
+        assert metadata.container_image_digest == TEST_IMAGE_ID
         assert metadata.runtime_config_path == str(
             MAGNA_HQ_RESUME_WORKERS4_CONFIG.resolve()
         )
@@ -1452,6 +1616,56 @@ def test_human_shell_has_no_duplicate_image_scratch_or_build_defaults():
     assert "runtime.container_build" in text
 
 
+def test_human_launch_requires_host_resolved_immutable_image_id(
+    monkeypatch,
+):
+    plan = {"runtime": {"container_image": "test-image:latest"}}
+
+    monkeypatch.delenv("STARVLA_CONTAINER_IMAGE", raising=False)
+    monkeypatch.delenv("STARVLA_CONTAINER_IMAGE_ID", raising=False)
+    monkeypatch.delenv("STARVLA_CONTAINER_IMAGE_DIGEST", raising=False)
+    with pytest.raises(
+        h100_training.PlanError,
+        match="STARVLA_CONTAINER_IMAGE is required",
+    ):
+        h100_training._required_container_image_identity(plan)
+
+    monkeypatch.setenv("STARVLA_CONTAINER_IMAGE", "test-image:latest")
+    with pytest.raises(
+        h100_training.PlanError,
+        match="STARVLA_CONTAINER_IMAGE_ID is required",
+    ):
+        h100_training._required_container_image_identity(plan)
+
+    monkeypatch.setenv("STARVLA_CONTAINER_IMAGE_ID", TEST_IMAGE_ID)
+    monkeypatch.setenv(
+        "STARVLA_CONTAINER_IMAGE_DIGEST",
+        "sha256:" + "e" * 64,
+    )
+    with pytest.raises(
+        h100_training.PlanError,
+        match="contradicts",
+    ):
+        h100_training._required_container_image_identity(plan)
+
+    monkeypatch.setenv("STARVLA_CONTAINER_IMAGE_DIGEST", TEST_IMAGE_ID)
+    assert h100_training._required_container_image_identity(plan) == (
+        "test-image:latest",
+        TEST_IMAGE_ID,
+    )
+
+
+def test_human_shell_runs_checked_workloads_by_image_id():
+    text = SHELL.read_text(encoding="utf-8")
+    docker_text = DOCKER_RUN.read_text(encoding="utf-8")
+
+    assert "resolve_container_image_id" in text
+    assert 'image_reference="${CONTAINER_IMAGE_ID:-${configured_image}}"' in text
+    assert 'IMAGE="${image_reference}"' in text
+    assert 'STARVLA_CONTAINER_IMAGE_ID="${CONTAINER_IMAGE_ID}"' in text
+    assert "STARVLA_CONTAINER_IMAGE_ID" in docker_text
+
+
 def test_human_shell_rejects_hyperparameter_overrides_before_docker():
     result = subprocess.run(
         ["bash", str(SHELL), "start", "--trainer.epochs", "2"],
@@ -1475,6 +1689,10 @@ def test_human_shell_passes_repo_owned_resume_runtime_config(tmp_path):
     )
     (bin_dir / "docker").write_text(
         "#!/usr/bin/env bash\n"
+        "if [[ \"$1\" == image && \"$2\" == inspect ]]; then\n"
+        f"  printf '%s\\n' {shlex.quote(TEST_IMAGE_ID)}\n"
+        "  exit 0\n"
+        "fi\n"
         f"printf '%q ' \"$@\" > {shlex.quote(str(capture))}\n",
         encoding="utf-8",
     )
@@ -1687,6 +1905,7 @@ def test_human_shell_bootstrap_resolves_composed_h100_profiles(
     assert result.returncode == 0, result.stderr
     arguments = shlex.split(capture.read_text(encoding="utf-8"))
     assert "vla-jepa:py313-cu130-h100" in arguments
+    assert "STARVLA_CONFIG_IS_AUTHORITATIVE=1" in arguments
     assert "scripts/h100_training.py" in arguments
     assert "/workspace/VLA-JEPA/scripts/config/h100/" in " ".join(arguments)
 
@@ -1694,9 +1913,12 @@ def test_human_shell_bootstrap_resolves_composed_h100_profiles(
 def test_human_shell_bootstrap_accepts_unindented_extends_sequence(
     tmp_path,
 ):
+    scratch = tmp_path / "scratch"
     leaf = _repo_local_temporary_config(
         "extends:\n"
         f"- ../scripts/config/{CONFIG.name}\n"
+        "runtime:\n"
+        f"  scratch_root: {scratch}\n"
     )
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
@@ -1731,6 +1953,30 @@ def test_human_shell_bootstrap_accepts_unindented_extends_sequence(
     arguments = shlex.split(capture.read_text(encoding="utf-8"))
     assert "vla-jepa:py313-cu130-h100" in arguments
     assert "scripts/h100_training.py" in arguments
+
+
+def test_direct_prepare_config_bytes_preserve_reviewed_file_identity(
+    tmp_path,
+):
+    config_path = tmp_path / "direct.yaml"
+    reviewed_bytes = (
+        b"# comments and key order are part of a direct config contract\n"
+        b"schema_version: 1\n"
+        b"run_id: fixture\n"
+    )
+    config_path.write_bytes(reviewed_bytes)
+    cfg = OmegaConf.load(config_path)
+
+    contract_bytes = h100_training._config_contract_bytes(
+        config_path,
+        cfg,
+    )
+
+    assert contract_bytes == reviewed_bytes
+    assert h100_training._config_contract_sha256(
+        config_path,
+        cfg,
+    ) == hashlib.sha256(reviewed_bytes).hexdigest()
 
 
 def test_deep_preflight_receives_flattened_composed_config(monkeypatch):
@@ -1857,6 +2103,10 @@ def test_unique_run_id_does_not_move_prepared_canonical_manifest(
             stdout="a" * 40 + "\n",
         ),
     )
+    _set_test_image_identity(
+        monkeypatch,
+        image=str(plan["runtime"]["container_image"]),
+    )
 
     resolved_path, _ = h100_training._resolved_launch_config(
         CANONICAL_H100_CONFIG,
@@ -1874,6 +2124,344 @@ def test_unique_run_id_does_not_move_prepared_canonical_manifest(
         assert runtime_run_id not in prepared_manifest
     finally:
         resolved_path.unlink()
+
+
+def _materialization_changed_paths(
+    before,
+    after,
+    *,
+    prefix: str = "",
+) -> set[str]:
+    if isinstance(before, dict) and isinstance(after, dict):
+        changed: set[str] = set()
+        for key in before.keys() | after.keys():
+            path = f"{prefix}.{key}" if prefix else str(key)
+            if key not in before or key not in after:
+                changed.add(path)
+            else:
+                changed.update(
+                    _materialization_changed_paths(
+                        before[key],
+                        after[key],
+                        prefix=path,
+                    )
+                )
+        return changed
+    return set() if before == after else {prefix}
+
+
+def test_fresh_launch_materialization_changes_only_identity_and_provenance(
+    tmp_path,
+    monkeypatch,
+):
+    _set_test_image_identity(monkeypatch)
+    source_config = tmp_path / "reviewed-source.yaml"
+    source_config.write_text(
+        "run_id: reviewed_source\n"
+        "trainer:\n"
+        "  is_resume: false\n"
+        "  resume_from_checkpoint: null\n"
+        "  epochs: 3\n"
+        "datasets:\n"
+        "  vla_data:\n"
+        "    num_workers: 4\n"
+        "reviewed_semantics:\n"
+        "  action_dim: 18\n"
+        "  action_horizon: 50\n",
+        encoding="utf-8",
+    )
+    source_bytes = source_config.read_bytes()
+    _, source = h100_training._load_config(source_config)
+    runtime_run_id = "fixture_runtime"
+    plan = {
+        "config_sha256": "a" * 64,
+        "training": {
+            "run_id_prefix": "fixture",
+            "run_root_dir": str(tmp_path / "runs"),
+        },
+        "runtime": {
+            "container_image": "test-image:latest",
+        },
+    }
+    monkeypatch.setattr(
+        h100_training.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=0,
+            stdout="b" * 40 + "\n",
+        ),
+    )
+
+    resolved_path, run_id = h100_training._resolved_launch_config(
+        source_config,
+        plan,
+        run_id=runtime_run_id,
+        resume_checkpoint=None,
+    )
+    try:
+        resolved = OmegaConf.to_container(
+            OmegaConf.load(resolved_path),
+            resolve=True,
+        )
+        assert run_id == runtime_run_id
+        assert _materialization_changed_paths(source, resolved) == {
+            "run_id",
+            "human_launch",
+        }
+        assert resolved["trainer"] == source["trainer"]
+        assert resolved["datasets"] == source["datasets"]
+        assert resolved["reviewed_semantics"] == source["reviewed_semantics"]
+        assert resolved["human_launch"]["source_config_sha256"] == "a" * 64
+        assert resolved["human_launch"]["source_commit"] == "b" * 40
+        assert (
+            resolved["human_launch"]["container_image_id"]
+            == TEST_IMAGE_ID
+        )
+    finally:
+        resolved_path.unlink()
+
+    assert source_config.read_bytes() == source_bytes
+
+
+def test_resume_launch_materialization_changes_only_resume_fields(
+    tmp_path,
+    monkeypatch,
+):
+    _set_test_image_identity(monkeypatch)
+    source_sha = "c" * 64
+    checkpoint, immutable_path = _resume_checkpoint_fixture(
+        tmp_path,
+        source_config_sha256=source_sha,
+    )
+    immutable_bytes = immutable_path.read_bytes()
+    immutable = OmegaConf.to_container(
+        OmegaConf.load(immutable_path),
+        resolve=True,
+    )
+    plan = {
+        "config_sha256": source_sha,
+        "runtime": {
+            "num_processes": 8,
+            "container_image": "test-image:latest",
+        },
+    }
+
+    resolved_path, run_id = h100_training._resolved_launch_config(
+        CONFIG,
+        plan,
+        run_id=None,
+        resume_checkpoint=checkpoint,
+    )
+    try:
+        resolved = OmegaConf.to_container(
+            OmegaConf.load(resolved_path),
+            resolve=True,
+        )
+        assert run_id == "resume-fixture"
+        assert _materialization_changed_paths(immutable, resolved) == {
+            "trainer.is_resume",
+            "trainer.resume_from_checkpoint",
+        }
+        assert resolved["trainer"]["is_resume"] is True
+        assert resolved["trainer"]["resume_from_checkpoint"] == str(
+            checkpoint.resolve()
+        )
+        assert resolved["human_launch"] == immutable["human_launch"]
+        assert resolved["datasets"] == immutable["datasets"]
+    finally:
+        resolved_path.unlink()
+
+    assert immutable_path.read_bytes() == immutable_bytes
+
+
+def test_resume_launch_rejects_changed_docker_image_id(
+    tmp_path,
+    monkeypatch,
+):
+    _set_test_image_identity(
+        monkeypatch,
+        image_id="sha256:" + "e" * 64,
+    )
+    source_sha = "c" * 64
+    checkpoint, _ = _resume_checkpoint_fixture(
+        tmp_path,
+        source_config_sha256=source_sha,
+    )
+    plan = {
+        "config_sha256": source_sha,
+        "runtime": {
+            "num_processes": 8,
+            "container_image": "test-image:latest",
+        },
+    }
+
+    with pytest.raises(
+        h100_training.PlanError,
+        match="Docker Image.Id does not match",
+    ):
+        h100_training._resolved_launch_config(
+            CONFIG,
+            plan,
+            run_id=None,
+            resume_checkpoint=checkpoint,
+        )
+
+
+def test_resume_launch_rejects_immutable_yaml_json_drift(
+    tmp_path,
+    monkeypatch,
+):
+    _set_test_image_identity(monkeypatch)
+    source_sha = "d" * 64
+    checkpoint, immutable_path = _resume_checkpoint_fixture(
+        tmp_path,
+        source_config_sha256=source_sha,
+    )
+    json_path = immutable_path.with_suffix(".json")
+    payload = json.loads(json_path.read_text(encoding="utf-8"))
+    payload["datasets"]["vla_data"]["num_workers"] = 999
+    json_path.write_text(
+        json.dumps(payload, indent=2, allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
+    plan = {
+        "config_sha256": source_sha,
+        "runtime": {
+            "num_processes": 8,
+            "container_image": "test-image:latest",
+        },
+    }
+
+    with pytest.raises(
+        h100_training.PlanError,
+        match="YAML/JSON mismatch",
+    ):
+        h100_training._resolved_launch_config(
+            CONFIG,
+            plan,
+            run_id=None,
+            resume_checkpoint=checkpoint,
+        )
+
+
+@pytest.mark.parametrize("resume", (False, True))
+def test_direct_human_launch_revalidates_exact_generated_yaml(
+    tmp_path,
+    monkeypatch,
+    resume,
+):
+    source = tmp_path / "source.yaml"
+    source.write_text("run_id: source\n", encoding="utf-8")
+    generated = tmp_path / "generated.yaml"
+    generated.write_text("run_id: generated\n", encoding="utf-8")
+    source_plan = {
+        "runtime": {
+            "num_processes": 8,
+            "num_machines": 1,
+            "mixed_precision": "bf16",
+            "dynamo_backend": "no",
+            "main_process_port": 29500,
+            "use_deepspeed": False,
+            "torch_compile_environment": "disabled",
+            "network_interface": "lo",
+        },
+        "training": {"run_id_prefix": "source"},
+    }
+    materialized_plan = copy.deepcopy(source_plan)
+    materialized_plan["training"]["run_id_prefix"] = "generated"
+    seen = []
+
+    monkeypatch.setattr(
+        h100_training,
+        "check_plan",
+        lambda path, *, deep: copy.deepcopy(source_plan),
+    )
+    monkeypatch.setattr(
+        h100_training,
+        "_resolved_launch_config",
+        lambda *args, **kwargs: (generated, "generated"),
+    )
+
+    def resolve_exact(path, *, allow_transport_resume=False, **kwargs):
+        seen.append((Path(path), allow_transport_resume))
+        return copy.deepcopy(materialized_plan)
+
+    monkeypatch.setattr(h100_training, "resolve_plan", resolve_exact)
+
+    h100_training.launch(
+        source,
+        run_id=None,
+        resume_checkpoint=(tmp_path / "steps_1") if resume else None,
+        print_command_only=True,
+    )
+
+    assert seen == [(generated, resume)]
+
+
+def test_runtime_correction_resume_revalidates_exact_generated_yaml(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "source.yaml"
+    source.write_text("run_id: source\n", encoding="utf-8")
+    generated = tmp_path / "generated-resume.yaml"
+    generated.write_text(
+        """
+run_id: generated
+resume_runtime_override:
+  runtime_config_path: /tmp/reviewed-runtime.yaml
+  runtime_config_sha256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  resume_helper_path: /workspace/VLA-JEPA/scripts/h100_resume_runtime.py
+  resume_helper_sha256: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+  changes:
+    datasets.vla_data.num_workers:
+      previous: 1
+      resumed: 4
+    datasets.vla_data.multiprocessing_context:
+      previous: spawn
+      resumed: forkserver
+""".lstrip(),
+        encoding="utf-8",
+    )
+    source_plan = {
+        "runtime": {
+            "num_processes": 8,
+            "num_machines": 1,
+            "mixed_precision": "bf16",
+            "dynamo_backend": "no",
+            "main_process_port": 29500,
+            "use_deepspeed": False,
+            "torch_compile_environment": "disabled",
+            "network_interface": "lo",
+        }
+    }
+    materialized_plan = copy.deepcopy(source_plan)
+    seen = []
+    monkeypatch.setattr(
+        h100_training,
+        "check_plan",
+        lambda path, *, deep: copy.deepcopy(source_plan),
+    )
+    monkeypatch.setattr(
+        h100_resume_runtime,
+        "_resolved_resume_config",
+        lambda *args, **kwargs: (generated, "generated"),
+    )
+
+    def resolve_exact(path, *, allow_transport_resume=False, **kwargs):
+        seen.append((Path(path), allow_transport_resume))
+        return copy.deepcopy(materialized_plan)
+
+    monkeypatch.setattr(h100_training, "resolve_plan", resolve_exact)
+
+    h100_resume_runtime.launch(
+        source,
+        checkpoint=tmp_path / "steps_1",
+        resume_runtime_config=tmp_path / "runtime.yaml",
+        print_command_only=True,
+    )
+
+    assert seen == [(generated, True)]
 
 
 def _capture_docker_run(tmp_path: Path, **extra_env: str) -> list[str]:
@@ -1935,6 +2523,139 @@ def test_docker_runner_supports_named_detached_human_run(tmp_path):
     assert "HOME=/tmp/human-home" in arguments
 
 
+def test_docker_runner_does_not_forward_semantic_env_for_authoritative_config(
+    tmp_path,
+):
+    arguments = _capture_docker_run(
+        tmp_path,
+        STARVLA_CONFIG_IS_AUTHORITATIVE="1",
+        MAX_TRAIN_STEPS="999",
+        DATALOADER_NUM_WORKERS="99",
+        STARVLA_ENABLE_FLASH_ATTN_WORLD_MODEL="1",
+        NCCL_SOCKET_IFNAME="stale-nccl0",
+        GLOO_SOCKET_IFNAME="stale-gloo0",
+        NCCL_IB_DISABLE="1",
+        WANDB_MODE="offline",
+        TOKENIZERS_PARALLELISM="true",
+        OMP_NUM_THREADS="99",
+        FFMPEG_THREADS="88",
+    )
+
+    assert "STARVLA_CONFIG_IS_AUTHORITATIVE=1" in arguments
+    assert "MAX_TRAIN_STEPS=999" not in arguments
+    assert "DATALOADER_NUM_WORKERS=99" not in arguments
+    assert "STARVLA_ENABLE_FLASH_ATTN_WORLD_MODEL=1" not in arguments
+    assert "NCCL_SOCKET_IFNAME=stale-nccl0" not in arguments
+    assert "GLOO_SOCKET_IFNAME=stale-gloo0" not in arguments
+    assert "NCCL_IB_DISABLE=1" not in arguments
+    assert "WANDB_MODE=offline" not in arguments
+    assert "TOKENIZERS_PARALLELISM=true" not in arguments
+    assert "OMP_NUM_THREADS=99" not in arguments
+    assert "FFMPEG_THREADS=88" not in arguments
+
+
+def test_docker_runner_preserves_legacy_runtime_environment_defaults(
+    tmp_path,
+):
+    arguments = _capture_docker_run(
+        tmp_path,
+        STARVLA_CONFIG_IS_AUTHORITATIVE="0",
+        WANDB_MODE="offline",
+        TOKENIZERS_PARALLELISM="true",
+        OMP_NUM_THREADS="3",
+        FFMPEG_THREADS="4",
+    )
+
+    assert "WANDB_MODE=offline" in arguments
+    assert "TOKENIZERS_PARALLELISM=true" in arguments
+    assert "OMP_NUM_THREADS=3" in arguments
+    assert "FFMPEG_THREADS=4" in arguments
+
+
+def test_direct_human_launch_scrubs_ambient_semantic_environment(
+    monkeypatch,
+    tmp_path,
+):
+    resolved = tmp_path / "resolved.yaml"
+    resolved.write_text("run_id: unit\n", encoding="utf-8")
+    plan = {
+        "runtime": {
+            "use_deepspeed": False,
+            "torch_compile_environment": "disabled",
+            "main_torch_threads": 1,
+            "main_torch_interop_threads": 1,
+            "disable_autograd_multithreading": True,
+            "pytorch_cuda_alloc_conf": "expandable_segments:True",
+            "tokenizers_parallelism": False,
+            "network_interface": "reviewed0",
+        }
+    }
+    captured: dict[str, str] = {}
+
+    class ExecIntercept(RuntimeError):
+        pass
+
+    monkeypatch.setattr(
+        h100_training,
+        "check_plan",
+        lambda config_path, *, deep: plan,
+    )
+    monkeypatch.setattr(
+        h100_training,
+        "_resolved_launch_config",
+        lambda *args, **kwargs: (resolved, "unit"),
+    )
+    monkeypatch.setattr(
+        h100_training,
+        "resolve_plan",
+        lambda *args, **kwargs: plan,
+    )
+    monkeypatch.setattr(
+        h100_training,
+        "_accelerate_command",
+        lambda *args, **kwargs: ["accelerate", "launch"],
+    )
+    monkeypatch.setattr(h100_training.os, "chdir", lambda path: None)
+
+    def intercept_exec(executable, command, env):
+        captured.update(env)
+        raise ExecIntercept
+
+    monkeypatch.setattr(h100_training.os, "execvpe", intercept_exec)
+    monkeypatch.setenv("MAX_TRAIN_STEPS", "999")
+    monkeypatch.setenv("DATALOADER_NUM_WORKERS", "99")
+    monkeypatch.setenv("STARVLA_ENABLE_FLASH_ATTN_WORLD_MODEL", "1")
+    monkeypatch.setenv("NCCL_SOCKET_IFNAME", "stale-nccl0")
+    monkeypatch.setenv("GLOO_SOCKET_IFNAME", "stale-gloo0")
+    monkeypatch.setenv("NCCL_IB_DISABLE", "1")
+    monkeypatch.setenv("TORCH_COMPILE_DISABLE", "0")
+    monkeypatch.setenv("TORCHDYNAMO_DISABLE", "0")
+
+    with pytest.raises(ExecIntercept):
+        h100_training.launch(
+            CONFIG,
+            run_id=None,
+            resume_checkpoint=None,
+            print_command_only=False,
+        )
+
+    assert "MAX_TRAIN_STEPS" not in captured
+    assert "DATALOADER_NUM_WORKERS" not in captured
+    assert "STARVLA_ENABLE_FLASH_ATTN_WORLD_MODEL" not in captured
+    assert "NCCL_IB_DISABLE" not in captured
+    assert captured["STARVLA_USE_DEEPSPEED"] == "0"
+    assert captured["TORCH_COMPILE_DISABLE"] == "1"
+    assert captured["TORCHDYNAMO_DISABLE"] == "1"
+    assert captured["VLA_JEPA_MAIN_TORCH_THREADS"] == "1"
+    assert captured["VLA_JEPA_MAIN_TORCH_INTEROP_THREADS"] == "1"
+    assert captured["VLA_JEPA_DISABLE_AUTOGRAD_MULTITHREADING"] == "1"
+    assert captured["PYTORCH_CUDA_ALLOC_CONF"] == "expandable_segments:True"
+    assert captured["TOKENIZERS_PARALLELISM"] == "false"
+    assert captured["STARVLA_ALLOW_TORCH_COMPILE"] == "0"
+    assert captured["NCCL_SOCKET_IFNAME"] == "reviewed0"
+    assert captured["GLOO_SOCKET_IFNAME"] == "reviewed0"
+
+
 def test_docker_runner_mounts_gcloud_auth_under_nonroot_home(tmp_path):
     sdk = tmp_path / "google-cloud-sdk"
     config = tmp_path / "gcloud-config"
@@ -1974,3 +2695,49 @@ def test_human_entrypoints_are_executable_and_shell_valid():
     assert "plan" in result.stdout
     assert "check" in result.stdout
     assert "start" in result.stdout
+    launcher_source = SHELL.read_text(encoding="utf-8")
+    assert launcher_source.count("STARVLA_CONFIG_IS_AUTHORITATIVE=1") >= 3
+
+
+@pytest.mark.parametrize(
+    "command",
+    ("setup", "plan", "prepare", "check", "start", "resume"),
+)
+def test_human_h100_shell_commands_require_explicit_config(command):
+    result = subprocess.run(
+        ["bash", str(SHELL), command],
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode == 2
+    assert f"{command} requires an explicit --config YAML" in result.stderr
+
+
+def test_human_h100_shell_rejects_config_symlink(tmp_path):
+    target = tmp_path / "training-target.yaml"
+    target.write_text("schema_version: 1\n", encoding="utf-8")
+    link = tmp_path / "training.yaml"
+    link.symlink_to(target)
+
+    result = subprocess.run(
+        ["bash", str(SHELL), "plan", "--config", str(link)],
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode == 2
+    assert "regular non-symlink file" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "command",
+    ("setup", "plan", "prepare", "check", "launch"),
+)
+def test_human_h100_python_commands_require_explicit_config(command):
+    with pytest.raises(SystemExit) as exc_info:
+        h100_training._parser().parse_args([command])
+
+    assert exc_info.value.code == 2

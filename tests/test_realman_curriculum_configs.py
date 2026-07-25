@@ -33,6 +33,7 @@ def _load_yaml(path: Path) -> dict:
 def test_curriculum_declares_bootstrap_and_complete_view_epochs():
     payload = _load_yaml(PRODUCTION_CONFIG)
     assert payload["schema_version"] == 2
+    assert payload["workflow_kind"] == "production_curriculum"
     assert set(payload["bootstrap"]) == {
         "stage_config",
         "container_image",
@@ -68,8 +69,8 @@ def test_curriculum_declares_bootstrap_and_complete_view_epochs():
         stage["local_evaluation_manifest_sha256"] for stage in stages
     ] == [
         "592400d73c2e7bcea0969c1b150744bea44d0ae7738e807bf97e8b9157f2c794",
-        "8836ffca045363d04fed2fb491c14cce1973ec5def924acbf750780841b232b1",
-        "60c71b84228fbf6a296a39eadbd712efc720a71e24a6dfde2ec4990b5e186389",
+        "c0f64465eff57ff7e253cbf15bb3c612eb6befa5ce3e81bd12a32f9baa24e72b",
+        "9730807c0ba8688c6ae525126fdf306cfbadb3d67366392c5f6eefe3399292a2",
     ]
     assert stages[0]["monitoring"]["first_epoch_exposure_fractions"] == [
         0.25,
@@ -123,11 +124,14 @@ def test_stage_configs_are_exhaustive_and_lr_contract_is_config_owned(
         [0.25, 0.5, 1.0] if name.startswith("realsource_") else [1.0]
     )
     assert trainer["checkpoint_eval_milestone_fractions"] == expected_fractions
-    assert trainer["checkpoint_eval_milestone_steps"] is None
+    assert trainer["checkpoint_eval_milestone_steps"] == "auto"
+    assert (
+        trainer["checkpoint_eval_include_full_epoch_boundaries"] is True
+    )
     assert trainer["checkpoint_eval_milestones_only"] is True
     assert trainer["checkpoint_max_to_keep"] == 0
     assert trainer["warmup_ratio"] == pytest.approx(0.05)
-    assert trainer["num_warmup_steps"] == 0
+    assert trainer["num_warmup_steps"] == "auto"
     assert trainer["scheduler_specific_kwargs"]["min_lr_rate"] == pytest.approx(
         0.05
     )

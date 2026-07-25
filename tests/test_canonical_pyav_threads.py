@@ -266,7 +266,7 @@ def test_gcloud_file_copy_retries_timeout(monkeypatch, tmp_path):
     assert not list(tmp_path.glob("*.tmp"))
 
 
-def test_canonical_worker_memory_budget_clamps_overcommit(monkeypatch):
+def test_canonical_worker_memory_budget_rejects_overcommit(monkeypatch):
     cfg = {
         "enforce_worker_memory_budget": True,
         "estimated_worker_memory_gb": 5.0,
@@ -275,10 +275,53 @@ def test_canonical_worker_memory_budget_clamps_overcommit(monkeypatch):
     monkeypatch.setattr(dataloader_pkg, "_host_memory_gib", lambda: 62.0)
     monkeypatch.setattr(dataloader_pkg, "_distributed_world_size", lambda: 1)
 
-    assert dataloader_pkg._maybe_clamp_canonical_workers_for_memory(cfg, 12) == 8
+    with pytest.raises(ValueError, match="num_workers exceeds"):
+        dataloader_pkg._maybe_clamp_canonical_workers_for_memory(cfg, 12)
 
     cfg["enforce_worker_memory_budget"] = False
     assert dataloader_pkg._maybe_clamp_canonical_workers_for_memory(cfg, 12) == 12
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    (
+        ("prefetch_factor", 0),
+        ("prefetch_factor", -1),
+        ("prefetch_factor", True),
+        ("prefetch_factor", "2"),
+        ("worker_torch_threads", 0),
+        ("worker_cv2_threads", -1),
+    ),
+)
+def test_worker_knobs_fail_instead_of_being_clamped(key, value):
+    with pytest.raises(ValueError, match=key):
+        dataloader_pkg._positive_loader_integer({key: value}, key)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("estimated_worker_memory_gb", 0.0),
+        ("estimated_worker_memory_gb", float("inf")),
+        ("worker_memory_budget_fraction", 0.0),
+        ("worker_memory_budget_fraction", 1.01),
+    ),
+)
+def test_canonical_worker_memory_values_fail_instead_of_being_clamped(
+    monkeypatch,
+    field,
+    value,
+):
+    cfg = {
+        "enforce_worker_memory_budget": True,
+        "estimated_worker_memory_gb": 5.0,
+        "worker_memory_budget_fraction": 0.65,
+    }
+    cfg[field] = value
+    monkeypatch.setattr(dataloader_pkg, "_host_memory_gib", lambda: 62.0)
+
+    with pytest.raises(ValueError, match=field):
+        dataloader_pkg._maybe_clamp_canonical_workers_for_memory(cfg, 1)
 
 
 def test_shard_data_prefetch_downloads_next_shard(monkeypatch, tmp_path):

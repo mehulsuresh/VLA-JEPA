@@ -51,14 +51,69 @@ from starVLA.holdout_selection_contract import (
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_CONFIG = REPO_ROOT / (
-    "scripts/config/"
-    "vlajepa_robot_ft_lerobot_magna_interventions_"
-    "h100x8_b16_qwen35_2b_full_moge_vitb_vjepa_large.yaml"
-)
 RUN_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
 CHECKPOINT_RE = re.compile(r"steps_([0-9]+)")
 HELPER_REPOSITORY_RE = re.compile(r"[a-z][a-z0-9_-]*")
+CONTAINER_IMAGE_ID_RE = re.compile(r"sha256:[0-9a-f]{64}")
+AUTHORITATIVE_SEMANTIC_ENV_VARS = frozenset(
+    {
+        "ACCELERATE_CONFIG_FILE",
+        "ACCELERATE_DISTRIBUTED_TYPE",
+        "ACCELERATE_DYNAMO_BACKEND",
+        "ACCELERATE_MIXED_PRECISION",
+        "ACCELERATE_NUM_MACHINES",
+        "ACCELERATE_NUM_PROCESSES",
+        "ACCELERATE_USE_DEEPSPEED",
+        "CONFIG_YAML",
+        "DATALOADER_NUM_WORKERS",
+        "DATALOADER_PERSISTENT_WORKERS",
+        "DATALOADER_PREFETCH_FACTOR",
+        "DATALOADER_TIMEOUT_SECONDS",
+        "DDP_BUCKET_CAP_MB",
+        "DDP_GRADIENT_AS_BUCKET_VIEW",
+        "DDP_STATIC_GRAPH",
+        "EPOCHS",
+        "EVAL_INTERVAL",
+        "FIND_UNUSED_PARAMETERS",
+        "GLOO_SOCKET_IFNAME",
+        "LOGGING_FREQUENCY",
+        "MAIN_PROCESS_PORT",
+        "MAX_TRAIN_STEPS",
+        "NCCL_IB_DISABLE",
+        "NCCL_SOCKET_IFNAME",
+        "NUM_PROCESSES",
+        "NUM_WARMUP_STEPS",
+        "PER_DEVICE_BATCH_SIZE",
+        "RUN_ID",
+        "SAVE_INTERVAL",
+        "STARVLA_ALLOW_COMPILE_WITH_DEEPSPEED",
+        "STARVLA_ALLOW_TORCH_COMPILE",
+        "STARVLA_DATASET_TIMING",
+        "STARVLA_DATASET_TIMING_EVERY",
+        "STARVLA_DATASET_TIMING_SLOW_SECONDS",
+        "STARVLA_DEEPSPEED_STAGE",
+        "STARVLA_DETAILED_TIMING",
+        "STARVLA_DETAILED_TIMING_FREQUENCY",
+        "STARVLA_DISABLE_FLASH_ATTN_WORLD_MODEL",
+        "STARVLA_DISABLE_FLASH_ATTN_PROMOTION",
+        "STARVLA_DISABLE_TORCH_COMPILE",
+        "STARVLA_ENABLE_FLASH_ATTN_WORLD_MODEL",
+        "STARVLA_USE_DEEPSPEED",
+        "TORCH_COMPILE_DISABLE",
+        "TORCHDYNAMO_DISABLE",
+        "TOKENIZERS_PARALLELISM",
+        "OMP_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+        "PYTORCH_CUDA_ALLOC_CONF",
+        "VLA_JEPA_DISABLE_AUTOGRAD_MULTITHREADING",
+        "VLA_JEPA_MAIN_TORCH_INTEROP_THREADS",
+        "VLA_JEPA_MAIN_TORCH_THREADS",
+        "VIDEO_BACKEND",
+        "VIDEO_BACKEND_NUM_THREADS",
+    }
+)
 
 REALMAN_LEROBOT_PROFILE = "realman_lerobot"
 LIBERO_LEROBOT_PROFILE = "libero_lerobot"
@@ -229,14 +284,28 @@ def _load_config(
     return cfg, payload
 
 
-def _config_contract_sha256(config_path: Path, cfg: DictConfig) -> str:
-    """Hash direct configs byte-for-byte and composed configs after resolution."""
+def _config_contract_bytes(
+    config_path: Path,
+    cfg: DictConfig,
+) -> bytes:
+    """Return the exact bytes used to bind a reviewed config contract."""
 
     raw = OmegaConf.load(config_path)
     if not isinstance(raw, DictConfig) or raw.get("extends") is None:
-        return _sha256(config_path)
-    resolved = OmegaConf.to_yaml(cfg, resolve=True, sort_keys=True).encode("utf-8")
-    return hashlib.sha256(resolved).hexdigest()
+        return config_path.read_bytes()
+    return OmegaConf.to_yaml(
+        cfg,
+        resolve=True,
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def _config_contract_sha256(config_path: Path, cfg: DictConfig) -> str:
+    """Hash direct configs byte-for-byte and composed configs after resolution."""
+
+    return hashlib.sha256(
+        _config_contract_bytes(config_path, cfg)
+    ).hexdigest()
 
 
 def _validate_runtime(payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -253,6 +322,8 @@ def _validate_runtime(payload: Mapping[str, Any]) -> dict[str, Any]:
         "runtime.dynamo_backend": "no",
         "runtime.use_deepspeed": False,
         "runtime.torch_compile_environment": "disabled",
+        "runtime.disable_autograd_multithreading": True,
+        "runtime.tokenizers_parallelism": False,
     }
     for path, expected in exact.items():
         actual = _get(payload, path)
@@ -359,6 +430,25 @@ def _validate_runtime(payload: Mapping[str, Any]) -> dict[str, Any]:
     if not 1024 <= port <= 65535:
         raise PlanError("runtime.main_process_port must be between 1024 and 65535")
     network = _require_nonempty_string(payload, "runtime.network_interface")
+    main_torch_threads = _require_type(
+        payload,
+        "runtime.main_torch_threads",
+        int,
+    )
+    main_torch_interop_threads = _require_type(
+        payload,
+        "runtime.main_torch_interop_threads",
+        int,
+    )
+    if main_torch_threads <= 0 or main_torch_interop_threads <= 0:
+        raise PlanError(
+            "runtime.main_torch_threads and "
+            "runtime.main_torch_interop_threads must be positive integers"
+        )
+    pytorch_cuda_alloc_conf = _require_nonempty_string(
+        payload,
+        "runtime.pytorch_cuda_alloc_conf",
+    )
     require_clean = _require_type(payload, "runtime.require_clean_git", bool)
     provenance_launcher = _resolve_repo_path(
         _require_nonempty_string(payload, "runtime.provenance_launcher"),
@@ -430,6 +520,11 @@ def _validate_runtime(payload: Mapping[str, Any]) -> dict[str, Any]:
         "main_process_port": port,
         "use_deepspeed": False,
         "torch_compile_environment": "disabled",
+        "main_torch_threads": main_torch_threads,
+        "main_torch_interop_threads": main_torch_interop_threads,
+        "disable_autograd_multithreading": True,
+        "pytorch_cuda_alloc_conf": pytorch_cuda_alloc_conf,
+        "tokenizers_parallelism": False,
         "network_interface": network,
         "require_clean_git": require_clean,
         "provenance_launcher": provenance_launcher,
@@ -438,7 +533,10 @@ def _validate_runtime(payload: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _validate_training_contract(
-    payload: Mapping[str, Any], runtime: Mapping[str, Any]
+    payload: Mapping[str, Any],
+    runtime: Mapping[str, Any],
+    *,
+    allow_transport_resume: bool = False,
 ) -> dict[str, Any]:
     """Validate common training settings and one explicit dataset-family contract.
 
@@ -454,6 +552,7 @@ def _validate_training_contract(
         "framework.name",
         "framework.qwenvl.base_vlm",
         "framework.qwenvl.attn_implementation",
+        "framework.vj2_model.predictor_attention_backend",
         "framework.action_model.action_model_type",
         "datasets.vla_data.dataset_py",
         "datasets.vla_data.action_type",
@@ -478,6 +577,8 @@ def _validate_training_contract(
         "datasets.vla_data.drop_last",
         "trainer.eval_before_train",
         "trainer.allow_training_stream_eval",
+        "trainer.checkpoint_eval_include_full_epoch_boundaries",
+        "trainer.checkpoint_eval_milestones_only",
         "trainer.detailed_timing_logging",
         "trainer.enable_mixed_precision_training",
         "trainer.find_unused_parameters",
@@ -507,8 +608,9 @@ def _validate_training_contract(
         "datasets.vla_data.per_device_batch_size",
         "datasets.vla_data.num_workers",
         "datasets.vla_data.prefetch_factor",
+        "datasets.vla_data.worker_torch_threads",
+        "datasets.vla_data.worker_cv2_threads",
         "trainer.epochs",
-        "trainer.num_warmup_steps",
         "trainer.save_interval",
         "trainer.eval_interval",
         "trainer.checkpoint_max_to_keep",
@@ -521,16 +623,102 @@ def _validate_training_contract(
     )
     for path in required_integers:
         _require_type(payload, path, int)
+    multiprocessing_context = _require_nonempty_string(
+        payload,
+        "datasets.vla_data.multiprocessing_context",
+    )
+    if multiprocessing_context not in {"spawn", "forkserver"}:
+        raise PlanError(
+            "datasets.vla_data.multiprocessing_context must be explicitly "
+            "'spawn' or 'forkserver'"
+        )
 
     action = _get(payload, "framework.action_model")
     data = _get(payload, "datasets.vla_data")
     trainer = _get(payload, "trainer")
+    for key in (
+        "checkpoint_eval_milestone_fractions",
+        "checkpoint_eval_milestone_steps",
+    ):
+        if key not in trainer:
+            raise PlanError(
+                f"trainer.{key} must be explicitly configured (null is "
+                "allowed when the feature is disabled)"
+            )
+    configured_warmup_steps = trainer.get("num_warmup_steps")
+    if isinstance(configured_warmup_steps, bool) or not (
+        (
+            isinstance(configured_warmup_steps, int)
+            and configured_warmup_steps >= 0
+        )
+        or (
+            isinstance(configured_warmup_steps, str)
+            and configured_warmup_steps == "auto"
+        )
+    ):
+        raise PlanError(
+            "trainer.num_warmup_steps must be a non-negative integer or "
+            "the explicit string 'auto'"
+        )
+    configured_warmup_ratio = trainer.get("warmup_ratio")
+    if (
+        isinstance(configured_warmup_ratio, bool)
+        or not isinstance(configured_warmup_ratio, (int, float))
+        or not math.isfinite(float(configured_warmup_ratio))
+        or not 0.0 <= float(configured_warmup_ratio) <= 1.0
+    ):
+        raise PlanError(
+            "trainer.warmup_ratio must be a finite number in [0, 1]"
+        )
+    if (
+        isinstance(configured_warmup_steps, int)
+        and configured_warmup_steps > 0
+        and float(configured_warmup_ratio) != 0.0
+    ):
+        raise PlanError(
+            "trainer.warmup_ratio must be 0 when trainer.num_warmup_steps "
+            "owns an exact positive step count"
+        )
+    if (
+        configured_warmup_steps == 0
+        and float(configured_warmup_ratio) != 0.0
+    ):
+        raise PlanError(
+            "trainer.num_warmup_steps=0 conflicts with a nonzero "
+            "trainer.warmup_ratio; use num_warmup_steps: auto to resolve the "
+            "ratio after the exact dataset schedule is known"
+        )
+    if (
+        configured_warmup_steps == "auto"
+        and float(configured_warmup_ratio) <= 0.0
+    ):
+        raise PlanError(
+            "trainer.num_warmup_steps=auto requires trainer.warmup_ratio > 0"
+        )
     dataset_py = str(data["dataset_py"])
     action_type = str(data["action_type"])
     state_dim = int(action["state_dim"])
     action_dim = int(action["action_dim"])
     action_horizon = int(action["action_horizon"])
     future_window = int(action["future_action_window_size"])
+    predictor_attention_backend = _get(
+        payload,
+        "framework.vj2_model.predictor_attention_backend",
+    )
+    if predictor_attention_backend not in {"torch_sdpa", "flash_attn"}:
+        raise PlanError(
+            "framework.vj2_model.predictor_attention_backend must be "
+            "'torch_sdpa' or 'flash_attn'"
+        )
+    for field in (
+        "prefetch_factor",
+        "worker_torch_threads",
+        "worker_cv2_threads",
+    ):
+        if int(data[field]) <= 0:
+            raise PlanError(
+                f"datasets.vla_data.{field} must be a positive integer"
+            )
 
     milestone_fractions = trainer.get(
         "checkpoint_eval_milestone_fractions", None
@@ -568,11 +756,18 @@ def _validate_training_contract(
         milestone_fractions = normalized_fractions
 
     milestone_steps = trainer.get("checkpoint_eval_milestone_steps", None)
-    if milestone_steps is not None:
+    if isinstance(milestone_steps, str):
+        if milestone_steps.lower() != "auto":
+            raise PlanError(
+                "trainer.checkpoint_eval_milestone_steps must be 'auto', null, "
+                "or a sorted, unique list of positive integers"
+            )
+        milestone_steps = "auto"
+    elif milestone_steps is not None:
         if not isinstance(milestone_steps, list):
             raise PlanError(
-                "trainer.checkpoint_eval_milestone_steps must be null or a "
-                "sorted, unique list of positive integers"
+                "trainer.checkpoint_eval_milestone_steps must be 'auto', null, "
+                "or a sorted, unique list of positive integers"
             )
         if any(type(step) is not int or step <= 0 for step in milestone_steps):
             raise PlanError(
@@ -596,6 +791,15 @@ def _validate_training_contract(
             )
         milestone_steps = list(milestone_steps)
 
+    include_full_epoch_boundaries = trainer.get(
+        "checkpoint_eval_include_full_epoch_boundaries",
+        False,
+    )
+    if type(include_full_epoch_boundaries) is not bool:
+        raise PlanError(
+            "trainer.checkpoint_eval_include_full_epoch_boundaries must be a "
+            "boolean"
+        )
     milestone_only = trainer.get(
         "checkpoint_eval_milestones_only", False
     )
@@ -955,6 +1159,39 @@ def _validate_training_contract(
             raise PlanError(
                 "datasets.vla_data.camera_slots must be a non-empty list of strings"
             )
+        _require_type(
+            payload,
+            "datasets.vla_data.enforce_worker_memory_budget",
+            bool,
+        )
+        estimated_worker_memory_gb = _get(
+            payload,
+            "datasets.vla_data.estimated_worker_memory_gb",
+        )
+        worker_memory_budget_fraction = _get(
+            payload,
+            "datasets.vla_data.worker_memory_budget_fraction",
+        )
+        if (
+            isinstance(estimated_worker_memory_gb, bool)
+            or not isinstance(estimated_worker_memory_gb, (int, float))
+            or not math.isfinite(float(estimated_worker_memory_gb))
+            or float(estimated_worker_memory_gb) <= 0.0
+        ):
+            raise PlanError(
+                "datasets.vla_data.estimated_worker_memory_gb must be a "
+                "positive finite number"
+            )
+        if (
+            isinstance(worker_memory_budget_fraction, bool)
+            or not isinstance(worker_memory_budget_fraction, (int, float))
+            or not math.isfinite(float(worker_memory_budget_fraction))
+            or not 0.0 < float(worker_memory_budget_fraction) <= 1.0
+        ):
+            raise PlanError(
+                "datasets.vla_data.worker_memory_budget_fraction must be "
+                "a finite number in (0, 1]"
+            )
         canonical_exact_realman_contract = (
             state_dim,
             action_dim,
@@ -1144,13 +1381,31 @@ def _validate_training_contract(
         bool(trainer[name]) for name in compile_flags
     ):
         raise PlanError("runtime disables torch.compile but a trainer compile flag is true")
-    if bool(trainer["is_resume"]) or bool(trainer["eval_only"]):
+    if bool(trainer["eval_only"]):
         raise PlanError(
-            "source production YAML must describe a fresh train; use the human resume command for transport state"
+            "source production YAML must describe training, not eval-only "
+            "transport state"
         )
-    if trainer.get("resume_from_checkpoint") is not None:
+    if bool(trainer["is_resume"]) and not allow_transport_resume:
+        raise PlanError(
+            "source production YAML must describe a fresh train; use the human "
+            "resume command for transport state"
+        )
+    resume_from_checkpoint = trainer.get("resume_from_checkpoint")
+    if not allow_transport_resume and resume_from_checkpoint is not None:
         raise PlanError(
             "source production YAML must explicitly set trainer.resume_from_checkpoint: null"
+        )
+    if allow_transport_resume and (
+        not bool(trainer["is_resume"])
+        or not isinstance(resume_from_checkpoint, str)
+        or not resume_from_checkpoint.strip()
+        or not Path(resume_from_checkpoint).is_absolute()
+    ):
+        raise PlanError(
+            "authenticated transport-resume config must set "
+            "trainer.is_resume=true and an absolute "
+            "trainer.resume_from_checkpoint"
         )
     if not bool(trainer["resume_load_optimizer_state"]):
         raise PlanError("production resume must restore optimizer and scheduler state")
@@ -1172,8 +1427,11 @@ def _validate_training_contract(
             holdout_episode_count is None
             and holdout_sampling_policy is None
         ):
-            holdout_episode_count = global_batch
-            evaluation_observation_count = global_batch
+            raise PlanError(
+                "RealMan H100 training requires an explicit immutable "
+                "holdout episode count or datasets.vla_data.holdout_sampling; "
+                "the launcher will not infer it from global batch size"
+            )
         if (
             holdout_episode_count is not None
             and global_batch % holdout_episode_count != 0
@@ -1279,6 +1537,9 @@ def _validate_training_contract(
         "run_root_dir": str(run_root),
         "base_vlm": _get(payload, "framework.qwenvl.base_vlm"),
         "attention": _get(payload, "framework.qwenvl.attn_implementation"),
+        "world_model_predictor_attention_backend": (
+            predictor_attention_backend
+        ),
         "fast_linear_attention": _get(
             payload, "framework.qwenvl.enable_fast_linear_attention"
         ),
@@ -1391,6 +1652,9 @@ def _validate_training_contract(
             milestone_fractions
         ),
         "checkpoint_eval_milestone_steps": copy.deepcopy(milestone_steps),
+        "checkpoint_eval_include_full_epoch_boundaries": (
+            include_full_epoch_boundaries
+        ),
         "checkpoint_eval_milestones_only": milestone_only,
         "checkpoint_max_to_keep": trainer["checkpoint_max_to_keep"],
         "pretrained_checkpoint": pretrained_checkpoint,
@@ -2458,11 +2722,20 @@ def _validate_dataset_artifacts(
     raise AssertionError(profile)
 
 
-def resolve_plan(config_path: Path, *, validate_artifacts: bool = True) -> dict[str, Any]:
+def resolve_plan(
+    config_path: Path,
+    *,
+    validate_artifacts: bool = True,
+    allow_transport_resume: bool = False,
+) -> dict[str, Any]:
     config_path = config_path.expanduser().resolve()
     cfg, payload = _load_config(config_path)
     runtime = _validate_runtime(payload)
-    contract = _validate_training_contract(payload, runtime)
+    contract = _validate_training_contract(
+        payload,
+        runtime,
+        allow_transport_resume=allow_transport_resume,
+    )
     plan = {
         "schema": "starvla-human-h100-training-plan-v1",
         "config_path": str(config_path),
@@ -2635,7 +2908,12 @@ def _print_plan(plan: Mapping[str, Any]) -> None:
     print()
 
 
-def _check_git(config_path: Path, required: bool) -> dict[str, str]:
+def _check_git(
+    config_path: Path,
+    required: bool,
+    *,
+    require_tracked: bool = False,
+) -> dict[str, str]:
     commit = subprocess.run(
         ["git", "-C", str(REPO_ROOT), "rev-parse", "HEAD"],
         check=True,
@@ -2665,7 +2943,7 @@ def _check_git(config_path: Path, required: bool) -> dict[str, str]:
         text=True,
         capture_output=True,
     )
-    if required and tracked.returncode != 0:
+    if (required or require_tracked) and tracked.returncode != 0:
         raise PlanError(f"production config must be tracked by Git: {config_path}")
     if required and status.strip():
         preview = "\n".join(status.splitlines()[:20])
@@ -2709,12 +2987,52 @@ def _check_files(plan: Mapping[str, Any]) -> None:
             raise PlanError(
                 f"pinned helper repository {name} is at {actual}, expected {entry['commit']}"
             )
-    expected_image = plan["runtime"]["container_image"]
-    actual_image = os.environ.get("STARVLA_CONTAINER_IMAGE")
-    if actual_image and actual_image != expected_image:
+    _required_container_image_identity(plan)
+
+
+def _required_container_image_identity(
+    plan: Mapping[str, Any],
+) -> tuple[str, str]:
+    """Authenticate the configured tag and host-resolved local Docker Image.Id.
+
+    A tag is intentionally config-owned, but tags are mutable.  The host
+    launcher resolves that tag once and starts Docker by the resulting Image.Id
+    while forwarding both identities here.  Requiring both values prevents a
+    direct Python invocation or a tag retarget between check and container
+    creation from weakening launch provenance.
+    """
+
+    configured_image = str(plan["runtime"]["container_image"])
+    actual_image = os.environ.get("STARVLA_CONTAINER_IMAGE", "").strip()
+    if not actual_image:
         raise PlanError(
-            f"container image mismatch: config={expected_image!r}, host={actual_image!r}"
+            "STARVLA_CONTAINER_IMAGE is required; use the human-facing H100 "
+            "launcher so the configured image tag is authenticated"
         )
+    if actual_image != configured_image:
+        raise PlanError(
+            f"container image mismatch: config={configured_image!r}, "
+            f"host={actual_image!r}"
+        )
+    image_id = os.environ.get("STARVLA_CONTAINER_IMAGE_ID", "").strip()
+    if not image_id:
+        raise PlanError(
+            "STARVLA_CONTAINER_IMAGE_ID is required; the human-facing H100 "
+            "launcher must resolve Docker's immutable local Image.Id"
+        )
+    if CONTAINER_IMAGE_ID_RE.fullmatch(image_id) is None:
+        raise PlanError(
+            "STARVLA_CONTAINER_IMAGE_ID must be sha256:<64 lowercase hex>"
+        )
+    legacy_digest = os.environ.get(
+        "STARVLA_CONTAINER_IMAGE_DIGEST", ""
+    ).strip()
+    if legacy_digest and legacy_digest != image_id:
+        raise PlanError(
+            "STARVLA_CONTAINER_IMAGE_DIGEST contradicts "
+            "STARVLA_CONTAINER_IMAGE_ID"
+        )
+    return actual_image, image_id
 
 
 def _check_hardware(plan: Mapping[str, Any]) -> None:
@@ -2863,25 +3181,252 @@ def _run_deep_preflight(config_path: Path, plan: Mapping[str, Any]) -> None:
             )
 
 
-def check_plan(config_path: Path, *, deep: bool) -> dict[str, Any]:
-    plan = resolve_plan(config_path)
+def _run_plan_checks(
+    plan: Mapping[str, Any],
+    *,
+    git_config_path: Path,
+    deep: bool,
+    require_tracked_config: bool = False,
+) -> dict[str, Any]:
     _print_plan(plan)
-    git = _check_git(
-        config_path.resolve(), bool(plan["runtime"]["require_clean_git"])
-    )
+    if require_tracked_config:
+        git = _check_git(
+            git_config_path.resolve(),
+            bool(plan["runtime"]["require_clean_git"]),
+            require_tracked=True,
+        )
+    else:
+        git = _check_git(
+            git_config_path.resolve(),
+            bool(plan["runtime"]["require_clean_git"]),
+        )
     _check_files(plan)
     _check_canonical_gcs_access(plan)
     _check_hardware(plan)
     _check_port(int(plan["runtime"]["main_process_port"]))
     if deep:
-        _run_deep_preflight(config_path, plan)
+        _run_deep_preflight(Path(str(plan["config_path"])), plan)
     print(f"Source commit               : {git['commit']}")
     print("H100x8 preflight            : PASS")
-    return plan
+    return dict(plan)
+
+
+def check_plan(config_path: Path, *, deep: bool) -> dict[str, Any]:
+    plan = resolve_plan(config_path)
+    return _run_plan_checks(
+        plan,
+        git_config_path=config_path,
+        deep=deep,
+    )
+
+
+def check_curriculum_materialized_plan(
+    materialized_config_path: Path,
+    *,
+    source_config_path: Path,
+    expected_source_config_sha256: str,
+    expected_materialized_config_sha256: str,
+    expected_run_id: str,
+    expected_pretrained_checkpoint: str | None,
+    expected_pretrained_checkpoint_sha256: str | None,
+    expected_curriculum_handoff: Mapping[str, Any],
+    base_materialized_config_path: Path | None = None,
+    expected_base_materialized_config_sha256: str | None = None,
+    expected_resume_checkpoint: Path | None = None,
+    deep: bool,
+) -> dict[str, Any]:
+    """Check one external curriculum config without weakening Git provenance.
+
+    Curriculum configs are necessarily written under the run/state root
+    because they bind a dynamic run ID and an authenticated predecessor model.
+    This narrow entrypoint still checks Git against the tracked source YAML and
+    proves that the external YAML differs only in those reviewed fields plus
+    immutable handoff provenance.  Arbitrary external configs never reach the
+    runtime checks.
+    """
+
+    source_config_path = source_config_path.expanduser()
+    if source_config_path.is_symlink():
+        raise PlanError(
+            "tracked curriculum source config must be a regular non-symlink "
+            f"file: {source_config_path}"
+        )
+    source_config_path = source_config_path.resolve()
+    materialized_config_path = materialized_config_path.expanduser()
+    if materialized_config_path.is_symlink():
+        raise PlanError(
+            "materialized curriculum config must be a regular non-symlink "
+            f"file: {materialized_config_path}"
+        )
+    materialized_config_path = materialized_config_path.resolve()
+    if base_materialized_config_path is not None:
+        base_materialized_config_path = (
+            base_materialized_config_path.expanduser()
+        )
+        if base_materialized_config_path.is_symlink():
+            raise PlanError(
+                "base materialized curriculum config must be a regular "
+                "non-symlink file: "
+                f"{base_materialized_config_path}"
+            )
+        base_materialized_config_path = base_materialized_config_path.resolve()
+    sha_re = re.compile(r"[0-9a-f]{64}")
+    if sha_re.fullmatch(expected_source_config_sha256) is None:
+        raise PlanError("expected source config SHA-256 is malformed")
+    if sha_re.fullmatch(expected_materialized_config_sha256) is None:
+        raise PlanError("expected materialized config SHA-256 is malformed")
+    if (base_materialized_config_path is None) != (
+        expected_base_materialized_config_sha256 is None
+    ):
+        raise PlanError(
+            "base materialized curriculum config path and SHA-256 must be "
+            "supplied together"
+        )
+    if (
+        expected_base_materialized_config_sha256 is not None
+        and sha_re.fullmatch(expected_base_materialized_config_sha256) is None
+    ):
+        raise PlanError("expected base materialized config SHA-256 is malformed")
+    if RUN_ID_RE.fullmatch(expected_run_id) is None:
+        raise PlanError("expected curriculum stage run ID is malformed")
+    if (expected_pretrained_checkpoint is None) != (
+        expected_pretrained_checkpoint_sha256 is None
+    ):
+        raise PlanError(
+            "expected predecessor checkpoint path and SHA-256 must be supplied "
+            "together"
+        )
+    if (
+        expected_pretrained_checkpoint_sha256 is not None
+        and sha_re.fullmatch(expected_pretrained_checkpoint_sha256) is None
+    ):
+        raise PlanError("expected predecessor checkpoint SHA-256 is malformed")
+    if not isinstance(expected_curriculum_handoff, Mapping):
+        raise PlanError("expected curriculum handoff must be an object")
+    if (base_materialized_config_path is None) != (
+        expected_resume_checkpoint is None
+    ):
+        raise PlanError(
+            "an exact expected resume checkpoint is required iff a base "
+            "materialized curriculum config is supplied"
+        )
+
+    def load_authenticated_materialization(
+        path: Path,
+        expected_sha256: str,
+    ) -> dict[str, Any]:
+        if path.is_symlink() or not path.is_file():
+            raise PlanError(
+                "materialized curriculum config must be a regular non-symlink "
+                f"file: {path}"
+            )
+        if _sha256(path) != expected_sha256:
+            raise PlanError(
+                "materialized curriculum config SHA-256 does not match the "
+                "launcher-authenticated bytes"
+            )
+        _, payload = _load_config(path)
+        return payload
+
+    source_cfg, source_payload = _load_config(source_config_path)
+    actual_source_sha = _config_contract_sha256(
+        source_config_path,
+        source_cfg,
+    )
+    if actual_source_sha != expected_source_config_sha256:
+        raise PlanError(
+            "tracked curriculum source config no longer matches the planned "
+            "source contract SHA-256"
+        )
+    base_path = base_materialized_config_path or materialized_config_path
+    base_sha = (
+        expected_base_materialized_config_sha256
+        or expected_materialized_config_sha256
+    )
+    base_payload = load_authenticated_materialization(base_path, base_sha)
+    handoff = base_payload.get("curriculum_handoff")
+    if not isinstance(handoff, Mapping):
+        raise PlanError(
+            "materialized curriculum config lacks immutable handoff provenance"
+        )
+    if (
+        handoff.get("source_stage_config_path")
+        != str(source_config_path)
+        or handoff.get("source_stage_config_sha256")
+        != expected_source_config_sha256
+    ):
+        raise PlanError(
+            "materialized curriculum handoff does not authenticate its tracked "
+            "source config path and contract hash"
+        )
+
+    expected_payload = copy.deepcopy(source_payload)
+    expected_payload["run_id"] = expected_run_id
+    expected_payload["trainer"]["pretrained_checkpoint"] = (
+        expected_pretrained_checkpoint
+    )
+    expected_payload["trainer"]["pretrained_checkpoint_sha256"] = (
+        expected_pretrained_checkpoint_sha256
+    )
+    expected_payload["curriculum_handoff"] = copy.deepcopy(
+        dict(expected_curriculum_handoff)
+    )
+    if base_payload != expected_payload:
+        raise PlanError(
+            "materialized curriculum config changed settings outside runtime "
+            "identity or differs from the independently authenticated "
+            "predecessor path/hash and immutable handoff provenance"
+        )
+
+    allow_transport_resume = base_materialized_config_path is not None
+    if allow_transport_resume:
+        materialized_payload = load_authenticated_materialization(
+            materialized_config_path,
+            expected_materialized_config_sha256,
+        )
+        expected_resume_payload = copy.deepcopy(base_payload)
+        expected_resume_payload["trainer"]["is_resume"] = True
+        expected_resume_payload["trainer"]["resume_from_checkpoint"] = str(
+            expected_resume_checkpoint
+        )
+        if materialized_payload != expected_resume_payload:
+            raise PlanError(
+                "materialized curriculum resume config changed settings "
+                "outside the exact authenticated same-stage full-state "
+                "checkpoint binding"
+            )
+    plan = resolve_plan(
+        materialized_config_path,
+        allow_transport_resume=allow_transport_resume,
+    )
+    if allow_transport_resume:
+        validated_checkpoint, _ = _validate_checkpoint(
+            expected_resume_checkpoint,
+            int(plan["runtime"]["num_processes"]),
+        )
+        if validated_checkpoint != expected_resume_checkpoint.expanduser().resolve(
+            strict=True
+        ):
+            raise PlanError(
+                "validated resume checkpoint differs from the exact "
+                "same-stage checkpoint selected by the curriculum"
+            )
+    return _run_plan_checks(
+        plan,
+        git_config_path=source_config_path,
+        deep=deep,
+        require_tracked_config=True,
+    )
 
 
 def _validate_checkpoint(checkpoint: Path, expected_ranks: int) -> tuple[Path, Path]:
-    checkpoint = checkpoint.expanduser().resolve(strict=True)
+    checkpoint = checkpoint.expanduser()
+    if checkpoint.is_symlink():
+        raise PlanError(
+            f"resume checkpoint must be a regular non-symlink directory: "
+            f"{checkpoint}"
+        )
+    checkpoint = checkpoint.resolve(strict=True)
     match = CHECKPOINT_RE.fullmatch(checkpoint.name)
     if not checkpoint.is_dir() or match is None or checkpoint.parent.name != "checkpoints":
         raise PlanError("resume checkpoint must be a .../<run_id>/checkpoints/steps_N directory")
@@ -2892,14 +3437,66 @@ def _validate_checkpoint(checkpoint: Path, expected_ranks: int) -> tuple[Path, P
         "trainer_state.json",
         *(f"random_states_{rank}.pkl" for rank in range(expected_ranks)),
     ]
-    missing = [name for name in required if not (checkpoint / name).is_file()]
+    missing = [
+        name
+        for name in required
+        if (checkpoint / name).is_symlink()
+        or not (checkpoint / name).is_file()
+    ]
     if missing:
-        raise PlanError(f"resume checkpoint is incomplete; missing {missing}")
+        raise PlanError(
+            "resume checkpoint is incomplete or contains symlinked required "
+            f"artifacts: {missing}"
+        )
     run_dir = checkpoint.parent.parent
     source_config = run_dir / "config.yaml"
-    if not source_config.is_file():
+    if source_config.is_symlink() or not source_config.is_file():
         raise PlanError(f"resume run is missing immutable config.yaml: {run_dir}")
     return checkpoint, source_config
+
+
+def _load_immutable_run_config(
+    config_path: Path,
+) -> tuple[DictConfig, dict[str, Any]]:
+    """Load the trainer-frozen YAML/JSON pair and reject provenance drift."""
+
+    config_path = config_path.expanduser()
+    if config_path.is_symlink():
+        raise PlanError(
+            f"immutable run config must be a regular non-symlink file: "
+            f"{config_path}"
+        )
+    config_path = config_path.resolve()
+    if not config_path.is_file():
+        raise PlanError(
+            f"immutable run config must be a regular non-symlink file: "
+            f"{config_path}"
+        )
+    json_path = config_path.with_suffix(".json")
+    if json_path.is_symlink() or not json_path.is_file():
+        raise PlanError(
+            f"immutable run config is missing its regular JSON twin: "
+            f"{json_path}"
+        )
+    cfg = OmegaConf.load(config_path)
+    payload = _plain(cfg)
+    if not isinstance(payload, dict):
+        raise PlanError("immutable run config root must be a mapping")
+    try:
+        json_payload = json.loads(json_path.read_text(encoding="utf-8"))
+        normalized_payload = json.loads(
+            json.dumps(payload, allow_nan=False)
+        )
+    except (OSError, json.JSONDecodeError, ValueError, TypeError) as exc:
+        raise PlanError(
+            f"immutable run config JSON is unreadable: {json_path}"
+        ) from exc
+    if json_payload != normalized_payload:
+        raise PlanError(
+            "immutable run config YAML/JSON mismatch; refusing resume: "
+            f"{config_path} vs {json_path}"
+        )
+    return cfg, payload
 
 
 def _resolved_launch_config(
@@ -2909,6 +3506,7 @@ def _resolved_launch_config(
     run_id: str | None,
     resume_checkpoint: Path | None,
 ) -> tuple[Path, str]:
+    current_image, current_image_id = _required_container_image_identity(plan)
     if resume_checkpoint is None:
         _, resolved_payload = _load_config(source_config)
         # Freeze source-profile interpolations before assigning a unique runtime
@@ -2928,10 +3526,8 @@ def _resolved_launch_config(
         if output.exists():
             raise PlanError(f"fresh run output already exists: {output}")
         cfg.run_id = run_id
-        cfg.trainer.is_resume = False
-        cfg.trainer.resume_from_checkpoint = None
-        cfg.human_launch = {
-            "schema": "starvla-human-launch-v1",
+        human_launch = {
+            "schema": "starvla-human-launch-v2",
             "source_config_path": str(source_config),
             "source_config_sha256": plan["config_sha256"],
             "launcher_path": str(Path(__file__).resolve()),
@@ -2942,14 +3538,26 @@ def _resolved_launch_config(
                 text=True,
                 capture_output=True,
             ).stdout.strip(),
-            "container_image": plan["runtime"]["container_image"],
+            "container_image": current_image,
+            "container_image_id": current_image_id,
             "generated_utc": datetime.now(timezone.utc).isoformat(),
         }
+        cfg.human_launch = human_launch
+        expected_payload = copy.deepcopy(resolved_payload)
+        expected_payload["run_id"] = run_id
+        expected_payload["human_launch"] = human_launch
+        if OmegaConf.to_container(cfg, resolve=True) != expected_payload:
+            raise PlanError(
+                "fresh launch materialization changed settings outside runtime "
+                "identity and immutable launch-provenance metadata"
+            )
     else:
         checkpoint, immutable_config = _validate_checkpoint(
             resume_checkpoint, int(plan["runtime"]["num_processes"])
         )
-        cfg = OmegaConf.load(immutable_config)
+        cfg, immutable_payload = _load_immutable_run_config(
+            immutable_config
+        )
         run_id = str(cfg.run_id)
         recorded_source_sha = cfg.get("human_launch", {}).get(
             "source_config_sha256"
@@ -2958,8 +3566,32 @@ def _resolved_launch_config(
             raise PlanError(
                 "resume source profile SHA does not match the run's recorded profile"
             )
+        recorded_image = cfg.get("human_launch", {}).get(
+            "container_image"
+        )
+        recorded_image_id = cfg.get("human_launch", {}).get(
+            "container_image_id"
+        )
+        if recorded_image != current_image:
+            raise PlanError(
+                "current configured container image tag does not match the "
+                "immutable run launch provenance"
+            )
+        if recorded_image_id != current_image_id:
+            raise PlanError(
+                "current Docker Image.Id does not match the immutable run "
+                "launch provenance"
+            )
         cfg.trainer.is_resume = True
         cfg.trainer.resume_from_checkpoint = str(checkpoint)
+        expected_payload = copy.deepcopy(immutable_payload)
+        expected_payload["trainer"]["is_resume"] = True
+        expected_payload["trainer"]["resume_from_checkpoint"] = str(checkpoint)
+        if OmegaConf.to_container(cfg, resolve=True) != expected_payload:
+            raise PlanError(
+                "resume launch materialization changed settings outside the "
+                "authenticated full-state resume checkpoint binding"
+            )
     handle = tempfile.NamedTemporaryFile(
         mode="w",
         encoding="utf-8",
@@ -3010,19 +3642,45 @@ def launch(
         run_id=run_id,
         resume_checkpoint=resume_checkpoint,
     )
-    command = _accelerate_command(plan, resolved_config)
+    # Parse and validate the exact generated YAML that will reach the trainer,
+    # rather than constructing the command/environment from the source plan.
+    # `_resolved_launch_config` already proves the only fresh changes are
+    # run_id/human_launch and the only resume changes are the two authenticated
+    # transport fields.
+    materialized_plan = resolve_plan(
+        resolved_config,
+        allow_transport_resume=resume_checkpoint is not None,
+    )
+    command = _accelerate_command(materialized_plan, resolved_config)
     print(f"Resolved run ID             : {resolved_run_id}")
     print(f"Resolved launch config      : {resolved_config}")
     print(f"Training command            : {shlex.join(command)}")
     if print_command_only:
         return
-    runtime = plan["runtime"]
+    runtime = materialized_plan["runtime"]
     env = os.environ.copy()
+    for name in AUTHORITATIVE_SEMANTIC_ENV_VARS:
+        env.pop(name, None)
     env["STARVLA_USE_DEEPSPEED"] = "1" if runtime["use_deepspeed"] else "0"
     if runtime["torch_compile_environment"] == "disabled":
         env["TORCH_COMPILE_DISABLE"] = "1"
         env["TORCHDYNAMO_DISABLE"] = "1"
         env["STARVLA_ALLOW_TORCH_COMPILE"] = "0"
+    env["VLA_JEPA_MAIN_TORCH_THREADS"] = str(
+        runtime["main_torch_threads"]
+    )
+    env["VLA_JEPA_MAIN_TORCH_INTEROP_THREADS"] = str(
+        runtime["main_torch_interop_threads"]
+    )
+    env["VLA_JEPA_DISABLE_AUTOGRAD_MULTITHREADING"] = (
+        "1" if runtime["disable_autograd_multithreading"] else "0"
+    )
+    env["PYTORCH_CUDA_ALLOC_CONF"] = str(
+        runtime["pytorch_cuda_alloc_conf"]
+    )
+    env["TOKENIZERS_PARALLELISM"] = (
+        "true" if runtime["tokenizers_parallelism"] else "false"
+    )
     interface = str(runtime["network_interface"])
     if interface == "auto":
         interface = _discover_default_interface()
@@ -3097,21 +3755,16 @@ def prepare(config_path: Path, *, confirmed: bool) -> None:
     )
     resolved_cfg, _ = _load_config(config_path)
     with tempfile.NamedTemporaryFile(
-        mode="w",
-        encoding="utf-8",
+        mode="wb",
         prefix="starvla-realman-prepare-",
         suffix=".yaml",
         dir="/tmp",
     ) as handle:
-        # sort_keys=True is part of _config_contract_sha256 for composed
-        # configs.  The generated full config therefore has exactly the hash
-        # that check/start will expect from the reviewed extends chain.
+        # Direct configs are byte-bound exactly as reviewed. Composed configs
+        # are bound to the deterministic fully resolved YAML. Use the same
+        # shared bytes here so `prepare` never mutates the config identity.
         handle.write(
-            OmegaConf.to_yaml(
-                resolved_cfg,
-                resolve=True,
-                sort_keys=True,
-            )
+            _config_contract_bytes(config_path, resolved_cfg)
         )
         handle.flush()
         if _sha256(Path(handle.name)) != plan["config_sha256"]:
@@ -3255,7 +3908,7 @@ def _parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
     for name in ("plan", "setup", "check", "prepare", "launch"):
         sub = subparsers.add_parser(name)
-        sub.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+        sub.add_argument("--config", type=Path, required=True)
         if name == "plan":
             sub.add_argument("--json", action="store_true")
         elif name == "prepare":

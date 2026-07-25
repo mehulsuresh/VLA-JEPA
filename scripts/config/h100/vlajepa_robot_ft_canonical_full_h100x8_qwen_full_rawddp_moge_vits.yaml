@@ -20,6 +20,10 @@ runtime:
       url: https://github.com/YonduAI/dataset-canonicalization.git
       commit: d9c3298f3fec1706258aeef800f65eb4274356a6
 
+framework:
+  vj2_model:
+    predictor_attention_backend: torch_sdpa
+
 datasets:
   vla_data:
     # Hold out a deterministic episode set near 5-8% of the configured

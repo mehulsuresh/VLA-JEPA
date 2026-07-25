@@ -4,7 +4,7 @@
     "contract_sha256": "9e1df348fb137c206b42a183892e29ec6247595fffc232bb2d73d94b5f5f91ac",
     "normalization": "q01_q99_unclipped",
     "path": "/workspace/VLA-JEPA/deployment/realman/eval_manifests/artifacts/magna_intervention_labelled_holdout_global_batch128_v1_openpi_realman18_stats.json",
-    "sha256": "233cc324b303064f38572ff72eefdd8f03d2a139fbbef5474853018b7a26d9d2",
+    "sha256": "633b1c326e0660e198dfc4b021e0e4b7431f648486cef279c2808bcb416f027f",
     "train_frame_count": 2264011
   },
   "catalog_binding": {
@@ -2573,7 +2573,7 @@
     "seed_sha256": "ce5050f7933f30045c474727e2f49b507a12868c637ddb06708cb19747c8f25b",
     "seed_text_utf8": "magna-internal-holdout-global-batch-v1|nonzero_valid_unpadded_uniform_v1",
     "window_allocation": {
-      "algorithm": "uniform_per_episode_v1",
+      "algorithm": "balanced_digest_rank_v1",
       "base_frames_per_episode": 1,
       "extra_window_episode_count": 0,
       "extra_window_episode_identities": [],
@@ -2582,7 +2582,7 @@
     }
   },
   "manifest_path": "/workspace/VLA-JEPA/deployment/realman/eval_manifests/magna_intervention_labelled_holdout_global_batch128_v1.json",
-  "manifest_sha256": "8836ffca045363d04fed2fb491c14cce1973ec5def924acbf750780841b232b1",
+  "manifest_sha256": "c0f64465eff57ff7e253cbf15bb3c612eb6befa5ce3e81bd12a32f9baa24e72b",
   "schema_version": 1,
   "selection": {
     "eligibility": {
@@ -2761,7 +2761,14 @@
         },
         "holdout_sampling": {
           "holdout_episode_count": null,
-          "policy": null
+          "policy": {
+            "algorithm": "dataset_fraction_divisor_v1",
+            "episode_count_multiple": 8,
+            "evaluation_observation_count": 128,
+            "max_episode_count": 128,
+            "maximum_episode_fraction": 0.08,
+            "minimum_episode_fraction": 0.05
+          }
         },
         "ranking": {
           "algorithm": "sha256-episode-ranking-v1",
@@ -2867,7 +2874,7 @@
         }
       },
       "schema": "realman-holdout-selection-contract-v1",
-      "sha256": "1afa809588bdcc3c6b6a303c2bb02d34f98f87f06b40f82eaf8b24c6556be7bb"
+      "sha256": "1922b5afee4edfc59936e830c344b2f549b450661be52647cdee2f2baa83a723"
     },
     "minimum_selected_episode_length": 326,
     "selected_episode_ids_in_rank_order": [

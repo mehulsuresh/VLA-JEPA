@@ -1,5 +1,6 @@
 import copy
 import json
+import math
 import multiprocessing as mp
 import os
 import signal
@@ -233,40 +234,109 @@ def _distributed_world_size() -> int:
     return 1
 
 
+def _positive_loader_integer(
+    vla_dataset_cfg,
+    key: str,
+    *,
+    default: int | None = None,
+) -> int:
+    """Read one worker knob without silently repairing invalid YAML.
+
+    Older non-H100 profiles may still omit these settings and use the legacy
+    default.  Once a value is present, however, zero, negative, boolean, and
+    string values are configuration errors rather than values to clamp.
+    """
+
+    if key in vla_dataset_cfg and vla_dataset_cfg.get(key) is not None:
+        value = vla_dataset_cfg.get(key)
+    elif default is not None:
+        value = default
+    else:
+        raise ValueError(f"datasets.vla_data.{key} is required")
+    if type(value) is not int or value <= 0:
+        raise ValueError(
+            f"datasets.vla_data.{key} must be a positive integer; got {value!r}"
+        )
+    return value
+
+
+def _loader_prefetch_factor(vla_dataset_cfg, *, is_eval: bool) -> int:
+    key = "eval_prefetch_factor" if is_eval else "prefetch_factor"
+    if is_eval and (
+        key not in vla_dataset_cfg or vla_dataset_cfg.get(key) is None
+    ):
+        key = "prefetch_factor"
+    return _positive_loader_integer(vla_dataset_cfg, key, default=2)
+
+
 def _maybe_clamp_canonical_workers_for_memory(vla_dataset_cfg, num_workers: int) -> int:
-    if num_workers <= 0:
+    if type(num_workers) is not int or num_workers < 0:
+        raise ValueError(
+            "canonical_subset_vla num_workers must be a non-negative integer"
+        )
+    enforce_budget = vla_dataset_cfg.get(
+        "enforce_worker_memory_budget", True
+    )
+    if type(enforce_budget) is not bool:
+        raise ValueError(
+            "datasets.vla_data.enforce_worker_memory_budget must be boolean"
+        )
+    if not enforce_budget or num_workers == 0:
         return num_workers
-    if not bool(vla_dataset_cfg.get("enforce_worker_memory_budget", True)):
-        return num_workers
+
+    raw_worker_budget_gib = vla_dataset_cfg.get(
+        "estimated_worker_memory_gb", 5.0
+    )
+    raw_host_fraction = vla_dataset_cfg.get(
+        "worker_memory_budget_fraction", 0.65
+    )
+    if (
+        isinstance(raw_worker_budget_gib, bool)
+        or not isinstance(raw_worker_budget_gib, (int, float))
+        or not math.isfinite(float(raw_worker_budget_gib))
+        or float(raw_worker_budget_gib) <= 0.0
+    ):
+        raise ValueError(
+            "datasets.vla_data.estimated_worker_memory_gb must be a positive "
+            f"finite number; got {raw_worker_budget_gib!r}"
+        )
+    if (
+        isinstance(raw_host_fraction, bool)
+        or not isinstance(raw_host_fraction, (int, float))
+        or not math.isfinite(float(raw_host_fraction))
+        or not 0.0 < float(raw_host_fraction) <= 1.0
+    ):
+        raise ValueError(
+            "datasets.vla_data.worker_memory_budget_fraction must be a finite "
+            f"number in (0, 1]; got {raw_host_fraction!r}"
+        )
+    worker_budget_gib = float(raw_worker_budget_gib)
+    host_fraction = float(raw_host_fraction)
 
     total_gib = _host_memory_gib()
     if total_gib is None or total_gib <= 0:
         return num_workers
 
-    worker_budget_gib = float(vla_dataset_cfg.get("estimated_worker_memory_gb", 5.0) or 5.0)
-    host_fraction = float(vla_dataset_cfg.get("worker_memory_budget_fraction", 0.65) or 0.65)
-    worker_budget_gib = max(0.5, worker_budget_gib)
-    host_fraction = min(0.95, max(0.1, host_fraction))
     world_size = _distributed_world_size()
 
-    max_total_workers = max(1, int((total_gib * host_fraction) // worker_budget_gib))
-    max_workers_per_rank = max(1, max_total_workers // max(1, world_size))
+    max_total_workers = int(
+        (total_gib * host_fraction) // worker_budget_gib
+    )
+    max_workers_per_rank = max_total_workers // world_size
     if num_workers <= max_workers_per_rank:
         return num_workers
 
-    message = (
-        "Clamping canonical_subset_vla num_workers from "
-        f"{num_workers} to {max_workers_per_rank} based on host RAM budget "
+    raise ValueError(
+        "canonical_subset_vla num_workers exceeds the config-owned host RAM "
+        "budget: "
+        f"requested={num_workers}, maximum={max_workers_per_rank} "
         f"(MemTotal={total_gib:.1f}GiB, world_size={world_size}, "
         f"estimated_worker_memory_gb={worker_budget_gib:.1f}, "
         f"worker_memory_budget_fraction={host_fraction:.2f}). "
-        "Set datasets.vla_data.enforce_worker_memory_budget=false to override."
+        "Refusing to silently change the reviewed worker topology. Set an "
+        "explicitly reviewed lower datasets.vla_data.num_workers value, or set "
+        "datasets.vla_data.enforce_worker_memory_budget=false in YAML."
     )
-    try:
-        logger.warning(message)
-    except RuntimeError:
-        print(message, file=sys.stderr, flush=True)
-    return max_workers_per_rank
 
 
 def save_dataset_statistics(dataset_statistics, run_dir):
@@ -636,10 +706,9 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets", model=None, *, mode: st
             generator=loader_generator,
         )
         if num_workers > 0:
-            prefetch_key = "eval_prefetch_factor" if is_eval else "prefetch_factor"
-            loader_kwargs["prefetch_factor"] = max(
-                1 if is_eval else 2,
-                int(vla_dataset_cfg.get(prefetch_key, vla_dataset_cfg.get("prefetch_factor", 2))),
+            loader_kwargs["prefetch_factor"] = _loader_prefetch_factor(
+                vla_dataset_cfg,
+                is_eval=is_eval,
             )
             # Eval workers are transient by default: holding a second complete
             # set of dataset/video-reader processes for thousands of train steps
@@ -672,8 +741,16 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets", model=None, *, mode: st
                 loader_kwargs["timeout"] = dataloader_timeout_seconds
             loader_kwargs["worker_init_fn"] = partial(
                 _configure_lerobot_worker,
-                torch_threads=max(1, int(vla_dataset_cfg.get("worker_torch_threads", 1))),
-                cv2_threads=max(1, int(vla_dataset_cfg.get("worker_cv2_threads", 1))),
+                torch_threads=_positive_loader_integer(
+                    vla_dataset_cfg,
+                    "worker_torch_threads",
+                    default=1,
+                ),
+                cv2_threads=_positive_loader_integer(
+                    vla_dataset_cfg,
+                    "worker_cv2_threads",
+                    default=1,
+                ),
             )
             logger.info(
                 "LeRobot DataLoader worker contract: "
@@ -831,14 +908,9 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets", model=None, *, mode: st
             generator=loader_generator,
         )
         if num_workers > 0:
-            loader_kwargs["prefetch_factor"] = max(
-                1,
-                int(
-                    vla_dataset_cfg.get(
-                        "eval_prefetch_factor" if is_eval else "prefetch_factor",
-                        vla_dataset_cfg.get("prefetch_factor", 2),
-                    )
-                ),
+            loader_kwargs["prefetch_factor"] = _loader_prefetch_factor(
+                vla_dataset_cfg,
+                is_eval=is_eval,
             )
             loader_kwargs["persistent_workers"] = (
                 False
@@ -866,8 +938,16 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets", model=None, *, mode: st
                 loader_kwargs["timeout"] = dataloader_timeout_seconds
             loader_kwargs["worker_init_fn"] = partial(
                 _configure_lerobot_worker,
-                torch_threads=max(1, int(vla_dataset_cfg.get("worker_torch_threads", 1))),
-                cv2_threads=max(1, int(vla_dataset_cfg.get("worker_cv2_threads", 1))),
+                torch_threads=_positive_loader_integer(
+                    vla_dataset_cfg,
+                    "worker_torch_threads",
+                    default=1,
+                ),
+                cv2_threads=_positive_loader_integer(
+                    vla_dataset_cfg,
+                    "worker_cv2_threads",
+                    default=1,
+                ),
             )
 
         vla_train_dataloader = DataLoader(**loader_kwargs)
@@ -959,7 +1039,10 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets", model=None, *, mode: st
             drop_last=drop_last,
         )
         if num_workers > 0:
-            loader_kwargs["prefetch_factor"] = max(2, int(vla_dataset_cfg.get("prefetch_factor", 2)))
+            loader_kwargs["prefetch_factor"] = _loader_prefetch_factor(
+                vla_dataset_cfg,
+                is_eval=False,
+            )
             loader_kwargs["persistent_workers"] = False
             loader_kwargs["multiprocessing_context"] = (
                 _resolve_worker_multiprocessing_context(

@@ -4154,6 +4154,7 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
                     metadata_stat.st_size != expected_size
                     or metadata_stat.st_mtime_ns != expected_mtime_ns
                     or metadata_stat.st_ctime_ns != expected_ctime_ns
+                    or _hash_file(metadata_path) != expected_sha256
                 ):
                     if rank == 0:
                         print(

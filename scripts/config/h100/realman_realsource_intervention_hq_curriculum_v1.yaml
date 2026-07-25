@@ -3,6 +3,7 @@
 # stages. This file is intentionally complete because h100_curriculum.py
 # hashes the exact reviewed ordering contract.
 schema_version: 2
+workflow_kind: production_curriculum
 curriculum_id: realman_rs50_intervention_hq_v1
 state_root_dir: /data/mehul-vla-jepa/curricula
 bootstrap:
@@ -19,10 +20,10 @@ shared_contract:
   gripper_action_type: absolute
   state_action_normalization: q01_q99_unclipped
   normalization_statistics_artifact: /data/mehul-vla-jepa/data_contracts/realman_union_openpi_q01q99_v1.json
-  normalization_statistics_artifact_sha256: REPLACE_WITH_MATERIALIZED_UNION_STATS_SHA256
+  normalization_statistics_artifact_sha256: e843ad26fb153c2abcd3ec6b4fdb2b89082b36093ed6f1ddda61216aef05ce2e
   action_representation_contract_sha256: 9e1df348fb137c206b42a183892e29ec6247595fffc232bb2d73d94b5f5f91ac
   statistics_holdout_manifest: /data/mehul-vla-jepa/data_contracts/realman_union_holdout_v1.json
-  statistics_holdout_manifest_sha256: e024f1fc5501a17d0f388f3408cd16ee044938df03dc195fd437927baac655de
+  statistics_holdout_manifest_sha256: 2dce910264e5a8b014cd9fc892e8eb6858e5ed4a04b0a08740b7728c8aae3ebd
 
 stages:
   - id: realsource_production50
@@ -44,7 +45,7 @@ stages:
     expected_full_dataset_epochs: 2
     require_useful_subtask_coverage: true
     require_verified_action_supervision: true
-    local_evaluation_manifest_sha256: 8836ffca045363d04fed2fb491c14cce1973ec5def924acbf750780841b232b1
+    local_evaluation_manifest_sha256: c0f64465eff57ff7e253cbf15bb3c612eb6befa5ce3e81bd12a32f9baa24e72b
     monitoring:
       first_epoch_exposure_fractions: [1.0]
       full_epoch_required: true
@@ -55,7 +56,7 @@ stages:
     handoff_checkpoint: natural_final
     config: scripts/config/h100/realman_curriculum/hq_finetune_v1.yaml
     expected_full_dataset_epochs: 4
-    local_evaluation_manifest_sha256: 60c71b84228fbf6a296a39eadbd712efc720a71e24a6dfde2ec4990b5e186389
+    local_evaluation_manifest_sha256: 9730807c0ba8688c6ae525126fdf306cfbadb3d67366392c5f6eefe3399292a2
     monitoring:
       first_epoch_exposure_fractions: [1.0]
       full_epoch_required: true

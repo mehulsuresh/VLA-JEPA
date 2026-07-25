@@ -3,7 +3,7 @@ extends:
 datasets:
   vla_data:
     frozen_train_view_manifest: deployment/realman/curriculum_manifests/handoff_smoke/hq_handoff_smoke_128_v1.json
-    frozen_train_view_manifest_sha256: 7795e09239a83a12c6f251b86bb1dab8275c40184970019a0ca0dd959ec9664e
+    frozen_train_view_manifest_sha256: 81a93f8c844c1a6db9338959628ac4a5f36335e8fbc6212ff7240d8b8834ba41
     normalization_statistics_artifact: /data/mehul-vla-jepa/data_contracts/handoff_smoke_openpi_q01q99_v1/openpi_q01q99_unclipped.json
-    normalization_statistics_artifact_sha256: 0257b9309c66ff3be6ba359b00a1d7db8cb5303111460af34f38d84a38191b6c
+    normalization_statistics_artifact_sha256: 5901adc8b7783fb4148ba5aa02e3976ab42ae3bab3593779bc44ade05ca5b493
     episode_split_manifest: deployment/realman/eval_manifests/magna_hq_subtasks_delta_fractional_holdout_global_batch128_v1.json

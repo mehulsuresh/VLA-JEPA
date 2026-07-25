@@ -38,10 +38,6 @@ except ModuleNotFoundError:  # Imported as ``scripts.h100_curriculum`` in tests.
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_CURRICULUM = (
-    REPO_ROOT
-    / "scripts/config/h100/realman_realsource_intervention_hq_curriculum_v1.yaml"
-)
 CURRICULUM_ID_RE = re.compile(r"[a-z0-9][a-z0-9_.-]{2,127}")
 RUN_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{2,191}")
 STAGE_ID_RE = re.compile(r"[a-z0-9][a-z0-9_-]{1,63}")
@@ -53,6 +49,10 @@ NATURAL_FINAL_HANDOFF = "natural_final"
 PRODUCTION_CURRICULUM = "production_curriculum"
 CHECKPOINT_HANDOFF_SMOKE = "checkpoint_handoff_smoke"
 HANDOFF_SMOKE_STAGE_SCHEMA = "realman-checkpoint-handoff-smoke-stage-v1"
+CURRICULUM_RESUME_POLICY = "newest_complete_full_state_same_stage"
+SEMANTIC_ENVIRONMENT_OVERRIDES = (
+    h100_training.AUTHORITATIVE_SEMANTIC_ENV_VARS
+)
 
 
 class CurriculumError(RuntimeError):
@@ -108,9 +108,9 @@ def _load_curriculum_state(path: Path) -> dict[str, Any]:
         raise CurriculumError(
             f"curriculum resume state is unreadable: {path}"
         ) from exc
-    if not isinstance(payload, dict) or payload.get("schema_version") != 3:
+    if not isinstance(payload, dict) or payload.get("schema_version") != 4:
         raise CurriculumError(
-            "curriculum resume state must use schema_version=3"
+            "curriculum resume state must use schema_version=4"
         )
     expected_sha = payload.get("state_payload_sha256")
     if (
@@ -156,10 +156,14 @@ def _resolve_repo_file(value: Any, *, field: str) -> Path:
     path = Path(raw).expanduser()
     if not path.is_absolute():
         path = REPO_ROOT / path
+    if path.is_symlink():
+        raise CurriculumError(
+            f"{field} must be a regular non-symlink file: {path}"
+        )
     path = path.resolve(strict=True)
     if not path.is_relative_to(REPO_ROOT):
         raise CurriculumError(f"{field} must be inside the repository: {path}")
-    if path.is_symlink() or not path.is_file():
+    if not path.is_file():
         raise CurriculumError(f"{field} must be a regular non-symlink file: {path}")
     return path
 
@@ -169,8 +173,12 @@ def _resolve_absolute_file(value: Any, *, field: str) -> Path:
     path = Path(raw).expanduser()
     if not path.is_absolute():
         path = REPO_ROOT / path
+    if path.is_symlink():
+        raise CurriculumError(
+            f"{field} must be a regular non-symlink file: {path}"
+        )
     path = path.resolve(strict=True)
-    if path.is_symlink() or not path.is_file():
+    if not path.is_file():
         raise CurriculumError(f"{field} must be a regular non-symlink file: {path}")
     return path
 
@@ -237,8 +245,13 @@ def _optional_nested(
 
 
 def _load_curriculum(path: Path) -> tuple[DictConfig, Mapping[str, Any]]:
-    path = path.expanduser().resolve(strict=True)
-    if path.is_symlink() or not path.is_file():
+    path = path.expanduser()
+    if path.is_symlink():
+        raise CurriculumError(
+            f"curriculum config must be a regular non-symlink file: {path}"
+        )
+    path = path.resolve(strict=True)
+    if not path.is_file():
         raise CurriculumError(
             f"curriculum config must be a regular non-symlink file: {path}"
         )
@@ -1021,10 +1034,44 @@ def _validate_source_stage(
             f"{stage_id} expected_full_dataset_epochs={expected_epochs} but "
             f"trainer.epochs={epochs}"
         )
-    if _nested(stage_payload, "trainer.max_train_steps") != "auto":
+    configured_max_train_steps = _nested(
+        stage_payload,
+        "trainer.max_train_steps",
+    )
+    if workflow_kind == CHECKPOINT_HANDOFF_SMOKE:
+        if configured_max_train_steps != 1:
+            raise CurriculumError(
+                f"{stage_id} checkpoint-handoff smoke must explicitly set "
+                "trainer.max_train_steps=1"
+            )
+    elif configured_max_train_steps != "auto":
         raise CurriculumError(
             f"{stage_id} must set trainer.max_train_steps=auto so an epoch is "
             "the complete frozen train view"
+        )
+    stage_contract = _require_mapping(
+        stage_payload.get("curriculum_stage"),
+        field=f"{stage_id}.curriculum_stage",
+    )
+    expected_stage_contract = {
+        "initialization": initialization,
+        "optimizer_scheduler_rng_reset": True,
+        "resume_policy": CURRICULUM_RESUME_POLICY,
+    }
+    if dict(stage_contract) != expected_stage_contract:
+        raise CurriculumError(
+            f"{stage_id}.curriculum_stage must be exactly "
+            f"{expected_stage_contract}; initialization and reset semantics "
+            "must be owned by the reviewed stage YAML"
+        )
+    predictor_attention_backend = _nested(
+        stage_payload,
+        "framework.vj2_model.predictor_attention_backend",
+    )
+    if predictor_attention_backend not in {"torch_sdpa", "flash_attn"}:
+        raise CurriculumError(
+            f"{stage_id} must explicitly select "
+            "framework.vj2_model.predictor_attention_backend"
         )
     data_cfg = _require_mapping(
         _nested(stage_payload, "datasets.vla_data"),
@@ -1360,16 +1407,15 @@ def _validate_source_stage(
             f"{stage_id} trainer.checkpoint_eval_milestone_fractions must "
             "exactly match curriculum monitoring fractions"
         )
-    if (
-        _optional_nested(
-            stage_payload,
-            "trainer.checkpoint_eval_milestone_steps",
-        )
-        is not None
-    ):
+    include_full_epoch_boundaries = _optional_nested(
+        stage_payload,
+        "trainer.checkpoint_eval_include_full_epoch_boundaries",
+        False,
+    )
+    if include_full_epoch_boundaries is not True:
         raise CurriculumError(
-            f"{stage_id} source config must leave resolved milestone steps "
-            "null; the curriculum derives them from its authenticated view"
+            f"{stage_id} must set "
+            "trainer.checkpoint_eval_include_full_epoch_boundaries=true"
         )
     first_epoch_checkpoints = sorted(
         {
@@ -1387,12 +1433,38 @@ def _validate_source_stage(
     checkpoint_eval_milestone_steps = sorted(
         set(first_epoch_checkpoints) | set(full_epoch_boundaries)
     )
+    configured_milestone_steps = _optional_nested(
+        stage_payload,
+        "trainer.checkpoint_eval_milestone_steps",
+    )
+    if workflow_kind == CHECKPOINT_HANDOFF_SMOKE:
+        if configured_milestone_steps != checkpoint_eval_milestone_steps:
+            raise CurriculumError(
+                f"{stage_id} checkpoint-handoff smoke must explicitly own "
+                "its exact trainer.checkpoint_eval_milestone_steps; expected "
+                f"{checkpoint_eval_milestone_steps}, got "
+                f"{configured_milestone_steps!r}"
+            )
+    elif configured_milestone_steps != "auto":
+        raise CurriculumError(
+            f"{stage_id} production stage must set "
+            "trainer.checkpoint_eval_milestone_steps=auto; the trainer, not "
+            "the curriculum launcher, resolves the YAML-owned fractions and "
+            "full-epoch-boundary policy"
+        )
     model_architecture_sha256 = _model_architecture_sha256(stage_payload)
     return {
         "id": stage_id,
         "workflow_kind": workflow_kind,
         "role": role,
         "initialization": initialization,
+        "optimizer_scheduler_rng_reset": bool(
+            stage_contract["optimizer_scheduler_rng_reset"]
+        ),
+        "resume_policy": str(stage_contract["resume_policy"]),
+        "world_model_predictor_attention_backend": (
+            predictor_attention_backend
+        ),
         "handoff_checkpoint_policy": handoff_checkpoint_policy,
         "config_path": str(config_path),
         "config_sha256": plan["config_sha256"],
@@ -1445,8 +1517,12 @@ def resolve_curriculum(
     )
     if CURRICULUM_ID_RE.fullmatch(curriculum_id) is None:
         raise CurriculumError(f"invalid curriculum_id: {curriculum_id!r}")
+    if "workflow_kind" not in payload:
+        raise CurriculumError(
+            "workflow_kind must be explicitly declared in the curriculum YAML"
+        )
     workflow_kind = _require_string(
-        payload.get("workflow_kind", PRODUCTION_CURRICULUM),
+        payload.get("workflow_kind"),
         field="workflow_kind",
     )
     if workflow_kind not in {
@@ -1603,6 +1679,11 @@ def resolve_curriculum(
             "dynamo_backend",
             "use_deepspeed",
             "torch_compile_environment",
+            "main_torch_threads",
+            "main_torch_interop_threads",
+            "disable_autograd_multithreading",
+            "pytorch_cuda_alloc_conf",
+            "tokenizers_parallelism",
         ):
             if runtime[key] != first_runtime[key]:
                 raise CurriculumError(
@@ -1736,8 +1817,14 @@ def _validate_materialized_run_config(
         raise CurriculumError(
             "expected materialized stage config SHA-256 is malformed"
         )
-    materialized_config = materialized_config.expanduser().resolve(strict=True)
-    if materialized_config.is_symlink() or not materialized_config.is_file():
+    materialized_config = materialized_config.expanduser()
+    if materialized_config.is_symlink():
+        raise CurriculumError(
+            "materialized stage config must be a regular non-symlink file: "
+            f"{materialized_config}"
+        )
+    materialized_config = materialized_config.resolve(strict=True)
+    if not materialized_config.is_file():
         raise CurriculumError(
             "materialized stage config must be a regular non-symlink file: "
             f"{materialized_config}"
@@ -1751,10 +1838,13 @@ def _validate_materialized_run_config(
         )
     try:
         materialized_payload = _plain(OmegaConf.load(materialized_config))
-        run_payload = _plain(OmegaConf.load(run_config))
+        _, run_payload = h100_training._load_immutable_run_config(
+            run_config
+        )
     except Exception as exc:
         raise CurriculumError(
-            "unable to parse materialized/run stage config for identity "
+            "unable to parse or authenticate the materialized/immutable run "
+            "config YAML+JSON pair for identity "
             f"validation: {exc}"
         ) from exc
     if not isinstance(materialized_payload, Mapping) or not isinstance(
@@ -1778,7 +1868,12 @@ def _validate_selection_handoff(
     materialized_config: Path | None = None,
     expected_materialized_config_sha256: str | None = None,
 ) -> dict[str, Any]:
-    run_dir = run_dir.expanduser().resolve(strict=True)
+    run_dir = run_dir.expanduser()
+    if run_dir.is_symlink():
+        raise CurriculumError(
+            f"completed stage run directory must not be a symlink: {run_dir}"
+        )
+    run_dir = run_dir.resolve(strict=True)
     pointer_path = run_dir / "best_checkpoint.json"
     if pointer_path.is_symlink() or not pointer_path.is_file():
         raise CurriculumError(
@@ -1797,8 +1892,11 @@ def _validate_selection_handoff(
         raise CurriculumError(
             "best checkpoint relative path does not match the selected step"
         )
-    checkpoint = (run_dir / relative).resolve(strict=True)
-    if not checkpoint.is_relative_to(run_dir) or checkpoint.is_symlink():
+    checkpoint = run_dir / relative
+    if checkpoint.is_symlink():
+        raise CurriculumError("best checkpoint escapes the run or is a symlink")
+    checkpoint = checkpoint.resolve(strict=True)
+    if not checkpoint.is_relative_to(run_dir):
         raise CurriculumError("best checkpoint escapes the run or is a symlink")
     model_path = checkpoint / "model.safetensors"
     trainer_state_path = checkpoint / "trainer_state.json"
@@ -1867,6 +1965,15 @@ def _validate_selection_handoff(
     run_config = run_dir / "config.yaml"
     if run_config.is_symlink() or not run_config.is_file():
         raise CurriculumError("completed stage lacks immutable config.yaml")
+    try:
+        _, immutable_run_payload = (
+            h100_training._load_immutable_run_config(run_config)
+        )
+    except (h100_training.PlanError, OSError) as exc:
+        raise CurriculumError(
+            "completed stage lacks an identical immutable config.yaml/"
+            f"config.json pair: {exc}"
+        ) from exc
     recorded_config_sha = _optional_nested(
         evaluation, "run.config_sha256"
     )
@@ -1890,12 +1997,12 @@ def _validate_selection_handoff(
             ),
         )
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "run_dir": str(run_dir),
         "run_config": str(run_config),
         "run_config_sha256": _sha256(run_config),
         "model_architecture_sha256": _model_architecture_sha256(
-            _plain(OmegaConf.load(run_config))
+            immutable_run_payload
         ),
         "materialized_config_path": (
             None
@@ -1936,7 +2043,12 @@ def _validate_natural_final_handoff(
     from the weights produced after *all* Stage-B examples.
     """
 
-    run_dir = run_dir.expanduser().resolve(strict=True)
+    run_dir = run_dir.expanduser()
+    if run_dir.is_symlink():
+        raise CurriculumError(
+            f"completed stage run directory must not be a symlink: {run_dir}"
+        )
+    run_dir = run_dir.resolve(strict=True)
     selected = _validate_selection_handoff(
         run_dir,
         materialized_config=materialized_config,
@@ -1948,8 +2060,13 @@ def _validate_natural_final_handoff(
         final_step, field="natural_final.final_step", minimum=1
     )
     relative = f"checkpoints/steps_{step}"
-    checkpoint = (run_dir / relative).resolve(strict=True)
-    if not checkpoint.is_relative_to(run_dir) or checkpoint.is_symlink():
+    checkpoint = run_dir / relative
+    if checkpoint.is_symlink():
+        raise CurriculumError(
+            "natural-final checkpoint escapes the run or is a symlink"
+        )
+    checkpoint = checkpoint.resolve(strict=True)
+    if not checkpoint.is_relative_to(run_dir):
         raise CurriculumError(
             "natural-final checkpoint escapes the run or is a symlink"
         )
@@ -2143,16 +2260,23 @@ def _validate_state_against_plan(
     plan: Mapping[str, Any],
     run_id: str,
 ) -> None:
+    current_image, current_image_id = (
+        h100_training._required_container_image_identity(
+            plan["stages"][0]["plan"]
+        )
+    )
     if (
         state.get("curriculum_id") != plan["curriculum_id"]
         or state.get("curriculum_run_id") != run_id
         or state.get("curriculum_config_path") != plan["curriculum_path"]
         or state.get("curriculum_config_sha256")
         != plan["curriculum_sha256"]
+        or state.get("container_image") != current_image
+        or state.get("container_image_id") != current_image_id
     ):
         raise CurriculumError(
             "curriculum resume state does not match the requested "
-            "curriculum config/run identity"
+            "curriculum config/run/image identity"
         )
     state_stages = state.get("stages")
     if not isinstance(state_stages, list) or len(state_stages) != len(
@@ -2235,9 +2359,31 @@ def _materialize_stage_resume_config(
         raise CurriculumError(
             f"interrupted stage lacks immutable config.yaml: {run_dir}"
         )
-    cfg = OmegaConf.load(immutable_config)
+    cfg, immutable_run_payload = (
+        h100_training._load_immutable_run_config(immutable_config)
+    )
+    immutable_payload = _canonical_stage_run_config(
+        immutable_run_payload
+    )
+    if (
+        cfg.get("curriculum_stage", {}).get("resume_policy")
+        != CURRICULUM_RESUME_POLICY
+    ):
+        raise CurriculumError(
+            "immutable stage config does not authorize a newest-complete "
+            "full-state same-stage resume"
+        )
+    cfg = OmegaConf.create(copy.deepcopy(immutable_payload))
     cfg.trainer.is_resume = True
     cfg.trainer.resume_from_checkpoint = str(checkpoint)
+    expected_payload = copy.deepcopy(immutable_payload)
+    expected_payload["trainer"]["is_resume"] = True
+    expected_payload["trainer"]["resume_from_checkpoint"] = str(checkpoint)
+    if OmegaConf.to_container(cfg, resolve=True) != expected_payload:
+        raise CurriculumError(
+            "stage resume materialization changed settings outside the "
+            "authenticated full-state resume checkpoint binding"
+        )
     payload = OmegaConf.to_yaml(cfg, resolve=True).encode("utf-8")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     temporary = output_path.with_name(
@@ -2320,8 +2466,6 @@ def _materialize_stage_config(
     _, source_payload = h100_training._load_config(Path(stage["config_path"]))
     cfg = OmegaConf.create(copy.deepcopy(source_payload))
     cfg.run_id = run_id
-    cfg.trainer.is_resume = False
-    cfg.trainer.resume_from_checkpoint = None
     cfg.trainer.pretrained_checkpoint = (
         None if previous_handoff is None else previous_handoff["model_path"]
     )
@@ -2330,14 +2474,11 @@ def _materialize_stage_config(
         if previous_handoff is None
         else previous_handoff["model_sha256"]
     )
-    # A stage boundary is a complete-model handoff.  Optimizer/scheduler/RNG
-    # are fresh, but no subset of model modules may be silently skipped.
-    cfg.trainer.reload_modules = None
-    cfg.trainer.checkpoint_eval_milestone_steps = list(
-        stage["checkpoint_eval_milestone_steps"]
+    container_image, container_image_id = (
+        h100_training._required_container_image_identity(stage["plan"])
     )
     handoff_payload = {
-        "schema_version": 1,
+        "schema_version": 2,
         "curriculum_id": curriculum_plan["curriculum_id"],
         "curriculum_config_path": curriculum_plan["curriculum_path"],
         "curriculum_config_sha256": curriculum_plan["curriculum_sha256"],
@@ -2348,6 +2489,8 @@ def _materialize_stage_config(
         "model_architecture_sha256": stage[
             "model_architecture_sha256"
         ],
+        "container_image": container_image,
+        "container_image_id": container_image_id,
         "frozen_train_view_manifest": stage["frozen_train_view_manifest"],
         "frozen_train_view_manifest_sha256": stage[
             "frozen_train_view_manifest_sha256"
@@ -2392,6 +2535,10 @@ def _materialize_stage_config(
             "partial_pass_is_epoch": False,
         },
         "initialization": stage["initialization"],
+        "resume_policy": stage["resume_policy"],
+        "world_model_predictor_attention_backend": stage[
+            "world_model_predictor_attention_backend"
+        ],
         "handoff_checkpoint_policy": stage[
             "handoff_checkpoint_policy"
         ],
@@ -2419,10 +2566,29 @@ def _materialize_stage_config(
                 )
             }
         ),
-        "optimizer_scheduler_rng_reset": True,
+        "optimizer_scheduler_rng_reset": stage[
+            "optimizer_scheduler_rng_reset"
+        ],
         "generated_utc": datetime.now(timezone.utc).isoformat(),
     }
     cfg.curriculum_handoff = handoff_payload
+    expected_payload = copy.deepcopy(dict(source_payload))
+    expected_payload["run_id"] = run_id
+    expected_payload["trainer"]["pretrained_checkpoint"] = (
+        None if previous_handoff is None else previous_handoff["model_path"]
+    )
+    expected_payload["trainer"]["pretrained_checkpoint_sha256"] = (
+        None
+        if previous_handoff is None
+        else previous_handoff["model_sha256"]
+    )
+    expected_payload["curriculum_handoff"] = handoff_payload
+    materialized_payload = OmegaConf.to_container(cfg, resolve=True)
+    if materialized_payload != expected_payload:
+        raise CurriculumError(
+            "stage materialization changed settings outside runtime identity, "
+            "authenticated predecessor path/hash, and provenance metadata"
+        )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(
         OmegaConf.to_yaml(cfg, resolve=True),
@@ -2431,9 +2597,148 @@ def _materialize_stage_config(
     return handoff_payload
 
 
+def _authenticate_stage_handoff_input(
+    *,
+    curriculum_plan: Mapping[str, Any],
+    stage: Mapping[str, Any],
+    previous_handoff: Mapping[str, Any] | None,
+    handoff: Any,
+) -> dict[str, Any]:
+    """Reconstruct and authenticate materialized stage provenance.
+
+    This deliberately derives every semantic field from the resolved
+    curriculum plan and the previously validated stage artifact. It must not
+    accept the predecessor path/hash merely because those values appear in the
+    materialized YAML or mutable curriculum state.
+    """
+
+    if not isinstance(handoff, Mapping):
+        raise CurriculumError(
+            f"stage {stage['id']} materialized config lacks handoff provenance"
+        )
+    generated_utc = _require_string(
+        handoff.get("generated_utc"),
+        field=f"{stage['id']}.curriculum_handoff.generated_utc",
+    )
+    try:
+        generated_at = datetime.fromisoformat(generated_utc)
+    except ValueError as exc:
+        raise CurriculumError(
+            f"stage {stage['id']} handoff generated_utc is invalid"
+        ) from exc
+    if generated_at.tzinfo is None:
+        raise CurriculumError(
+            f"stage {stage['id']} handoff generated_utc must be timezone-aware"
+        )
+
+    expected_previous = (
+        None
+        if previous_handoff is None
+        else {
+            key: previous_handoff[key]
+            for key in (
+                "handoff_checkpoint_policy",
+                "run_dir",
+                "run_config_sha256",
+                "model_architecture_sha256",
+                "checkpoint_step",
+                "checkpoint_relative_path",
+                "model_path",
+                "model_sha256",
+                "heldout_eval_sha256",
+                "best_metric_name",
+                "best_metric_mode",
+                "best_metric_value",
+                "handoff_metric_name",
+                "handoff_metric_mode",
+                "handoff_metric_value",
+            )
+        }
+    )
+    container_image, container_image_id = (
+        h100_training._required_container_image_identity(stage["plan"])
+    )
+    expected = {
+        "schema_version": 2,
+        "curriculum_id": curriculum_plan["curriculum_id"],
+        "curriculum_config_path": curriculum_plan["curriculum_path"],
+        "curriculum_config_sha256": curriculum_plan["curriculum_sha256"],
+        "stage_id": stage["id"],
+        "stage_role": stage["role"],
+        "source_stage_config_path": stage["config_path"],
+        "source_stage_config_sha256": stage["config_sha256"],
+        "model_architecture_sha256": stage["model_architecture_sha256"],
+        "container_image": container_image,
+        "container_image_id": container_image_id,
+        "frozen_train_view_manifest": stage["frozen_train_view_manifest"],
+        "frozen_train_view_manifest_sha256": stage[
+            "frozen_train_view_manifest_sha256"
+        ],
+        "shared_normalization_statistics_artifact": curriculum_plan[
+            "shared_contract"
+        ]["normalization_statistics_artifact"],
+        "shared_normalization_statistics_artifact_sha256": curriculum_plan[
+            "shared_contract"
+        ]["normalization_statistics_artifact_sha256"],
+        "statistics_holdout_manifest": curriculum_plan["shared_contract"][
+            "statistics_holdout_manifest"
+        ],
+        "statistics_holdout_manifest_sha256": curriculum_plan[
+            "shared_contract"
+        ]["statistics_holdout_manifest_sha256"],
+        "stage_local_evaluation_manifest": stage[
+            "local_evaluation_manifest"
+        ],
+        "stage_local_evaluation_manifest_sha256": stage[
+            "local_evaluation_manifest_sha256"
+        ],
+        "epoch_contract": {
+            "one_epoch_is_entire_frozen_view": True,
+            "eligible_window_count": stage["eligible_window_count"],
+            "steps_per_epoch": stage["steps_per_epoch"],
+            "expected_full_dataset_epochs": stage[
+                "expected_full_dataset_epochs"
+            ],
+            "first_epoch_exposure_fractions": stage[
+                "first_epoch_exposure_fractions"
+            ],
+            "first_epoch_checkpoint_steps": stage[
+                "first_epoch_checkpoint_steps"
+            ],
+            "full_epoch_boundary_steps": stage[
+                "full_epoch_boundary_steps"
+            ],
+            "checkpoint_eval_milestone_steps": stage[
+                "checkpoint_eval_milestone_steps"
+            ],
+            "partial_pass_is_epoch": False,
+        },
+        "initialization": stage["initialization"],
+        "resume_policy": stage["resume_policy"],
+        "world_model_predictor_attention_backend": stage[
+            "world_model_predictor_attention_backend"
+        ],
+        "handoff_checkpoint_policy": stage["handoff_checkpoint_policy"],
+        "previous_stage_handoff": expected_previous,
+        "optimizer_scheduler_rng_reset": stage[
+            "optimizer_scheduler_rng_reset"
+        ],
+        "generated_utc": generated_utc,
+    }
+    authenticated = copy.deepcopy(dict(handoff))
+    if authenticated != expected:
+        raise CurriculumError(
+            f"stage {stage['id']} handoff provenance does not match the "
+            "resolved curriculum and independently validated predecessor"
+        )
+    return authenticated
+
+
 def _training_environment(plan: Mapping[str, Any]) -> dict[str, str]:
     runtime = plan["runtime"]
     env = os.environ.copy()
+    for name in SEMANTIC_ENVIRONMENT_OVERRIDES:
+        env.pop(name, None)
     env["STARVLA_USE_DEEPSPEED"] = (
         "1" if bool(runtime["use_deepspeed"]) else "0"
     )
@@ -2441,6 +2746,21 @@ def _training_environment(plan: Mapping[str, Any]) -> dict[str, str]:
         env["TORCH_COMPILE_DISABLE"] = "1"
         env["TORCHDYNAMO_DISABLE"] = "1"
         env["STARVLA_ALLOW_TORCH_COMPILE"] = "0"
+    env["VLA_JEPA_MAIN_TORCH_THREADS"] = str(
+        runtime["main_torch_threads"]
+    )
+    env["VLA_JEPA_MAIN_TORCH_INTEROP_THREADS"] = str(
+        runtime["main_torch_interop_threads"]
+    )
+    env["VLA_JEPA_DISABLE_AUTOGRAD_MULTITHREADING"] = (
+        "1" if runtime["disable_autograd_multithreading"] else "0"
+    )
+    env["PYTORCH_CUDA_ALLOC_CONF"] = str(
+        runtime["pytorch_cuda_alloc_conf"]
+    )
+    env["TOKENIZERS_PARALLELISM"] = (
+        "true" if runtime["tokenizers_parallelism"] else "false"
+    )
     interface = str(runtime["network_interface"])
     if interface == "auto":
         interface = h100_training._discover_default_interface()
@@ -2471,9 +2791,10 @@ def run_curriculum(
     state_dir = Path(plan["state_root_dir"]) / run_id
     state_path = state_dir / "curriculum_state.json"
     if resume:
-        if not state_dir.is_dir():
+        if state_dir.is_symlink() or not state_dir.is_dir():
             raise CurriculumError(
-                f"curriculum resume state directory does not exist: {state_dir}"
+                "curriculum resume state directory must be an existing "
+                f"non-symlink directory: {state_dir}"
             )
         state = _load_curriculum_state(state_path)
         _validate_state_against_plan(state=state, plan=plan, run_id=run_id)
@@ -2487,13 +2808,20 @@ def run_curriculum(
                 f"curriculum state directory already exists: {state_dir}; "
                 "use --resume with the same --run-id after authenticating it"
             )
+        container_image, container_image_id = (
+            h100_training._required_container_image_identity(
+                plan["stages"][0]["plan"]
+            )
+        )
         state_dir.mkdir(parents=True)
         state = {
-            "schema_version": 3,
+            "schema_version": 4,
             "curriculum_id": plan["curriculum_id"],
             "curriculum_run_id": run_id,
             "curriculum_config_path": plan["curriculum_path"],
             "curriculum_config_sha256": plan["curriculum_sha256"],
+            "container_image": container_image,
+            "container_image_id": container_image_id,
             "status": "running",
             "started_utc": datetime.now(timezone.utc).isoformat(),
             "stages": [
@@ -2560,6 +2888,7 @@ def run_curriculum(
                 / f"{index + 1:02d}_{stage['id']}.yaml"
             )
             launch_config = resolved_path
+            launch_plan = stage["plan"]
             resumed_from_checkpoint: Path | None = None
 
             if state_stage["status"] == "pending":
@@ -2574,12 +2903,45 @@ def run_curriculum(
                     output_path=resolved_path,
                     previous_handoff=previous_handoff,
                 )
+                handoff_input = _authenticate_stage_handoff_input(
+                    curriculum_plan=plan,
+                    stage=stage,
+                    previous_handoff=previous_handoff,
+                    handoff=handoff_input,
+                )
+                # Authenticate the exact generated YAML, including the dynamic
+                # predecessor model path/hash, before constructing a command.
+                # This check is read-only and must not rewrite config semantics.
+                resolved_sha = _sha256(resolved_path)
+                launch_plan = (
+                    h100_training.check_curriculum_materialized_plan(
+                    resolved_path,
+                    source_config_path=Path(stage["config_path"]),
+                    expected_source_config_sha256=stage[
+                        "config_sha256"
+                    ],
+                        expected_materialized_config_sha256=resolved_sha,
+                        expected_run_id=stage_run_id,
+                        expected_pretrained_checkpoint=(
+                            None
+                            if previous_handoff is None
+                            else previous_handoff["model_path"]
+                        ),
+                        expected_pretrained_checkpoint_sha256=(
+                            None
+                            if previous_handoff is None
+                            else previous_handoff["model_sha256"]
+                        ),
+                        expected_curriculum_handoff=handoff_input,
+                        deep=False,
+                    )
+                )
                 state_stage.update(
                     {
                         "run_id": stage_run_id,
                         "run_dir": str(run_dir),
                         "resolved_config_path": str(resolved_path),
-                        "resolved_config_sha256": _sha256(resolved_path),
+                        "resolved_config_sha256": resolved_sha,
                         "handoff_input": handoff_input,
                         "started_utc": datetime.now(
                             timezone.utc
@@ -2609,6 +2971,21 @@ def run_curriculum(
                         f"interrupted stage {stage['id']} materialized config "
                         "is missing or changed"
                     )
+                _, resolved_payload = h100_training._load_config(
+                    resolved_path
+                )
+                handoff_input = _authenticate_stage_handoff_input(
+                    curriculum_plan=plan,
+                    stage=stage,
+                    previous_handoff=previous_handoff,
+                    handoff=resolved_payload.get("curriculum_handoff"),
+                )
+                if state_stage.get("handoff_input") != handoff_input:
+                    raise CurriculumError(
+                        f"interrupted stage {stage['id']} handoff input in "
+                        "curriculum state differs from the independently "
+                        "authenticated materialized config"
+                    )
                 resumed_from_checkpoint = (
                     _latest_complete_resume_checkpoint(
                         run_dir=run_dir,
@@ -2635,6 +3012,34 @@ def run_curriculum(
                 state_stage["resumed_from_checkpoint"] = str(
                     resumed_from_checkpoint
                 )
+                launch_plan = (
+                    h100_training.check_curriculum_materialized_plan(
+                        launch_config,
+                        source_config_path=Path(stage["config_path"]),
+                        expected_source_config_sha256=stage[
+                            "config_sha256"
+                        ],
+                        expected_materialized_config_sha256=resume_sha,
+                        base_materialized_config_path=resolved_path,
+                        expected_base_materialized_config_sha256=str(
+                            state_stage["resolved_config_sha256"]
+                        ),
+                        expected_run_id=stage_run_id,
+                        expected_pretrained_checkpoint=(
+                            None
+                            if previous_handoff is None
+                            else previous_handoff["model_path"]
+                        ),
+                        expected_pretrained_checkpoint_sha256=(
+                            None
+                            if previous_handoff is None
+                            else previous_handoff["model_sha256"]
+                        ),
+                        expected_curriculum_handoff=handoff_input,
+                        expected_resume_checkpoint=resumed_from_checkpoint,
+                        deep=False,
+                    )
+                )
                 state_stage["launch_attempt"] = (
                     int(state_stage.get("launch_attempt", 1)) + 1
                 )
@@ -2644,7 +3049,7 @@ def run_curriculum(
             state_stage.pop("exit_code", None)
             _write_curriculum_state(state_path, state)
             command = h100_training._accelerate_command(
-                stage["plan"], launch_config
+                launch_plan, launch_config
             )
             print(
                 f"Starting curriculum stage {index + 1}/"
@@ -2661,7 +3066,7 @@ def run_curriculum(
             active_process = subprocess.Popen(
                 command,
                 cwd=REPO_ROOT,
-                env=_training_environment(stage["plan"]),
+                env=_training_environment(launch_plan),
             )
             state_stage["active_process_pid"] = active_process.pid
             _write_curriculum_state(state_path, state)
@@ -2733,35 +3138,119 @@ def run_curriculum(
             signal.signal(signum, handler)
 
 
+def _stage_setup_dependency_identity(
+    stage: Mapping[str, Any],
+) -> str:
+    """Return the exact dependency contract installed by stage setup.
+
+    Helper repositories alone are not sufficient: a canonical stage also
+    depends on an authenticated GCS backend/probe while a LeRobot stage does
+    not.  Hashing the complete setup-relevant contract lets equivalent stages
+    share one setup pass without silently skipping a distinct backend.
+    """
+
+    runtime = stage["plan"]["runtime"]
+    training = stage["plan"]["training"]
+    contract = {
+        "container_image": runtime["container_image"],
+        "helper_repositories": runtime["helper_repositories"],
+        "dataset_profile": training["dataset_profile"],
+        "requires_gcloud": training["requires_gcloud"],
+        "canonical_bucket_root": training.get("canonical_bucket_root"),
+        "canonical_gcs_probe_object": training.get(
+            "canonical_gcs_probe_object"
+        ),
+    }
+    serialized = json.dumps(
+        contract,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(serialized).hexdigest()
+
+
 def setup(plan: Mapping[str, Any]) -> None:
-    seen: set[tuple[str, str]] = set()
+    seen: set[str] = set()
     for stage in plan["stages"]:
-        helpers = stage["plan"]["runtime"]["helper_repositories"]
-        identity = tuple(
-            sorted(
-                (
-                    name,
-                    f"{entry['url']}@{entry['commit']}:{entry['path']}",
-                )
-                for name, entry in helpers.items()
-            )
-        )
+        identity = _stage_setup_dependency_identity(stage)
         if identity in seen:
             continue
         seen.add(identity)
         h100_training.setup_dependencies(Path(stage["config_path"]))
 
 
+def _stage_preflight_backend_identity(
+    stage: Mapping[str, Any],
+) -> tuple[str, str | None, str | None, bool | None, bool | None]:
+    """Identify the config-sensitive runtime backend preflight must exercise."""
+
+    data = _require_mapping(
+        _nested(stage["payload"], "datasets.vla_data"),
+        field=f"stage {stage['id']} datasets.vla_data",
+    )
+    dataset_py = _require_string(
+        data.get("dataset_py"),
+        field=f"stage {stage['id']} datasets.vla_data.dataset_py",
+    )
+    video_backend = data.get("video_backend")
+    if video_backend is not None:
+        video_backend = _require_string(
+            video_backend,
+            field=f"stage {stage['id']} datasets.vla_data.video_backend",
+        )
+    multiprocessing_context = data.get("multiprocessing_context")
+    if multiprocessing_context is not None:
+        multiprocessing_context = _require_string(
+            multiprocessing_context,
+            field=(
+                f"stage {stage['id']} "
+                "datasets.vla_data.multiprocessing_context"
+            ),
+        )
+    persistent_workers = data.get("persistent_workers")
+    if persistent_workers is not None and not isinstance(
+        persistent_workers, bool
+    ):
+        raise CurriculumError(
+            f"stage {stage['id']} datasets.vla_data.persistent_workers "
+            "must be a boolean or null"
+        )
+    gpu_video_decode = data.get("gpu_video_decode_on_rank")
+    if gpu_video_decode is not None and not isinstance(
+        gpu_video_decode, bool
+    ):
+        raise CurriculumError(
+            f"stage {stage['id']} "
+            "datasets.vla_data.gpu_video_decode_on_rank must be a boolean "
+            "or null"
+        )
+    return (
+        dataset_py,
+        video_backend,
+        multiprocessing_context,
+        persistent_workers,
+        gpu_video_decode,
+    )
+
+
 def check(plan: Mapping[str, Any]) -> None:
-    for index, stage in enumerate(plan["stages"]):
-        # The expensive CUDA/model preflight is identical across the three
-        # stages, so run it once. Every stage still gets full config/artifact,
-        # Git, data, GCS, hardware, and port validation.
+    deep_backends: set[
+        tuple[str, str | None, str | None, bool | None, bool | None]
+    ] = set()
+    for stage in plan["stages"]:
+        backend = _stage_preflight_backend_identity(stage)
+        deep = backend not in deep_backends
         h100_training.check_plan(
             Path(stage["config_path"]),
-            deep=index == 0,
+            deep=deep,
         )
-    print("Three-stage curriculum preflight: PASS")
+        if deep:
+            deep_backends.add(backend)
+    print(
+        "Three-stage curriculum artifact/runtime preflight: PASS "
+        f"({len(deep_backends)} distinct data backends)"
+    )
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -2774,7 +3263,7 @@ def _parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
     for name in ("plan", "setup", "check", "run"):
         sub = subparsers.add_parser(name)
-        sub.add_argument("--config", type=Path, default=DEFAULT_CURRICULUM)
+        sub.add_argument("--config", type=Path, required=True)
         if name == "plan":
             sub.add_argument("--json", action="store_true")
         elif name == "run":
@@ -2816,6 +3305,11 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "check":
             check(plan)
         elif args.command == "run":
+            # Start and resume must pass the same artifact-authenticated,
+            # hardware, source, dependency, port, and backend-specific deep
+            # preflight as the explicit check command immediately before any
+            # run state or training process is created.
+            check(plan)
             run_curriculum(
                 plan,
                 run_id=args.run_id,

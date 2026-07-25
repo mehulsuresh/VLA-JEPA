@@ -58,6 +58,11 @@ runtime:
   main_process_port: 29573
   use_deepspeed: false
   torch_compile_environment: disabled
+  main_torch_threads: 1
+  main_torch_interop_threads: 1
+  disable_autograd_multithreading: true
+  pytorch_cuda_alloc_conf: expandable_segments:True
+  tokenizers_parallelism: false
   network_interface: auto
   require_clean_git: true
   provenance_launcher: scripts/h100_training.py
@@ -150,6 +155,7 @@ framework:
     allow_frozen_qwen: false
     allow_zero_loss_scale: false
   vj2_model:
+    predictor_attention_backend: torch_sdpa
     source: torchhub
     hub_repo_or_dir: /data/mehul-vla-jepa/src/vjepa2
     hub_model_name: vjepa2_1_vit_large_384
@@ -192,6 +198,7 @@ datasets:
     action_delta_anchor: chunk_start_state
     gripper_action_type: absolute
     state_action_normalization: q01_q99_unclipped
+    action_representation_contract_sha256: 9e1df348fb137c206b42a183892e29ec6247595fffc232bb2d73d94b5f5f91ac
     action_delta_mappings:
       source_controls:
         state_key: source
@@ -283,6 +290,10 @@ trainer:
   step_scheduler_with_optimizer: false
   save_interval: 1875
   eval_interval: 1875
+  checkpoint_eval_milestone_fractions: null
+  checkpoint_eval_milestone_steps: null
+  checkpoint_eval_include_full_epoch_boundaries: false
+  checkpoint_eval_milestones_only: false
   checkpoint_max_to_keep: 3
   save_best_only: false
   # Lower is better: 1 - min(grasp-recall, release-recall) / (1 + arm

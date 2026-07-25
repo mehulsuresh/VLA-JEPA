@@ -157,29 +157,15 @@ def _git_commit() -> str:
     return commit
 
 
-def _container_identity(plan: Mapping[str, Any]) -> tuple[str, str | None]:
-    configured_image = str(plan["runtime"]["container_image"])
-    current_image = os.environ.get(
-        "STARVLA_CONTAINER_IMAGE",
-        configured_image,
-    ).strip()
-    if not current_image:
+def _container_identity(plan: Mapping[str, Any]) -> tuple[str, str]:
+    current_image, image_id = (
+        h100_training._required_container_image_identity(plan)
+    )
+    if IMAGE_DIGEST_RE.fullmatch(image_id) is None:  # defensive schema guard
         raise h100_training.PlanError(
-            "current container image identity is empty"
+            "resolved Docker Image.Id must be sha256:<64 lowercase hex>"
         )
-    if current_image != configured_image:
-        raise h100_training.PlanError(
-            "current container image does not match runtime.container_image: "
-            f"{current_image!r} != {configured_image!r}"
-        )
-    digest = os.environ.get("STARVLA_CONTAINER_IMAGE_DIGEST", "").strip()
-    if not digest:
-        return current_image, None
-    if IMAGE_DIGEST_RE.fullmatch(digest) is None:
-        raise h100_training.PlanError(
-            "STARVLA_CONTAINER_IMAGE_DIGEST must be sha256:<64 lowercase hex>"
-        )
-    return current_image, digest
+    return current_image, image_id
 
 
 def _resolved_resume_config(
@@ -195,7 +181,7 @@ def _resolved_resume_config(
         checkpoint,
         int(plan["runtime"]["num_processes"]),
     )
-    cfg = OmegaConf.load(immutable_config)
+    cfg, _ = h100_training._load_immutable_run_config(immutable_config)
     run_id = str(cfg.get("run_id", ""))
     if h100_training.RUN_ID_RE.fullmatch(run_id) is None:
         raise h100_training.PlanError(
@@ -263,12 +249,18 @@ def _resolved_resume_config(
             "multiprocessing_context"
         )
 
-    current_image, image_digest = _container_identity(plan)
+    current_image, image_id = _container_identity(plan)
     recorded_image = human_launch.get("container_image")
-    if recorded_image is not None and str(recorded_image) != current_image:
+    recorded_image_id = human_launch.get("container_image_id")
+    if recorded_image != current_image:
         raise h100_training.PlanError(
             "current container image does not match the frozen run's recorded "
             "container image"
+        )
+    if recorded_image_id != image_id:
+        raise h100_training.PlanError(
+            "current Docker Image.Id does not match the frozen run's recorded "
+            "launch provenance"
         )
     helper_path = Path(__file__).resolve()
     source_commit = _git_commit()
@@ -286,7 +278,9 @@ def _resolved_resume_config(
         "source_commit": source_commit,
         "generated_utc": datetime.now(timezone.utc).isoformat(),
         "container_image": current_image,
-        "container_image_digest": image_digest,
+        # Preserve the v1 sidecar field name for the already reviewed narrow
+        # runtime-override schema.  Its value is Docker's local Image.Id.
+        "container_image_digest": image_id,
         "runtime_config_path": str(runtime_config_path),
         "runtime_config_sha256": runtime_config_sha256,
         "changes": {
@@ -335,7 +329,17 @@ def launch(
         checkpoint=checkpoint,
         resume_runtime_config=resume_runtime_config,
     )
-    command = h100_training._accelerate_command(plan, resolved_config)
+    # Re-resolve the exact generated invocation after the narrowly authorized
+    # worker-topology changes.  The command and environment must come from the
+    # bytes handed to the trainer, not from the pre-materialization profile.
+    materialized_plan = h100_training.resolve_plan(
+        resolved_config,
+        allow_transport_resume=True,
+    )
+    command = h100_training._accelerate_command(
+        materialized_plan,
+        resolved_config,
+    )
     resolved = OmegaConf.load(resolved_config)
     metadata = resolved.resume_runtime_override
     change = metadata.changes["datasets.vla_data.num_workers"]
@@ -364,13 +368,30 @@ def launch(
     if print_command_only:
         return
 
-    runtime = plan["runtime"]
+    runtime = materialized_plan["runtime"]
     env = os.environ.copy()
+    for name in h100_training.AUTHORITATIVE_SEMANTIC_ENV_VARS:
+        env.pop(name, None)
     env["STARVLA_USE_DEEPSPEED"] = "1" if runtime["use_deepspeed"] else "0"
     if runtime["torch_compile_environment"] == "disabled":
         env["TORCH_COMPILE_DISABLE"] = "1"
         env["TORCHDYNAMO_DISABLE"] = "1"
         env["STARVLA_ALLOW_TORCH_COMPILE"] = "0"
+    env["VLA_JEPA_MAIN_TORCH_THREADS"] = str(
+        runtime["main_torch_threads"]
+    )
+    env["VLA_JEPA_MAIN_TORCH_INTEROP_THREADS"] = str(
+        runtime["main_torch_interop_threads"]
+    )
+    env["VLA_JEPA_DISABLE_AUTOGRAD_MULTITHREADING"] = (
+        "1" if runtime["disable_autograd_multithreading"] else "0"
+    )
+    env["PYTORCH_CUDA_ALLOC_CONF"] = str(
+        runtime["pytorch_cuda_alloc_conf"]
+    )
+    env["TOKENIZERS_PARALLELISM"] = (
+        "true" if runtime["tokenizers_parallelism"] else "false"
+    )
     interface = str(runtime["network_interface"])
     if interface == "auto":
         interface = h100_training._discover_default_interface()

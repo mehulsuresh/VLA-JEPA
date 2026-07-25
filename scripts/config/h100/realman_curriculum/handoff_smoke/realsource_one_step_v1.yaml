@@ -23,10 +23,13 @@ datasets:
 
 trainer:
   epochs: 1
-  max_train_steps: auto
+  max_train_steps: 1
+  num_warmup_steps: 0
+  warmup_ratio: 0.0
   eval_before_train: false
   checkpoint_eval_milestone_fractions: [1.0]
-  checkpoint_eval_milestone_steps: null
+  checkpoint_eval_milestone_steps: [1]
+  checkpoint_eval_include_full_epoch_boundaries: true
   checkpoint_eval_milestones_only: true
   checkpoint_max_to_keep: 0
   reload_modules: null

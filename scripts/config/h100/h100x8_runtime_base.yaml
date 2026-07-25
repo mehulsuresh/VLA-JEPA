@@ -38,6 +38,11 @@ runtime:
   main_process_port: 29573
   use_deepspeed: false
   torch_compile_environment: disabled
+  main_torch_threads: 1
+  main_torch_interop_threads: 1
+  disable_autograd_multithreading: true
+  pytorch_cuda_alloc_conf: expandable_segments:True
+  tokenizers_parallelism: false
   network_interface: auto
   require_clean_git: true
   provenance_launcher: scripts/h100_training.py
@@ -59,6 +64,10 @@ framework:
     strict_full_trainable: true
 
 trainer:
+  checkpoint_eval_milestone_fractions: null
+  checkpoint_eval_milestone_steps: null
+  checkpoint_eval_include_full_epoch_boundaries: false
+  checkpoint_eval_milestones_only: false
   detailed_timing_logging: false
   detailed_timing_frequency: 10
   allow_training_stream_eval: false

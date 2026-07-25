@@ -16,6 +16,16 @@ from starVLA.training import train_starvla
 from starVLA.training.trainer_utils.trainer_tools import TrainerUtils
 
 
+TEST_IMAGE = "fixture:h100"
+TEST_IMAGE_ID = "sha256:" + "d" * 64
+
+
+def _set_test_image_identity(monkeypatch) -> None:
+    monkeypatch.setenv("STARVLA_CONTAINER_IMAGE", TEST_IMAGE)
+    monkeypatch.setenv("STARVLA_CONTAINER_IMAGE_ID", TEST_IMAGE_ID)
+    monkeypatch.setenv("STARVLA_CONTAINER_IMAGE_DIGEST", TEST_IMAGE_ID)
+
+
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -29,7 +39,13 @@ def test_human_wrapper_exposes_only_explicit_authenticated_resume():
     subprocess.run(["bash", "-n", str(wrapper)], check=True)
 
     missing_id = subprocess.run(
-        ["bash", str(wrapper), "resume"],
+        [
+            "bash",
+            str(wrapper),
+            "resume",
+            "--config",
+            "/does/not/need/to/exist/for/this/error.yaml",
+        ],
         text=True,
         capture_output=True,
     )
@@ -53,6 +69,7 @@ def test_human_wrapper_exposes_only_explicit_authenticated_resume():
     assert "unknown option --learning-rate" in override.stderr
 
     source = wrapper.read_text(encoding="utf-8")
+    assert "h100_curriculum.py setup" in source
     assert "h100_curriculum.py run" in source
     assert '--run-id "${RUN_ID}"' in source
     assert "--resume" in source
@@ -61,6 +78,359 @@ def test_human_wrapper_exposes_only_explicit_authenticated_resume():
         in source
     )
     assert 'run_curriculum_container "${name}" gpus' in source
+    assert "resolve_container_image_id" in source
+    assert 'IMAGE="${image_reference}"' in source
+    assert 'STARVLA_CONTAINER_IMAGE_ID="${CONTAINER_IMAGE_ID}"' in source
+
+
+@pytest.mark.parametrize(
+    "command",
+    ("setup", "plan", "check", "start", "resume"),
+)
+def test_human_curriculum_commands_require_explicit_config(command: str):
+    wrapper = (
+        Path(__file__).resolve().parents[1]
+        / "scripts"
+        / "h100_curriculum.sh"
+    )
+    result = subprocess.run(
+        ["bash", str(wrapper), command],
+        text=True,
+        capture_output=True,
+    )
+    assert result.returncode == 2
+    assert (
+        f"{command} requires explicit --config YAML" in result.stderr
+    )
+
+
+def test_human_curriculum_wrapper_rejects_config_symlink(
+    tmp_path: Path,
+):
+    wrapper = (
+        Path(__file__).resolve().parents[1]
+        / "scripts"
+        / "h100_curriculum.sh"
+    )
+    target = tmp_path / "curriculum-target.yaml"
+    target.write_text("schema_version: 2\n", encoding="utf-8")
+    link = tmp_path / "curriculum.yaml"
+    link.symlink_to(target)
+
+    result = subprocess.run(
+        ["bash", str(wrapper), "plan", "--config", str(link)],
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode == 2
+    assert "regular non-symlink file" in result.stderr
+
+
+@pytest.mark.parametrize("command", ("plan", "setup", "check", "run"))
+def test_python_curriculum_commands_require_explicit_config(command: str):
+    with pytest.raises(SystemExit):
+        h100_curriculum._parser().parse_args([command])
+
+
+def test_curriculum_requires_explicit_workflow_kind(monkeypatch):
+    monkeypatch.setattr(
+        h100_curriculum,
+        "_load_curriculum",
+        lambda _path: (
+            OmegaConf.create({}),
+            {
+                "schema_version": 2,
+                "curriculum_id": "fixture_curriculum",
+            },
+        ),
+    )
+    with pytest.raises(
+        h100_curriculum.CurriculumError,
+        match="workflow_kind must be explicitly declared",
+    ):
+        h100_curriculum.resolve_curriculum(Path("/unused.yaml"))
+
+
+def test_curriculum_config_symlink_is_rejected_before_resolve(
+    tmp_path: Path,
+):
+    target = tmp_path / "curriculum-target.yaml"
+    target.write_text("schema_version: 2\n", encoding="utf-8")
+    link = tmp_path / "curriculum.yaml"
+    link.symlink_to(target)
+
+    with pytest.raises(
+        h100_curriculum.CurriculumError,
+        match="non-symlink",
+    ):
+        h100_curriculum._load_curriculum(link)
+
+
+def test_curriculum_state_file_symlink_is_rejected(tmp_path: Path):
+    target = tmp_path / "state-target.json"
+    h100_curriculum._write_curriculum_state(
+        target,
+        {
+            "schema_version": 3,
+            "curriculum_id": "fixture_curriculum",
+        },
+    )
+    link = tmp_path / "curriculum_state.json"
+    link.symlink_to(target)
+
+    with pytest.raises(
+        h100_curriculum.CurriculumError,
+        match="regular file",
+    ):
+        h100_curriculum._load_curriculum_state(link)
+
+
+def test_curriculum_resume_state_directory_symlink_is_rejected(
+    tmp_path: Path,
+):
+    state_root = tmp_path / "curricula"
+    state_root.mkdir()
+    target = tmp_path / "external-state"
+    target.mkdir()
+    run_id = "fixture_curriculum_symlink_resume"
+    (state_root / run_id).symlink_to(target, target_is_directory=True)
+    plan = {
+        "curriculum_id": "fixture_curriculum",
+        "state_root_dir": str(state_root),
+    }
+
+    with pytest.raises(
+        h100_curriculum.CurriculumError,
+        match="non-symlink directory",
+    ):
+        h100_curriculum.run_curriculum(
+            plan,
+            run_id=run_id,
+            resume=True,
+        )
+
+
+def test_curriculum_handoff_checkpoint_symlink_is_rejected_before_resolve(
+    tmp_path: Path,
+):
+    run_dir = tmp_path / "run"
+    checkpoint_root = run_dir / "checkpoints"
+    checkpoint_root.mkdir(parents=True)
+    target = tmp_path / "external" / "steps_1"
+    target.mkdir(parents=True)
+    (checkpoint_root / "steps_1").symlink_to(
+        target, target_is_directory=True
+    )
+    (run_dir / "best_checkpoint.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "best_metric_step": 1,
+                "checkpoint_relative_path": "checkpoints/steps_1",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        h100_curriculum.CurriculumError,
+        match="checkpoint.*symlink",
+    ):
+        h100_curriculum._validate_selection_handoff(run_dir)
+
+
+def _dependency_stage(
+    *,
+    stage_id: str,
+    config: Path,
+    profile: str,
+    helpers: dict,
+    requires_gcloud: bool,
+    dataset_py: str,
+    video_backend: str | None,
+    multiprocessing_context: str = "forkserver",
+    persistent_workers: bool = True,
+    gpu_video_decode_on_rank: bool = False,
+) -> dict:
+    training = {
+        "dataset_profile": profile,
+        "requires_gcloud": requires_gcloud,
+        "canonical_bucket_root": (
+            "gs://fixture" if requires_gcloud else None
+        ),
+        "canonical_gcs_probe_object": (
+            "gs://fixture/probe" if requires_gcloud else None
+        ),
+    }
+    data = {
+        "dataset_py": dataset_py,
+        "multiprocessing_context": multiprocessing_context,
+        "persistent_workers": persistent_workers,
+        "gpu_video_decode_on_rank": gpu_video_decode_on_rank,
+    }
+    if video_backend is not None:
+        data["video_backend"] = video_backend
+    return {
+        "id": stage_id,
+        "config_path": str(config),
+        "plan": {
+            "runtime": {
+                "container_image": "fixture:h100",
+                "helper_repositories": helpers,
+            },
+            "training": training,
+        },
+        "payload": {"datasets": {"vla_data": data}},
+    }
+
+
+def test_curriculum_setup_covers_every_unique_stage_dependency(
+    tmp_path: Path,
+    monkeypatch,
+):
+    canonical_config = tmp_path / "canonical.yaml"
+    intervention_config = tmp_path / "intervention.yaml"
+    hq_config = tmp_path / "hq.yaml"
+    common_helpers = {
+        "moge": {
+            "path": "/scratch/src/moge",
+            "url": "https://example.invalid/moge.git",
+            "commit": "a" * 40,
+        }
+    }
+    canonical_helpers = common_helpers | {
+        "canonical": {
+            "path": "/scratch/src/canonical",
+            "url": "https://example.invalid/canonical.git",
+            "commit": "b" * 40,
+        }
+    }
+    stages = [
+        _dependency_stage(
+            stage_id="canonical",
+            config=canonical_config,
+            profile="canonical_gcs",
+            helpers=canonical_helpers,
+            requires_gcloud=True,
+            dataset_py="canonical_subset_vla",
+            video_backend="pyav",
+        ),
+        _dependency_stage(
+            stage_id="intervention",
+            config=intervention_config,
+            profile="realman_lerobot",
+            helpers=common_helpers,
+            requires_gcloud=False,
+            dataset_py="lerobot_datasets",
+            video_backend="pyav",
+        ),
+        _dependency_stage(
+            stage_id="hq",
+            config=hq_config,
+            profile="realman_lerobot",
+            helpers=common_helpers,
+            requires_gcloud=False,
+            dataset_py="lerobot_datasets",
+            video_backend="pyav",
+        ),
+    ]
+    calls: list[Path] = []
+    monkeypatch.setattr(
+        h100_curriculum.h100_training,
+        "setup_dependencies",
+        lambda config: calls.append(config),
+    )
+
+    h100_curriculum.setup({"stages": stages})
+
+    assert calls == [canonical_config, intervention_config]
+
+
+def test_curriculum_check_deep_preflights_each_distinct_stage_backend(
+    tmp_path: Path,
+    monkeypatch,
+):
+    stages = [
+        _dependency_stage(
+            stage_id="canonical",
+            config=tmp_path / "canonical.yaml",
+            profile="canonical_gcs",
+            helpers={},
+            requires_gcloud=True,
+            dataset_py="canonical_subset_vla",
+            video_backend="pyav",
+        ),
+        _dependency_stage(
+            stage_id="intervention",
+            config=tmp_path / "intervention.yaml",
+            profile="realman_lerobot",
+            helpers={},
+            requires_gcloud=False,
+            dataset_py="lerobot_datasets",
+            video_backend="pyav",
+        ),
+        _dependency_stage(
+            stage_id="hq",
+            config=tmp_path / "hq.yaml",
+            profile="realman_lerobot",
+            helpers={},
+            requires_gcloud=False,
+            dataset_py="lerobot_datasets",
+            video_backend="pyav",
+            multiprocessing_context="spawn",
+        ),
+    ]
+    calls: list[tuple[Path, bool]] = []
+    monkeypatch.setattr(
+        h100_curriculum.h100_training,
+        "check_plan",
+        lambda config, *, deep: calls.append((config, deep)),
+    )
+
+    h100_curriculum.check({"stages": stages})
+
+    assert calls == [
+        (tmp_path / "canonical.yaml", True),
+        (tmp_path / "intervention.yaml", True),
+        (tmp_path / "hq.yaml", True),
+    ]
+
+
+def test_curriculum_run_preflights_before_creating_run_state(
+    tmp_path: Path,
+    monkeypatch,
+):
+    plan = {"curriculum_id": "fixture"}
+    events: list[str] = []
+    monkeypatch.setattr(
+        h100_curriculum,
+        "resolve_curriculum",
+        lambda *_args, **_kwargs: plan,
+    )
+    monkeypatch.setattr(
+        h100_curriculum,
+        "check",
+        lambda actual: events.append("check")
+        if actual is plan
+        else None,
+    )
+    monkeypatch.setattr(
+        h100_curriculum,
+        "run_curriculum",
+        lambda actual, **_kwargs: events.append("run")
+        if actual is plan
+        else None,
+    )
+
+    assert (
+        h100_curriculum.main(
+            ["run", "--config", str(tmp_path / "curriculum.yaml")]
+        )
+        == 0
+    )
+    assert events == ["check", "run"]
 
 
 def test_trainer_authenticates_config_owned_pretrained_model_before_load(
@@ -273,6 +643,10 @@ def test_materialized_config_identity_is_bound_to_immutable_run_config(
         OmegaConf.to_yaml(OmegaConf.create(run_payload), resolve=True),
         encoding="utf-8",
     )
+    (tmp_path / "config.json").write_text(
+        json.dumps(run_payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
 
     h100_curriculum._validate_materialized_run_config(
         run_config=run_config,
@@ -283,6 +657,10 @@ def test_materialized_config_identity_is_bound_to_immutable_run_config(
     run_payload["trainer"]["pretrained_checkpoint_sha256"] = "f" * 64
     run_config.write_text(
         OmegaConf.to_yaml(OmegaConf.create(run_payload), resolve=True),
+        encoding="utf-8",
+    )
+    (tmp_path / "config.json").write_text(
+        json.dumps(run_payload, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
     with pytest.raises(
@@ -296,9 +674,41 @@ def test_materialized_config_identity_is_bound_to_immutable_run_config(
         )
 
 
-def test_natural_final_handoff_never_rewinds_to_offline_best(
+def test_completed_stage_requires_immutable_yaml_json_config_pair(
     tmp_path: Path,
 ):
+    materialized = tmp_path / "materialized.yaml"
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    run_config = run_dir / "config.yaml"
+    payload = {
+        "run_id": "fixture",
+        "trainer": {
+            "is_resume": False,
+            "pretrained_checkpoint": None,
+            "pretrained_checkpoint_sha256": None,
+        },
+    }
+    text = OmegaConf.to_yaml(OmegaConf.create(payload), resolve=True)
+    materialized.write_text(text, encoding="utf-8")
+    run_config.write_text(text, encoding="utf-8")
+
+    with pytest.raises(
+        h100_curriculum.CurriculumError,
+        match=r"config YAML\+JSON pair",
+    ):
+        h100_curriculum._validate_materialized_run_config(
+            run_config=run_config,
+            materialized_config=materialized,
+            expected_materialized_config_sha256=_sha256(materialized),
+        )
+
+
+def test_natural_final_handoff_never_rewinds_to_offline_best(
+    tmp_path: Path,
+    monkeypatch,
+):
+    _set_test_image_identity(monkeypatch)
     run_dir = tmp_path / "stage_a_run"
     run_dir.mkdir()
     config_payload = {
@@ -325,6 +735,10 @@ def test_natural_final_handoff_never_rewinds_to_offline_best(
     run_config = run_dir / "config.yaml"
     materialized_config = tmp_path / "stage_a_materialized.yaml"
     run_config.write_text(config_text, encoding="utf-8")
+    (run_dir / "config.json").write_text(
+        json.dumps(config_payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
     materialized_config.write_text(config_text, encoding="utf-8")
     config_sha = _sha256(run_config)
 
@@ -421,6 +835,9 @@ def test_natural_final_handoff_never_rewinds_to_offline_best(
         "id": "stage_b",
         "role": "adapt",
         "initialization": "previous_stage_final",
+        "optimizer_scheduler_rng_reset": True,
+        "resume_policy": "newest_complete_full_state_same_stage",
+        "world_model_predictor_attention_backend": "torch_sdpa",
         "handoff_checkpoint_policy": "natural_final",
         "config_path": str(source_config),
         "config_sha256": _sha256(source_config),
@@ -438,6 +855,7 @@ def test_natural_final_handoff_never_rewinds_to_offline_best(
         "first_epoch_checkpoint_steps": [1],
         "full_epoch_boundary_steps": [1],
         "checkpoint_eval_milestone_steps": [1],
+        "plan": {"runtime": {"container_image": TEST_IMAGE}},
     }
     curriculum_plan = {
         "curriculum_id": "fixture",
@@ -473,6 +891,13 @@ def _source_stage_config(path: Path) -> None:
     path.write_text(
         """
 run_id: source
+curriculum_stage:
+  initialization: previous_stage_final
+  optimizer_scheduler_rng_reset: true
+  resume_policy: newest_complete_full_state_same_stage
+framework:
+  vj2_model:
+    predictor_attention_backend: torch_sdpa
 trainer:
   is_resume: false
   resume_from_checkpoint: null
@@ -532,6 +957,7 @@ def test_three_stage_handoff_and_interrupted_resume_are_authenticated(
     tmp_path: Path,
     monkeypatch,
 ):
+    _set_test_image_identity(monkeypatch)
     configs = []
     stages = []
     run_root = tmp_path / "runs"
@@ -543,10 +969,15 @@ def test_three_stage_handoff_and_interrupted_resume_are_authenticated(
             {
                 "id": stage_id,
                 "role": ("pretrain", "adapt", "finetune")[index],
-                "initialization": (
-                    "upstream" if index == 0 else "previous_stage_final"
-                ),
-                "handoff_checkpoint_policy": "natural_final",
+                    "initialization": (
+                        "upstream" if index == 0 else "previous_stage_final"
+                    ),
+                    "optimizer_scheduler_rng_reset": True,
+                    "resume_policy": (
+                        "newest_complete_full_state_same_stage"
+                    ),
+                    "world_model_predictor_attention_backend": "torch_sdpa",
+                    "handoff_checkpoint_policy": "natural_final",
                 "config_path": str(config),
                 "config_sha256": _sha256(config),
                 "model_architecture_sha256": "a" * 64,
@@ -558,6 +989,7 @@ def test_three_stage_handoff_and_interrupted_resume_are_authenticated(
                         "run_root_dir": str(run_root),
                     },
                     "runtime": {
+                        "container_image": TEST_IMAGE,
                         "num_processes": 8,
                         "use_deepspeed": False,
                         "torch_compile_environment": "disabled",
@@ -598,6 +1030,11 @@ def test_three_stage_handoff_and_interrupted_resume_are_authenticated(
         lambda _plan, config: ["fixture-train", str(config)],
     )
     monkeypatch.setattr(
+        h100_curriculum.h100_training,
+        "check_curriculum_materialized_plan",
+        lambda _config, **_kwargs: {},
+    )
+    monkeypatch.setattr(
         h100_curriculum,
         "_training_environment",
         lambda _plan: {},
@@ -635,8 +1072,21 @@ def test_three_stage_handoff_and_interrupted_resume_are_authenticated(
                     OmegaConf.to_container(cfg, resolve=True)
                 )
                 frozen.output_dir = str(run_dir)
+                frozen_payload = OmegaConf.to_container(
+                    frozen, resolve=True
+                )
                 immutable.write_text(
                     OmegaConf.to_yaml(frozen, resolve=True),
+                    encoding="utf-8",
+                )
+                (run_dir / "config.json").write_text(
+                    json.dumps(
+                        frozen_payload,
+                        indent=2,
+                        sort_keys=True,
+                        allow_nan=False,
+                    )
+                    + "\n",
                     encoding="utf-8",
                 )
             # A succeeds; B's first launch fails; resumed B and then C succeed.

@@ -83,6 +83,22 @@ _KNOWN_TORCHHUB_VJEPA_METADATA = {
 }
 
 
+def _resolve_vj_predictor_attention_backend(vj2_model_cfg) -> str:
+    backend = vj2_model_cfg.get("predictor_attention_backend", None)
+    if not isinstance(backend, str) or not backend.strip():
+        raise ValueError(
+            "framework.vj2_model.predictor_attention_backend is required; "
+            "configure either 'torch_sdpa' or 'flash_attn'"
+        )
+    backend = backend.strip()
+    if backend not in {"torch_sdpa", "flash_attn"}:
+        raise ValueError(
+            "framework.vj2_model.predictor_attention_backend must be "
+            "'torch_sdpa' or 'flash_attn'"
+        )
+    return backend
+
+
 class _VJEPAMetadataEncoder(nn.Module):
     """Metadata-only stand-in for eval paths that never call the V-JEPA teacher."""
 
@@ -318,6 +334,9 @@ class VLA_JEPA(baseframework):
         vj_predictor_embed_dim = self._resolve_vj_predictor_embed_dim(hidden_size)
         vj_predictor_num_heads = self._resolve_vj_predictor_num_heads(vj_predictor_embed_dim)
 
+        predictor_attention_backend = _resolve_vj_predictor_attention_backend(
+            self.config.framework.vj2_model
+        )
         self.vj_predictor = VisionTransformerPredictorAC(
             num_frames=self.config.framework.vj2_model.num_frames // tubelet_size,
             img_size=((image_size, image_size)),
@@ -333,6 +352,9 @@ class VLA_JEPA(baseframework):
             ),
             use_legacy_rope_bug=bool(
                 self.config.framework.vj2_model.get("use_legacy_rope_bug", False)
+            ),
+            use_flash_attention=(
+                predictor_attention_backend == "flash_attn"
             ),
         )
         self.replace_prompt = "".join(

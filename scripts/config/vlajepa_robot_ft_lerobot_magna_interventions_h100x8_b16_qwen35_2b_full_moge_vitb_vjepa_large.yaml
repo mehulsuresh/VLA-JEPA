@@ -55,6 +55,11 @@ runtime:
   main_process_port: 29573
   use_deepspeed: false
   torch_compile_environment: disabled
+  main_torch_threads: 1
+  main_torch_interop_threads: 1
+  disable_autograd_multithreading: true
+  pytorch_cuda_alloc_conf: expandable_segments:True
+  tokenizers_parallelism: false
   network_interface: auto
   require_clean_git: true
   provenance_launcher: scripts/h100_training.py
@@ -147,6 +152,7 @@ framework:
     allow_frozen_qwen: false
     allow_zero_loss_scale: false
   vj2_model:
+    predictor_attention_backend: torch_sdpa
     source: torchhub
     hub_repo_or_dir: /mnt/vla-jepa/src/vjepa2
     hub_model_name: vjepa2_1_vit_large_384
@@ -174,6 +180,8 @@ datasets:
     data_mix: magna_source_no_base_no_lift_interventions_v3
     lerobot_version: v3.0
     episode_split_manifest: deployment/realman/eval_manifests/magna_internal_holdout_global_batch128_v1.json
+    holdout_episode_count: 128
+    eval_per_device_batch_size: 16
     lerobot_statistics_source: split_train
     require_statistics_frame_count: true
     action_type: joint_delta_gripper_absolute
@@ -267,6 +275,10 @@ trainer:
   step_scheduler_with_optimizer: false
   save_interval: 1875
   eval_interval: 1875
+  checkpoint_eval_milestone_fractions: null
+  checkpoint_eval_milestone_steps: null
+  checkpoint_eval_include_full_epoch_boundaries: false
+  checkpoint_eval_milestones_only: false
   checkpoint_max_to_keep: 3
   save_best_only: false
   # Lower is better: 1 - min(grasp-recall, release-recall) / (1 + arm

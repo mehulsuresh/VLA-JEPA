@@ -402,17 +402,36 @@ def _install_compiled_callable_attr(
 
 def resolve_trackers(cfg):
     configured_trackers = cfg.get("trackers", [])
+    if configured_trackers is None:
+        return []
     if isinstance(configured_trackers, str):
         configured_trackers = [configured_trackers]
+    elif (
+        isinstance(configured_trackers, (bytes, bytearray, Mapping))
+        or not (
+            isinstance(configured_trackers, Sequence)
+            or OmegaConf.is_list(configured_trackers)
+        )
+    ):
+        raise TypeError(
+            "trackers must be null, a tracker name, or a list of tracker names"
+        )
 
     valid_trackers = {tracker.value for tracker in LoggerType}
     resolved_trackers = []
+    unsupported_trackers = []
     for tracker in configured_trackers:
-        tracker_name = str(tracker).lower()
+        tracker_name = str(tracker).strip().lower()
         if tracker_name in valid_trackers:
             resolved_trackers.append(tracker_name)
         else:
-            logger.warning(f"Ignoring unsupported tracker '{tracker_name}'. Valid Accelerate trackers: {sorted(valid_trackers)}")
+            unsupported_trackers.append(tracker_name)
+    if unsupported_trackers:
+        raise ValueError(
+            "Unsupported configured tracker(s) "
+            f"{sorted(set(unsupported_trackers))}. "
+            f"Valid Accelerate trackers: {sorted(valid_trackers)}"
+        )
     return resolved_trackers
 
 
@@ -1166,6 +1185,19 @@ def _validate_resume_runtime_override(
         raise RuntimeError(
             "resume_runtime_override container_image_digest must be null or "
             "sha256:<64 lowercase hex>."
+        )
+    recorded_container_image_id = _nested_config_value(
+        source,
+        ("human_launch", "container_image_id"),
+        missing=missing,
+    )
+    if (
+        recorded_container_image_id is missing
+        or image_digest != recorded_container_image_id
+    ):
+        raise RuntimeError(
+            "resume_runtime_override container_image_digest does not match "
+            "the immutable source Docker Image.Id."
         )
 
     runtime_config_path = validated_repo_file(
@@ -2004,6 +2036,94 @@ def _validated_checkpoint_eval_milestone_steps(
     return steps
 
 
+def _validated_checkpoint_eval_milestone_fractions(
+    raw_fractions,
+) -> list[float]:
+    """Validate config-owned first-epoch checkpoint/eval fractions."""
+
+    if raw_fractions is None:
+        return []
+    if OmegaConf.is_config(raw_fractions):
+        raw_fractions = OmegaConf.to_container(
+            raw_fractions,
+            resolve=True,
+        )
+    if (
+        isinstance(raw_fractions, (str, bytes, Mapping))
+        or not isinstance(raw_fractions, Sequence)
+        or not raw_fractions
+    ):
+        raise ValueError(
+            "trainer.checkpoint_eval_milestone_fractions must be null or a "
+            "non-empty strictly increasing list of values in (0, 1]"
+        )
+    fractions: list[float] = []
+    for value in raw_fractions:
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or float(value) <= 0.0
+            or float(value) > 1.0
+        ):
+            raise ValueError(
+                "trainer.checkpoint_eval_milestone_fractions must contain "
+                "only finite numeric values in (0, 1]"
+            )
+        fractions.append(float(value))
+    if any(
+        current <= previous
+        for previous, current in zip(fractions, fractions[1:])
+    ):
+        raise ValueError(
+            "trainer.checkpoint_eval_milestone_fractions must be strictly "
+            "increasing"
+        )
+    return fractions
+
+
+def _resolve_checkpoint_eval_milestone_steps(
+    raw_steps,
+    *,
+    milestone_fractions: Sequence[float],
+    include_full_epoch_boundaries: bool,
+    steps_per_epoch: int,
+    epochs: int,
+    max_train_steps: int,
+) -> list[int]:
+    """Resolve a YAML-declared milestone policy after loader length is known.
+
+    ``auto`` means: checkpoint at each configured fraction of the first full
+    epoch, and (when explicitly requested) at every complete epoch boundary.
+    An explicit integer list remains exact and is never augmented.
+    """
+
+    auto_steps = raw_steps is None or (
+        isinstance(raw_steps, str) and raw_steps.lower() == "auto"
+    )
+    if isinstance(raw_steps, str) and not auto_steps:
+        raise ValueError(
+            "trainer.checkpoint_eval_milestone_steps must be 'auto', null, "
+            "or a sorted, unique list of positive integers"
+        )
+    if not auto_steps:
+        return _validated_checkpoint_eval_milestone_steps(
+            raw_steps,
+            max_train_steps=max_train_steps,
+        )
+
+    resolved: set[int] = set()
+    for fraction in milestone_fractions:
+        boundary = max(1, math.ceil(steps_per_epoch * float(fraction)))
+        resolved.add(min(boundary, steps_per_epoch, max_train_steps))
+    if include_full_epoch_boundaries:
+        for epoch in range(1, int(epochs) + 1):
+            boundary = steps_per_epoch * epoch
+            if boundary <= max_train_steps:
+                resolved.add(boundary)
+    return sorted(step for step in resolved if 0 < step <= max_train_steps)
+
+
 def _authenticated_pretrained_checkpoint(cfg) -> str | None:
     """Authenticate a model-only initialization artifact before deserialization.
 
@@ -2145,6 +2265,19 @@ def _resolved_training_schedule_payload(
         payload["resolved"]["checkpoint_eval_milestone_steps"] = list(
             trainer_cfg.get("checkpoint_eval_milestone_steps", []) or []
         )
+    if "checkpoint_eval_milestone_fractions" in configured_schedule:
+        payload["resolved"]["checkpoint_eval_milestone_fractions"] = list(
+            trainer_cfg.get("checkpoint_eval_milestone_fractions", []) or []
+        )
+    if "checkpoint_eval_include_full_epoch_boundaries" in configured_schedule:
+        payload["resolved"][
+            "checkpoint_eval_include_full_epoch_boundaries"
+        ] = bool(
+            trainer_cfg.get(
+                "checkpoint_eval_include_full_epoch_boundaries",
+                False,
+            )
+        )
     if "checkpoint_eval_milestones_only" in configured_schedule:
         payload["resolved"]["checkpoint_eval_milestones_only"] = bool(
             trainer_cfg.get("checkpoint_eval_milestones_only", False)
@@ -2255,9 +2388,21 @@ def resolve_training_schedule(
     configured_milestone_steps = trainer_cfg.get(
         "checkpoint_eval_milestone_steps", None
     )
-    if OmegaConf.is_config(configured_milestone_steps):
+    if (
+        OmegaConf.is_config(configured_milestone_steps)
+        and not isinstance(configured_milestone_steps, str)
+    ):
         configured_milestone_steps = OmegaConf.to_container(
             configured_milestone_steps,
+            resolve=True,
+        )
+    configured_milestone_fractions = trainer_cfg.get(
+        "checkpoint_eval_milestone_fractions",
+        None,
+    )
+    if OmegaConf.is_config(configured_milestone_fractions):
+        configured_milestone_fractions = OmegaConf.to_container(
+            configured_milestone_fractions,
             resolve=True,
         )
     configured_schedule = {
@@ -2274,6 +2419,17 @@ def resolve_training_schedule(
     if "checkpoint_eval_milestone_steps" in trainer_cfg:
         configured_schedule["checkpoint_eval_milestone_steps"] = (
             configured_milestone_steps
+        )
+    if "checkpoint_eval_milestone_fractions" in trainer_cfg:
+        configured_schedule["checkpoint_eval_milestone_fractions"] = (
+            configured_milestone_fractions
+        )
+    if "checkpoint_eval_include_full_epoch_boundaries" in trainer_cfg:
+        configured_schedule[
+            "checkpoint_eval_include_full_epoch_boundaries"
+        ] = trainer_cfg.get(
+            "checkpoint_eval_include_full_epoch_boundaries",
+            False,
         )
     micro_batches_per_epoch = _raw_dataloader_batches_per_rank(vla_train_dataloader, num_processes)
     grad_accum_steps = max(int(trainer_cfg.get("gradient_accumulation_steps", 1)), 1)
@@ -2314,9 +2470,29 @@ def resolve_training_schedule(
 
     _resolve_periodic_interval("save_interval")
     _resolve_periodic_interval("eval_interval")
+    milestone_fractions = _validated_checkpoint_eval_milestone_fractions(
+        trainer_cfg.get("checkpoint_eval_milestone_fractions", None)
+    )
+    trainer_cfg.checkpoint_eval_milestone_fractions = milestone_fractions
+    include_full_epoch_boundaries = trainer_cfg.get(
+        "checkpoint_eval_include_full_epoch_boundaries",
+        False,
+    )
+    if type(include_full_epoch_boundaries) is not bool:
+        raise ValueError(
+            "trainer.checkpoint_eval_include_full_epoch_boundaries must be a "
+            "boolean"
+        )
+    trainer_cfg.checkpoint_eval_include_full_epoch_boundaries = (
+        include_full_epoch_boundaries
+    )
     trainer_cfg.checkpoint_eval_milestone_steps = (
-        _validated_checkpoint_eval_milestone_steps(
-            trainer_cfg.get("checkpoint_eval_milestone_steps", None),
+        _resolve_checkpoint_eval_milestone_steps(
+            configured_milestone_steps,
+            milestone_fractions=milestone_fractions,
+            include_full_epoch_boundaries=include_full_epoch_boundaries,
+            steps_per_epoch=steps_per_epoch,
+            epochs=int(trainer_cfg.epochs),
             max_train_steps=int(trainer_cfg.max_train_steps),
         )
     )
@@ -2359,6 +2535,10 @@ def resolve_training_schedule(
         f"eval_interval={trainer_cfg.eval_interval}, "
         "checkpoint_eval_milestones_only="
         f"{milestone_only}, "
+        "checkpoint_eval_milestone_fractions="
+        f"{list(trainer_cfg.checkpoint_eval_milestone_fractions)}, "
+        "checkpoint_eval_include_full_epoch_boundaries="
+        f"{include_full_epoch_boundaries}, "
         "checkpoint_eval_milestone_steps="
         f"{list(trainer_cfg.checkpoint_eval_milestone_steps)}"
     )

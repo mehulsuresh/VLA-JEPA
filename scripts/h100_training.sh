@@ -3,7 +3,6 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd -P)"
-DEFAULT_CONFIG="${REPO_ROOT}/scripts/config/vlajepa_robot_ft_lerobot_magna_interventions_h100x8_b16_qwen35_2b_full_moge_vitb_vjepa_large.yaml"
 CONTAINER_REPO="/workspace/VLA-JEPA"
 
 usage() {
@@ -11,12 +10,12 @@ usage() {
 Human-first H100x8 training
 
 Usage:
-  ./scripts/h100_training.sh setup [--config YAML] [--skip-build]
-  ./scripts/h100_training.sh plan [--config YAML] [--json]
-  ./scripts/h100_training.sh prepare [--config YAML] --yes-rebuild-data-contract
-  ./scripts/h100_training.sh check [--config YAML]
-  ./scripts/h100_training.sh start [--config YAML] [--run-id ID] [--detach]
-  ./scripts/h100_training.sh resume [--config YAML] --checkpoint STEPS_DIR [--resume-runtime-config YAML] [--detach]
+  ./scripts/h100_training.sh setup --config YAML [--skip-build]
+  ./scripts/h100_training.sh plan --config YAML [--json]
+  ./scripts/h100_training.sh prepare --config YAML --yes-rebuild-data-contract
+  ./scripts/h100_training.sh check --config YAML
+  ./scripts/h100_training.sh start --config YAML [--run-id ID] [--detach]
+  ./scripts/h100_training.sh resume --config YAML --checkpoint STEPS_DIR [--resume-runtime-config YAML] [--detach]
   ./scripts/h100_training.sh status
   ./scripts/h100_training.sh logs [CONTAINER]
 
@@ -38,7 +37,7 @@ fi
 COMMAND="$1"
 shift
 
-CONFIG="${DEFAULT_CONFIG}"
+CONFIG=""
 IMAGE=""
 SCRATCH=""
 BUILD_ENV=()
@@ -46,6 +45,7 @@ RUN_ID=""
 CHECKPOINT=""
 RESUME_RUNTIME_CONFIG=""
 CONTAINER_IMAGE_DIGEST=""
+CONTAINER_IMAGE_ID=""
 DETACH=0
 SKIP_BUILD=0
 JSON=0
@@ -109,10 +109,18 @@ done
 if [[ -n "${RESUME_RUNTIME_CONFIG}" && "${COMMAND}" != "resume" ]]; then
   die "--resume-runtime-config is accepted only by resume"
 fi
+case "${COMMAND}" in
+  setup|plan|prepare|check|start|resume)
+    [[ "${SEEN_CONFIG}" == "1" && -n "${CONFIG}" ]] \
+      || die "${COMMAND} requires an explicit --config YAML"
+    ;;
+esac
 
 load_bootstrap_runtime() {
   require_command python3
   local resolved runtime_output
+  [[ -f "${CONFIG}" && ! -L "${CONFIG}" ]] \
+    || die "config must be a regular non-symlink file: ${CONFIG}"
   resolved="$(realpath -e -- "${CONFIG}")" || die "config does not exist: ${CONFIG}"
   runtime_output="$(
     python3 - "${resolved}" "${REPO_ROOT}" <<'PY'
@@ -280,6 +288,8 @@ PY
       local dockerfile dockerfile_path
       dockerfile="${BUILD_ENV[index]#DOCKERFILE=}"
       [[ "${dockerfile}" != /* ]] || die "runtime container DOCKERFILE must be repository-relative"
+      [[ -f "${REPO_ROOT}/${dockerfile}" && ! -L "${REPO_ROOT}/${dockerfile}" ]] \
+        || die "runtime container DOCKERFILE must be a regular non-symlink file: ${dockerfile}"
       dockerfile_path="$(realpath -e -- "${REPO_ROOT}/${dockerfile}")" \
         || die "runtime container DOCKERFILE does not exist: ${dockerfile}"
       [[ "${dockerfile_path}" == "${REPO_ROOT}/"* ]] \
@@ -295,6 +305,20 @@ PY
 
 require_command() {
   command -v "$1" >/dev/null 2>&1 || die "missing required host command: $1"
+}
+
+resolve_container_image_id() {
+  require_command docker
+  CONTAINER_IMAGE_ID="$(
+    docker image inspect "${IMAGE}" --format '{{.Id}}' 2>/dev/null
+  )" || die "configured container image does not exist locally: ${IMAGE}"
+  [[ "${CONTAINER_IMAGE_ID}" =~ ^sha256:[0-9a-f]{64}$ ]] \
+    || die "docker returned an invalid Image.Id for ${IMAGE}: ${CONTAINER_IMAGE_ID}"
+  # Keep the older variable during the narrow worker-topology resume path.
+  # Docker's local Image.Id, not a mutable tag or registry manifest name, is
+  # the identity authenticated by both fields.
+  CONTAINER_IMAGE_DIGEST="${CONTAINER_IMAGE_ID}"
+  echo "Container image ID         : ${CONTAINER_IMAGE_ID}"
 }
 
 doctor() {
@@ -316,6 +340,8 @@ doctor() {
 
 config_in_container() {
   local resolved relative
+  [[ -f "${CONFIG}" && ! -L "${CONFIG}" ]] \
+    || die "config must be a regular non-symlink file: ${CONFIG}"
   resolved="$(realpath -e -- "${CONFIG}")" || die "config does not exist: ${CONFIG}"
   [[ "${resolved}" == "${REPO_ROOT}/"* ]] \
     || die "config must live inside the repository: ${resolved}"
@@ -327,6 +353,8 @@ repo_file_in_container() {
   local value="$1"
   local label="$2"
   local resolved relative
+  [[ -f "${value}" && ! -L "${value}" ]] \
+    || die "${label} must be a regular non-symlink file: ${value}"
   resolved="$(realpath -e -- "${value}")" || die "${label} does not exist: ${value}"
   [[ "${resolved}" == "${REPO_ROOT}/"* ]] \
     || die "${label} must live inside the repository: ${resolved}"
@@ -340,14 +368,18 @@ run_in_container() {
   local docker_name="$1"
   shift
   local auto_remove=1
+  local configured_image="${IMAGE}"
+  local image_reference="${CONTAINER_IMAGE_ID:-${configured_image}}"
   if [[ "${DETACH}" == "1" ]]; then
     auto_remove=0
   fi
-  IMAGE="${IMAGE}" \
+  IMAGE="${image_reference}" \
   VLA_JEPA_SCRATCH="${SCRATCH}" \
   CHECKPOINT_ROOT="${SCRATCH}/checkpoints" \
-  STARVLA_CONTAINER_IMAGE="${IMAGE}" \
+  STARVLA_CONTAINER_IMAGE="${configured_image}" \
+  STARVLA_CONTAINER_IMAGE_ID="${CONTAINER_IMAGE_ID}" \
   STARVLA_CONTAINER_IMAGE_DIGEST="${CONTAINER_IMAGE_DIGEST}" \
+  STARVLA_CONFIG_IS_AUTHORITATIVE=1 \
   DOCKER_NAME="${docker_name}" \
   DOCKER_TTY=0 \
   DOCKER_DETACH="${DETACH}" \
@@ -388,6 +420,7 @@ case "${COMMAND}" in
     VLA_JEPA_SCRATCH="${SCRATCH}" \
     CHECKPOINT_ROOT="${SCRATCH}/checkpoints" \
     STARVLA_CONTAINER_IMAGE="${IMAGE}" \
+    STARVLA_CONFIG_IS_AUTHORITATIVE=1 \
     DOCKER_USER="$(id -u):$(id -g)" \
     DOCKER_HOME=/tmp \
     DOCKER_NAME="starvla-h100-setup-$$" \
@@ -436,6 +469,7 @@ case "${COMMAND}" in
     VLA_JEPA_SCRATCH="${SCRATCH}" \
     CHECKPOINT_ROOT="${SCRATCH}/checkpoints" \
     STARVLA_CONTAINER_IMAGE="${IMAGE}" \
+    STARVLA_CONFIG_IS_AUTHORITATIVE=1 \
     DOCKER_USER="$(id -u):$(id -g)" \
     DOCKER_HOME=/tmp \
     DOCKER_NAME="starvla-h100-prepare-$$" \
@@ -451,6 +485,7 @@ case "${COMMAND}" in
       && "${SKIP_BUILD}" == 0 && "${JSON}" == 0 && "${CONFIRM_PREPARE}" == 0 ]] \
       || die "check accepts only --config"
     load_bootstrap_runtime
+    resolve_container_image_id
     config_path="$(config_in_container)"
     run_in_container "starvla-h100-check-$$" \
       python scripts/h100_training.py check --config "${config_path}"
@@ -460,6 +495,7 @@ case "${COMMAND}" in
     [[ "${SKIP_BUILD}" == 0 && "${JSON}" == 0 && "${CONFIRM_PREPARE}" == 0 ]] \
       || die "start accepts only --config, --run-id, and --detach"
     load_bootstrap_runtime
+    resolve_container_image_id
     [[ -z "${CHECKPOINT}" ]] || die "use the resume command with --checkpoint"
     config_path="$(config_in_container)"
     container_name="starvla-h100-train-$(date -u +%Y%m%d-%H%M%S)"
@@ -475,6 +511,7 @@ case "${COMMAND}" in
     [[ "${SKIP_BUILD}" == 0 && "${JSON}" == 0 && "${CONFIRM_PREPARE}" == 0 ]] \
       || die "resume accepts only --config, --checkpoint, and --detach"
     load_bootstrap_runtime
+    resolve_container_image_id
     [[ -n "${CHECKPOINT}" ]] || die "resume requires --checkpoint STEPS_DIR"
     [[ -z "${RUN_ID}" ]] || die "resume derives the original run ID from its checkpoint"
     config_path="$(config_in_container)"
@@ -485,13 +522,6 @@ case "${COMMAND}" in
           "${RESUME_RUNTIME_CONFIG}" \
           "resume runtime config"
       )"
-      CONTAINER_IMAGE_DIGEST="$(
-        docker image inspect "${IMAGE}" --format '{{.Id}}' 2>/dev/null || true
-      )"
-      if [[ -n "${CONTAINER_IMAGE_DIGEST}" \
-        && ! "${CONTAINER_IMAGE_DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-        die "docker returned an invalid image digest for ${IMAGE}: ${CONTAINER_IMAGE_DIGEST}"
-      fi
       args=(
         python scripts/h100_resume_runtime.py
         --config "${config_path}"
