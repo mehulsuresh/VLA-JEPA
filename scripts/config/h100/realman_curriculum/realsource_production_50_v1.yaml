@@ -7,4 +7,4 @@ run_id: robot_ft_realsource_production50_18d_delta_h100x8_b16
 datasets:
   vla_data:
     frozen_train_view_manifest: /data/mehul-vla-jepa/data_contracts/views/realsource_strict_valid_balanced_50_v1.json
-    frozen_train_view_manifest_sha256: 8035d7238b38d854f0e94aa1c9ff8e11ebb5dc887f11c2438d8d5aa04d8a953e
+    frozen_train_view_manifest_sha256: 2e902ea67d145aa9804d362a21fcd1d814a27b5b3bd144defcb4d46b335aa25c

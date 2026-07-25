@@ -20,10 +20,10 @@ shared_contract:
   gripper_action_type: absolute
   state_action_normalization: q01_q99_unclipped
   normalization_statistics_artifact: /data/mehul-vla-jepa/data_contracts/realman_union_openpi_q01q99_v1.json
-  normalization_statistics_artifact_sha256: e843ad26fb153c2abcd3ec6b4fdb2b89082b36093ed6f1ddda61216aef05ce2e
+  normalization_statistics_artifact_sha256: 79212d802c009c00ebb33bd3945b00401ee5304873d1a3b26e1ada5ee3cdc0be
   action_representation_contract_sha256: 9e1df348fb137c206b42a183892e29ec6247595fffc232bb2d73d94b5f5f91ac
   statistics_holdout_manifest: /data/mehul-vla-jepa/data_contracts/realman_union_holdout_v1.json
-  statistics_holdout_manifest_sha256: 2dce910264e5a8b014cd9fc892e8eb6858e5ed4a04b0a08740b7728c8aae3ebd
+  statistics_holdout_manifest_sha256: f2fba177b07dff1d576af7f9ff0a20b1f4e45d94cbdb0a89e78e3667be793d8c
 
 stages:
   - id: realsource_production50
@@ -32,7 +32,7 @@ stages:
     handoff_checkpoint: natural_final
     config: scripts/config/h100/realman_curriculum/realsource_production_50_v1.yaml
     expected_full_dataset_epochs: 1
-    local_evaluation_manifest_sha256: 592400d73c2e7bcea0969c1b150744bea44d0ae7738e807bf97e8b9157f2c794
+    local_evaluation_manifest_sha256: cb6eabe7ca09f850c972037077c538029b97761946cc1334892a557f1bc2bd5f
     monitoring:
       first_epoch_exposure_fractions: [0.25, 0.5, 1.0]
       full_epoch_required: true

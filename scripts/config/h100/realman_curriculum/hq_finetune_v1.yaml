@@ -16,7 +16,7 @@ framework:
 datasets:
   vla_data:
     normalization_statistics_artifact: /data/mehul-vla-jepa/data_contracts/realman_union_openpi_q01q99_v1.json
-    normalization_statistics_artifact_sha256: e843ad26fb153c2abcd3ec6b4fdb2b89082b36093ed6f1ddda61216aef05ce2e
+    normalization_statistics_artifact_sha256: 79212d802c009c00ebb33bd3945b00401ee5304873d1a3b26e1ada5ee3cdc0be
     action_representation_contract_sha256: 9e1df348fb137c206b42a183892e29ec6247595fffc232bb2d73d94b5f5f91ac
     frozen_train_view_manifest: /data/mehul-vla-jepa/data_contracts/views/magna_hq_clean_h50_v1.json
     frozen_train_view_manifest_sha256: d0b77b52f975f16c1ecaf6a55d562c7e7b7dd27a88e82532fa65de08ecd93824

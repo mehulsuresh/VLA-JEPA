@@ -3,7 +3,7 @@ extends:
 datasets:
   vla_data:
     frozen_train_view_manifest: deployment/realman/curriculum_manifests/handoff_smoke/realsource_handoff_smoke_128_v1.json
-    frozen_train_view_manifest_sha256: ddec8de1cabac0995bfc8c5f4ae6acbeef3fbc12863a07cadcb11dab85db8842
+    frozen_train_view_manifest_sha256: d8d1017ea0d9a24d245c503e3b5b8fe23fb0bc5d788bd891785220549f7f55d8
     normalization_statistics_artifact: /data/mehul-vla-jepa/data_contracts/handoff_smoke_openpi_q01q99_v1/openpi_q01q99_unclipped.json
-    normalization_statistics_artifact_sha256: 5901adc8b7783fb4148ba5aa02e3976ab42ae3bab3593779bc44ade05ca5b493
-    canonical_eval_manifest: /data/mehul-vla-jepa/data_contracts/realsource_strict_valid_fractional_eval128_v1.json
+    normalization_statistics_artifact_sha256: bc071d239b85004f274f75b29994633f19c390500eeb6260980d92ed1799b180
+    canonical_eval_manifest: /data/mehul-vla-jepa/checkpoints/eval_manifests/realsource_strict_valid_fractional_eval128_v2.json

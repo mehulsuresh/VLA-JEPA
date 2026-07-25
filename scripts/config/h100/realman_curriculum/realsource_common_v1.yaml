@@ -13,7 +13,7 @@ extends:
 
 run_id: robot_ft_realsource_18d_delta_h100x8_b16
 run_root_dir: /data/mehul-vla-jepa/checkpoints
-canonical_eval_split_id: realsource_strict_valid_fractional_eval128_v1
+canonical_eval_split_id: realsource_strict_valid_fractional_eval128_v2
 
 curriculum_stage:
   initialization: upstream
@@ -61,7 +61,7 @@ datasets:
     manifest_path: /data/mehul-vla-jepa/src/dataset-canonicalization-training-d9c3298/configs/manifests/dataset_manifests.jsonl.gz
     adapter_dir: /data/mehul-vla-jepa/src/dataset-canonicalization-training-d9c3298/configs/dataset_adapters
     cache_dir: /data/mehul-vla-jepa/datasets/canonical_gcs
-    canonical_eval_manifest: /data/mehul-vla-jepa/checkpoints/eval_manifests/realsource_strict_valid_fractional_eval128_v1.json
+    canonical_eval_manifest: /data/mehul-vla-jepa/checkpoints/eval_manifests/realsource_strict_valid_fractional_eval128_v2.json
     canonical_exclude_eval_episodes_from_training: true
     canonical_eval_selection_seed: 42
     canonical_eval_candidate_count: 32
@@ -96,7 +96,7 @@ datasets:
     sidecar_normalization: q01_q99_unclipped
     action_representation_contract_sha256: 9e1df348fb137c206b42a183892e29ec6247595fffc232bb2d73d94b5f5f91ac
     normalization_statistics_artifact: /data/mehul-vla-jepa/data_contracts/realman_union_openpi_q01q99_v1.json
-    normalization_statistics_artifact_sha256: e843ad26fb153c2abcd3ec6b4fdb2b89082b36093ed6f1ddda61216aef05ce2e
+    normalization_statistics_artifact_sha256: 79212d802c009c00ebb33bd3945b00401ee5304873d1a3b26e1ada5ee3cdc0be
     sample_stride: 1
     sidecar_dtype: float16
     video_decode_backend: pyav

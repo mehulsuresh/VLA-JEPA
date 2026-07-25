@@ -165,7 +165,7 @@ only that candidate's authenticated ledger:
 
 ```bash
 REALSOURCE_CANDIDATE=/data/mehul-vla-jepa/data_contracts/views/realsource_strict_valid_balanced_50_eval_selection_candidate_v1.json
-REALSOURCE_EVAL=/data/mehul-vla-jepa/checkpoints/eval_manifests/realsource_strict_valid_fractional_eval128_v1.json
+REALSOURCE_EVAL=/data/mehul-vla-jepa/checkpoints/eval_manifests/realsource_strict_valid_fractional_eval128_v2.json
 
 python scripts/build_realman_dataset_views.py realsource-canonical \
   --canonical-manifest /data/mehul-vla-jepa/src/dataset-canonicalization-training-d9c3298/configs/manifests/dataset_manifests.jsonl.gz \
@@ -185,6 +185,12 @@ python scripts/generate_canonical_eval_manifest.py \
   --eval-selection-view-manifest "$REALSOURCE_CANDIDATE" \
   --eval-selection-view-manifest-sha256 "$REALSOURCE_CANDIDATE_SHA"
 ```
+
+The `v2` filename is intentional. The canonical adapter/action-sidecar
+contract changed after `v1` was frozen, so the generator created a new
+immutable manifest instead of overwriting history. Its 128 selected
+episode/window identities are identical to `v1`; only the authenticated
+adapter and sidecar contract bindings changed.
 
 The candidate has
 `purpose: eval_selection_population_candidate`,
@@ -263,7 +269,7 @@ python scripts/build_realman_dataset_views.py realsource-canonical \
   --canonical-manifest /data/mehul-vla-jepa/src/dataset-canonicalization-training-d9c3298/configs/manifests/dataset_manifests.jsonl.gz \
   --adapter-path /data/mehul-vla-jepa/src/dataset-canonicalization-training-d9c3298/configs/dataset_adapters/RealSourceData_RealSource-World__607cbd4f6adf.json \
   --cache-dir /data/mehul-vla-jepa/datasets/canonical_gcs \
-  --eval-holdout-manifest /data/mehul-vla-jepa/checkpoints/eval_manifests/realsource_strict_valid_fractional_eval128_v1.json \
+  --eval-holdout-manifest /data/mehul-vla-jepa/checkpoints/eval_manifests/realsource_strict_valid_fractional_eval128_v2.json \
   --fraction 0.50 \
   --statistics-population-candidate \
   --output /data/mehul-vla-jepa/data_contracts/views/realsource_strict_valid_balanced_50_statistics_population_candidate_v1.json
@@ -295,7 +301,7 @@ closed.
 python scripts/build_openpi_realman_union_contract.py \
   --holdout-output /data/mehul-vla-jepa/data_contracts/realman_union_holdout_v1.json \
   --population-output /data/mehul-vla-jepa/data_contracts/realman_union_population_v1.json \
-  --realsource-eval-manifest /data/mehul-vla-jepa/checkpoints/eval_manifests/realsource_strict_valid_fractional_eval128_v1.json \
+  --realsource-eval-manifest /data/mehul-vla-jepa/checkpoints/eval_manifests/realsource_strict_valid_fractional_eval128_v2.json \
   --realsource-candidate-view /data/mehul-vla-jepa/data_contracts/views/realsource_strict_valid_balanced_50_statistics_population_candidate_v1.json \
   --realsource-cache-dir /data/mehul-vla-jepa/datasets/canonical_gcs \
   --intervention-eval-manifest /data/mehul-vla-jepa/checkpoints/eval_manifests/magna_intervention_labelled_holdout_global_batch128_v1.json \

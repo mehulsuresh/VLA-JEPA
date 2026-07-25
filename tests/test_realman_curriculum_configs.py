@@ -68,7 +68,7 @@ def test_curriculum_declares_bootstrap_and_complete_view_epochs():
     assert [
         stage["local_evaluation_manifest_sha256"] for stage in stages
     ] == [
-        "592400d73c2e7bcea0969c1b150744bea44d0ae7738e807bf97e8b9157f2c794",
+        "cb6eabe7ca09f850c972037077c538029b97761946cc1334892a557f1bc2bd5f",
         "c0f64465eff57ff7e253cbf15bb3c612eb6befa5ce3e81bd12a32f9baa24e72b",
         "9730807c0ba8688c6ae525126fdf306cfbadb3d67366392c5f6eefe3399292a2",
     ]
