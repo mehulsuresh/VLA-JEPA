@@ -6,13 +6,13 @@ extends:
   - realsource_common_v1.yaml
 
 run_id: robot_ft_realsource_production10_18d_delta_h100x8_b16
-canonical_eval_split_id: realsource_strict_valid_fractional_eval128_v4
+canonical_eval_split_id: realsource_strict_valid_fractional_eval128_v6
 
 datasets:
   vla_data:
-    canonical_eval_manifest: /data/mehul-vla-jepa/checkpoints/eval_manifests/realsource_strict_valid_fractional_eval128_v4.json
-    frozen_train_view_manifest: /data/mehul-vla-jepa/data_contracts/views/realsource_strict_valid_balanced_10_v1.json
-    frozen_train_view_manifest_sha256: cdf2046b8242621e34c715615d58fe38203dd17368ff738229ef0657b943061c
+    canonical_eval_manifest: /data/mehul-vla-jepa/checkpoints/eval_manifests/realsource_strict_valid_fractional_eval128_v6.json
+    frozen_train_view_manifest: /data/mehul-vla-jepa/data_contracts/views/realsource_strict_valid_balanced_10_v2.json
+    frozen_train_view_manifest_sha256: 3138f5e3bbbe81d5c17a1d0dbbcceaa468887de7f3bea3dc27209c7d35a7af89
 
 trainer:
   # Four equally spaced checkpoint-backed evaluations over the only

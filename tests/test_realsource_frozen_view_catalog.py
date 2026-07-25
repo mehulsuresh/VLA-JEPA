@@ -184,7 +184,20 @@ def _write_eval_manifest(
     *,
     source_sha256: str,
     episode: RealSourceEpisode,
+    configured_identities: tuple[
+        tuple[str, str, str, str, int], ...
+    ] | None = None,
 ) -> None:
+    if configured_identities is None:
+        configured_identities = (
+            (
+                episode.dataset_id,
+                episode.sid,
+                episode.revision,
+                episode.data_file,
+                episode.episode_index,
+            ),
+        )
     path.write_text(
         json.dumps(
             {
@@ -194,6 +207,14 @@ def _write_eval_manifest(
                 "selection": {
                     "window_count": 1,
                     "holdout_episode_count": 1,
+                    "configured_episode_count": len(
+                        configured_identities
+                    ),
+                    "configured_episode_catalog_sha256": (
+                        h100_curriculum._canonical_json_sha256(
+                            sorted(configured_identities)
+                        )
+                    ),
                 },
                 "windows": [
                     {
@@ -237,6 +258,22 @@ def test_realsource_train_view_requires_and_excludes_eval_holdout_and_copies(
         eval_manifest,
         source_sha256=source_sha256,
         episode=heldout,
+        configured_identities=(
+            (
+                heldout.dataset_id,
+                heldout.sid,
+                heldout.revision,
+                heldout.data_file,
+                heldout.episode_index,
+            ),
+            (
+                catalog.valid_episodes[2].dataset_id,
+                catalog.valid_episodes[2].sid,
+                catalog.valid_episodes[2].revision,
+                catalog.valid_episodes[2].data_file,
+                catalog.valid_episodes[2].episode_index,
+            ),
+        ),
     )
 
     monkeypatch.setattr(

@@ -728,6 +728,7 @@ def _validate_canonical_view_eval_holdout_binding(
     observed_records = 0
     observed_logical_rows = 0
     overlap: list[tuple[str, str, str, str, int]] = []
+    train_identities: set[tuple[str, str, str, str, int]] = set()
     lineage_set = set(lineages)
     content_set = set(contents)
     with ledger_path.open("r", encoding="utf-8") as handle:
@@ -748,6 +749,20 @@ def _validate_canonical_view_eval_holdout_binding(
                     "episode_index",
                 )
             )
+            if (
+                any(
+                    not isinstance(value, str) or not value
+                    for value in identity[:4]
+                )
+                or isinstance(identity[4], bool)
+                or not isinstance(identity[4], int)
+                or identity[4] < 0
+            ):
+                raise CurriculumError(
+                    f"{stage_id} frozen ledger row {ordinal} has an invalid "
+                    "episode identity"
+                )
+            train_identities.add(identity)
             if identity in eval_identities:
                 overlap.append(identity)
             if row.get("episode_lineage_id") in lineage_set:
@@ -773,6 +788,30 @@ def _validate_canonical_view_eval_holdout_binding(
         raise CurriculumError(
             f"{stage_id} frozen train view leaks canonical eval episodes: "
             f"{sorted(set(overlap))[:5]}"
+        )
+    eval_selection = _require_mapping(
+        evaluation.get("selection"),
+        field=f"{stage_id}.canonical_evaluation.selection",
+    )
+    logical_catalog = train_identities | eval_identities
+    configured_episode_count = eval_selection.get(
+        "configured_episode_count"
+    )
+    configured_catalog_sha256 = eval_selection.get(
+        "configured_episode_catalog_sha256"
+    )
+    actual_catalog_sha256 = _canonical_json_sha256(
+        sorted(logical_catalog)
+    )
+    if (
+        configured_episode_count != len(logical_catalog)
+        or configured_catalog_sha256 != actual_catalog_sha256
+    ):
+        raise CurriculumError(
+            f"{stage_id} canonical eval logical catalog does not match the "
+            "frozen train view plus heldout episodes: "
+            f"count={configured_episode_count!r}/{len(logical_catalog)}, "
+            f"sha256={configured_catalog_sha256!r}/{actual_catalog_sha256}"
         )
     expected_records = rows.get("record_count", eligible_windows)
     if (

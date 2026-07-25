@@ -38,7 +38,7 @@ stages:
     handoff_checkpoint: natural_final
     config: scripts/config/h100/realman_curriculum/realsource_production_10_v1.yaml
     expected_full_dataset_epochs: 1
-    local_evaluation_manifest_sha256: 7a1f8420aa8824c0bea0681a6acfa10193fca06b4f182174769f62894729a6d9
+    local_evaluation_manifest_sha256: 972eae8ce1d3d901e59dd80897d4361ebfea05e13f8de7ea0e863871abe9f33f
     monitoring:
       first_epoch_exposure_fractions: [0.25, 0.5, 0.75, 1.0]
       full_epoch_required: true
