@@ -130,6 +130,12 @@ datasets:
 trainer:
   epochs: 1
   max_train_steps: auto
+  # Canonical/streaming evaluation intentionally constructs one exact,
+  # unbiased manifest view.  Do not inherit the LeRobot-only focused-H10
+  # loader/selection contract from the shared RealMan model profile.
+  heldout_focused_eval_enabled: false
+  best_metric_name: heldout_eval_normalized_action_mae
+  best_metric_mode: min
   checkpoint_eval_milestone_fractions: [0.25, 0.5, 1.0]
   checkpoint_eval_milestone_steps: auto
   checkpoint_eval_include_full_epoch_boundaries: true

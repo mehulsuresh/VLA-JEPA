@@ -1113,6 +1113,30 @@ def _validate_training_contract(
                 "holdout_episode_count",
             ),
         )
+        focused_eval_enabled = trainer.get(
+            "heldout_focused_eval_enabled",
+            None,
+        )
+        if type(focused_eval_enabled) is not bool:
+            raise PlanError(
+                "canonical GCS requires an explicit boolean "
+                "trainer.heldout_focused_eval_enabled"
+            )
+        if focused_eval_enabled:
+            raise PlanError(
+                "canonical GCS constructs only the exact unbiased manifest "
+                "heldout loader; set "
+                "trainer.heldout_focused_eval_enabled=false"
+            )
+        if (
+            trainer["best_metric_name"]
+            != "heldout_eval_normalized_action_mae"
+        ):
+            raise PlanError(
+                "canonical GCS checkpoint selection must use "
+                "trainer.best_metric_name="
+                "'heldout_eval_normalized_action_mae'"
+            )
         for path in (
             "datasets.vla_data.action_delta_anchor",
             "datasets.vla_data.gripper_action_type",

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 from pathlib import Path
 
@@ -139,6 +140,18 @@ def test_stage_configs_are_exhaustive_and_lr_contract_is_config_owned(
     assert trainer["strict_learning_rate_groups"] is True
     assert trainer["eval_before_train"] is True
     assert trainer["allow_training_stream_eval"] is False
+    if data["dataset_py"] == "canonical_subset_vla":
+        assert trainer["heldout_focused_eval_enabled"] is False
+        assert (
+            trainer["best_metric_name"]
+            == "heldout_eval_normalized_action_mae"
+        )
+    else:
+        assert trainer["heldout_focused_eval_enabled"] is True
+        assert (
+            trainer["best_metric_name"]
+            == "heldout_focused_eval_task_failure_score_h10"
+        )
     assert trainer["save_interval"] == trainer["eval_interval"]
     assert trainer["save_final_model"] is True
     assert trainer["pretrained_checkpoint"] is None
@@ -167,6 +180,38 @@ def test_stage_configs_are_exhaustive_and_lr_contract_is_config_owned(
         assert "magna_training_data_with_interventions" != Path(
             data["data_root_dir"]
         ).name
+
+
+@pytest.mark.parametrize(
+    ("trainer_override", "error"),
+    (
+        (
+            {"heldout_focused_eval_enabled": True},
+            "constructs only the exact unbiased manifest heldout loader",
+        ),
+        (
+            {
+                "best_metric_name": (
+                    "heldout_focused_eval_task_failure_score_h10"
+                )
+            },
+            "checkpoint selection must use",
+        ),
+    ),
+)
+def test_canonical_h100_preflight_rejects_inherited_lerobot_eval_contract(
+    trainer_override: dict,
+    error: str,
+):
+    _, payload = h100_training._load_config(
+        STAGE_ROOT / "realsource_production_50_v1.yaml"
+    )
+    payload = copy.deepcopy(payload)
+    payload["trainer"].update(trainer_override)
+    runtime = h100_training._validate_runtime(payload)
+
+    with pytest.raises(h100_training.PlanError, match=error):
+        h100_training._validate_training_contract(payload, runtime)
 
 
 def test_only_reviewed_production_curriculum_and_stage_configs_are_present():

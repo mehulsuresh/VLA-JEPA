@@ -41,3 +41,9 @@ datasets:
     # Bounded readability probe used by setup/check. This exact object is
     # present in the source manifest pinned by the helper checkout above.
     gcs_access_probe_object: gs://robotics-datasets-yonduai/raw/BAAI-DataCube__AgiBotWorld-Beta_G1_task_327_Pick_up_at_supermarket/main/files/meta/episodes/chunk-000/file-000.parquet
+
+trainer:
+  # Canonical evaluation has one exact unbiased manifest loader.  Keep this
+  # explicit so no future parent profile can silently enable a loader that the
+  # canonical backend does not construct.
+  heldout_focused_eval_enabled: false
