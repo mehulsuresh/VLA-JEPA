@@ -636,6 +636,26 @@ def _validate_training_contract(
     action = _get(payload, "framework.action_model")
     data = _get(payload, "datasets.vla_data")
     trainer = _get(payload, "trainer")
+    scheduler_specific_kwargs = trainer.get("scheduler_specific_kwargs")
+    if not isinstance(scheduler_specific_kwargs, Mapping):
+        raise PlanError("trainer.scheduler_specific_kwargs must be a mapping")
+    if (
+        trainer["lr_scheduler_type"] == "cosine_with_min_lr"
+        and scheduler_specific_kwargs.get("min_lr") is not None
+        and scheduler_specific_kwargs.get("min_lr_rate") is not None
+    ):
+        raise PlanError(
+            "trainer.scheduler_specific_kwargs cannot set both non-null "
+            "min_lr and min_lr_rate for cosine_with_min_lr"
+        )
+    strict_learning_rate_groups = trainer.get(
+        "strict_learning_rate_groups",
+        False,
+    )
+    if type(strict_learning_rate_groups) is not bool:
+        raise PlanError(
+            "trainer.strict_learning_rate_groups must be a boolean"
+        )
     for key in (
         "checkpoint_eval_milestone_fractions",
         "checkpoint_eval_milestone_steps",
@@ -1662,6 +1682,7 @@ def _validate_training_contract(
         "save_final_model": trainer["save_final_model"],
         "enable_force_checkpoint_file": trainer["enable_force_checkpoint_file"],
         "learning_rate": copy.deepcopy(trainer.get("learning_rate")),
+        "strict_learning_rate_groups": strict_learning_rate_groups,
         "optimizer": copy.deepcopy(trainer.get("optimizer")),
         "scheduler": trainer["lr_scheduler_type"],
         "loss_scale": copy.deepcopy(trainer.get("loss_scale")),
@@ -2846,6 +2867,7 @@ def _print_plan(plan: Mapping[str, Any]) -> None:
         ),
         ("Optimizer", training["optimizer"]),
         ("Learning rates", training["learning_rate"]),
+        ("Strict LR groups", training["strict_learning_rate_groups"]),
         ("Loss scales", training["loss_scale"]),
         ("Diffusion repeats", training["repeated_diffusion_steps"]),
         (

@@ -775,6 +775,149 @@ def _validate_canonical_view_eval_holdout_binding(
     return binding
 
 
+def _validate_useful_subtask_prompt_coverage(
+    *,
+    coverage: Mapping[str, Any],
+    eligible_windows: int,
+    append_probability: Any,
+    stage_id: str,
+) -> Mapping[str, Any]:
+    """Validate the exact prompt-coverage artifact emitted by the view builder."""
+
+    if coverage.get("schema") != "realman-subtask-prompt-coverage-v1":
+        raise CurriculumError(
+            f"{stage_id} subtask coverage has an unknown schema"
+        )
+    selected_rows = _require_int(
+        coverage.get("selected_row_count"),
+        field=f"{stage_id}.subtask_prompt_coverage.selected_row_count",
+        minimum=1,
+    )
+    if selected_rows != eligible_windows:
+        raise CurriculumError(
+            f"{stage_id} subtask coverage row count does not match view"
+        )
+    useful_rows = _require_int(
+        coverage.get("useful_prompt_row_count"),
+        field=f"{stage_id}.subtask_prompt_coverage.useful_prompt_row_count",
+        minimum=1,
+    )
+    nonuseful_rows = _require_int(
+        coverage.get("unlabeled_or_nonuseful_row_count"),
+        field=(
+            f"{stage_id}.subtask_prompt_coverage."
+            "unlabeled_or_nonuseful_row_count"
+        ),
+        minimum=0,
+    )
+    if useful_rows + nonuseful_rows != selected_rows:
+        raise CurriculumError(
+            f"{stage_id} subtask coverage counts are inconsistent"
+        )
+
+    rows_by_subtask = coverage.get("rows_by_subtask")
+    if not isinstance(rows_by_subtask, list) or not rows_by_subtask:
+        raise CurriculumError(
+            f"{stage_id}.subtask_prompt_coverage.rows_by_subtask must be a "
+            "non-empty list"
+        )
+    observed_indices: set[int] = set()
+    derived_selected_rows = 0
+    derived_useful_rows = 0
+    distinct_useful_subtasks = 0
+    for ordinal, raw_entry in enumerate(rows_by_subtask):
+        entry = _require_mapping(
+            raw_entry,
+            field=(
+                f"{stage_id}.subtask_prompt_coverage."
+                f"rows_by_subtask[{ordinal}]"
+            ),
+        )
+        subtask_index = _require_int(
+            entry.get("subtask_index"),
+            field=(
+                f"{stage_id}.subtask_prompt_coverage."
+                f"rows_by_subtask[{ordinal}].subtask_index"
+            ),
+            minimum=0,
+        )
+        if subtask_index in observed_indices:
+            raise CurriculumError(
+                f"{stage_id} subtask coverage repeats subtask_index "
+                f"{subtask_index}"
+            )
+        observed_indices.add(subtask_index)
+        row_count = _require_int(
+            entry.get("selected_row_count"),
+            field=(
+                f"{stage_id}.subtask_prompt_coverage."
+                f"rows_by_subtask[{ordinal}].selected_row_count"
+            ),
+            minimum=0,
+        )
+        useful_prompt = entry.get("useful_prompt")
+        if type(useful_prompt) is not bool:
+            raise CurriculumError(
+                f"{stage_id}.subtask_prompt_coverage."
+                f"rows_by_subtask[{ordinal}].useful_prompt must be a boolean"
+            )
+        derived_selected_rows += row_count
+        if useful_prompt:
+            derived_useful_rows += row_count
+            if row_count > 0:
+                distinct_useful_subtasks += 1
+
+    if (
+        derived_selected_rows != selected_rows
+        or derived_useful_rows != useful_rows
+    ):
+        raise CurriculumError(
+            f"{stage_id} rows_by_subtask does not reproduce the coverage totals"
+        )
+    if distinct_useful_subtasks < 2:
+        raise CurriculumError(
+            f"{stage_id} must cover at least two distinct useful subtasks"
+        )
+
+    useful_fraction = useful_rows / selected_rows
+    artifact_fraction = coverage.get("useful_prompt_fraction")
+    if (
+        isinstance(artifact_fraction, bool)
+        or not isinstance(artifact_fraction, (int, float))
+        or not math.isfinite(float(artifact_fraction))
+        or not math.isclose(
+            float(artifact_fraction),
+            useful_fraction,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        )
+    ):
+        raise CurriculumError(
+            f"{stage_id} useful_prompt_fraction does not match row counts"
+        )
+    if useful_fraction < 0.95:
+        raise CurriculumError(
+            f"{stage_id} useful subtask coverage is only "
+            f"{useful_fraction:.2%}; refusing a mislabeled stage"
+        )
+    if (
+        isinstance(append_probability, bool)
+        or not isinstance(append_probability, (int, float))
+        or float(append_probability) != 0.7
+    ):
+        raise CurriculumError(
+            f"{stage_id} must append eligible subtasks with probability 0.7"
+        )
+
+    normalized = dict(coverage)
+    normalized["prompt_eligible_row_count"] = useful_rows
+    normalized["distinct_useful_subtask_count"] = distinct_useful_subtasks
+    normalized["expected_appended_prompt_row_count"] = (
+        useful_rows * float(append_probability)
+    )
+    return normalized
+
+
 def _validate_action_supervision_audit(
     *,
     view: Mapping[str, Any],
@@ -1161,6 +1304,17 @@ def _validate_source_stage(
             f"{stage_id} save_interval and eval_interval must coincide so "
             "every selectable evaluation is checkpoint-backed"
         )
+    if (
+        _optional_nested(
+            stage_payload,
+            "trainer.strict_learning_rate_groups",
+            False,
+        )
+        is not True
+    ):
+        raise CurriculumError(
+            f"{stage_id} must set trainer.strict_learning_rate_groups=true"
+        )
 
     # The union holdout manifest is a curriculum-level provenance input to
     # the shared statistics artifact; it is validated once above and is not a
@@ -1279,59 +1433,14 @@ def _validate_source_stage(
                 "subtask_prompt_coverage"
             ),
         )
-        coverage_rows = _require_int(
-            coverage.get("row_count"),
-            field=f"{stage_id}.subtask_prompt_coverage.row_count",
-            minimum=1,
-        )
-        if coverage_rows != eligible_windows:
-            raise CurriculumError(
-                f"{stage_id} subtask coverage row count does not match view"
-            )
-        useful_rows = _require_int(
-            coverage.get("useful_nonzero_subtask_row_count"),
-            field=(
-                f"{stage_id}.subtask_prompt_coverage."
-                "useful_nonzero_subtask_row_count"
+        coverage = _validate_useful_subtask_prompt_coverage(
+            coverage=coverage,
+            eligible_windows=eligible_windows,
+            append_probability=data_cfg.get(
+                "subtask_prompt_append_probability"
             ),
-            minimum=1,
+            stage_id=stage_id,
         )
-        eligible_prompt_rows = _require_int(
-            coverage.get("prompt_eligible_row_count"),
-            field=(
-                f"{stage_id}.subtask_prompt_coverage."
-                "prompt_eligible_row_count"
-            ),
-            minimum=1,
-        )
-        distinct_subtasks = _require_int(
-            coverage.get("distinct_useful_subtask_count"),
-            field=(
-                f"{stage_id}.subtask_prompt_coverage."
-                "distinct_useful_subtask_count"
-            ),
-            minimum=2,
-        )
-        if useful_rows > eligible_windows or eligible_prompt_rows > useful_rows:
-            raise CurriculumError(
-                f"{stage_id} subtask coverage counts are inconsistent"
-            )
-        useful_fraction = useful_rows / eligible_windows
-        if useful_fraction < 0.95:
-            raise CurriculumError(
-                f"{stage_id} useful subtask coverage is only "
-                f"{useful_fraction:.2%}; refusing a mislabeled stage"
-            )
-        probability = data_cfg.get("subtask_prompt_append_probability")
-        if probability != 0.7:
-            raise CurriculumError(
-                f"{stage_id} must append eligible subtasks with probability 0.7"
-            )
-        expected_appended_rows = eligible_prompt_rows * float(probability)
-        if expected_appended_rows <= 0:
-            raise CurriculumError(
-                f"{stage_id} has no prompt-eligible rows at 70% prompting"
-            )
     global_batch = int(plan["training"]["global_batch_size"])
     seed = _require_int(
         stage_payload.get("seed"),

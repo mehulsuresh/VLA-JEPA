@@ -2580,9 +2580,17 @@ def setup_optimizer_and_scheduler(model, cfg) -> Tuple[torch.optim.Optimizer, to
     )
 
     # print optimizer group info
-    if dist.is_initialized() and dist.get_rank() == 0:
+    if not dist.is_initialized() or dist.get_rank() == 0:
         for i, group in enumerate(optimizer.param_groups):
-            logger.info(f"LR Group {group['name']}: lr={group['lr']}, num_params={len(group['params'])}")
+            parameter_tensors = len(group["params"])
+            trainable_numel = sum(
+                parameter.numel() for parameter in group["params"]
+            )
+            logger.info(
+                f"LR Group {group['name']}: lr={group['lr']}, "
+                f"parameter_tensors={parameter_tensors}, "
+                f"trainable_numel={trainable_numel}"
+            )
 
     # initialize learning rate scheduler
     lr_scheduler = get_scheduler(

@@ -135,6 +135,8 @@ def test_stage_configs_are_exhaustive_and_lr_contract_is_config_owned(
     assert trainer["scheduler_specific_kwargs"]["min_lr_rate"] == pytest.approx(
         0.05
     )
+    assert trainer["scheduler_specific_kwargs"]["min_lr"] is None
+    assert trainer["strict_learning_rate_groups"] is True
     assert trainer["eval_before_train"] is True
     assert trainer["allow_training_stream_eval"] is False
     assert trainer["save_interval"] == trainer["eval_interval"]
@@ -603,6 +605,134 @@ def test_exhaustive_view_validator_rejects_non_unique_or_partial_epoch(
                 manifest.read_bytes()
             ).hexdigest(),
             stage_id="fixture",
+        )
+
+
+def _subtask_coverage_fixture(
+    *,
+    useful_rows: int = 96,
+) -> dict:
+    nonuseful_rows = 100 - useful_rows
+    first_useful_rows = useful_rows // 2
+    second_useful_rows = useful_rows - first_useful_rows
+    return {
+        "schema": "realman-subtask-prompt-coverage-v1",
+        "subtask_catalog_sha256": "a" * 64,
+        "selected_row_count": 100,
+        "useful_prompt_row_count": useful_rows,
+        "unlabeled_or_nonuseful_row_count": nonuseful_rows,
+        "useful_prompt_fraction": useful_rows / 100,
+        "rows_by_subtask": [
+            {
+                "subtask_index": 0,
+                "useful_prompt": False,
+                "selected_row_count": nonuseful_rows,
+            },
+            {
+                "subtask_index": 1,
+                "useful_prompt": True,
+                "selected_row_count": first_useful_rows,
+            },
+            {
+                "subtask_index": 2,
+                "useful_prompt": True,
+                "selected_row_count": second_useful_rows,
+            },
+        ],
+    }
+
+
+def test_curriculum_accepts_generator_subtask_coverage_schema():
+    coverage = _subtask_coverage_fixture()
+    validated = h100_curriculum._validate_useful_subtask_prompt_coverage(
+        coverage=coverage,
+        eligible_windows=100,
+        append_probability=0.7,
+        stage_id="intervention",
+    )
+
+    assert validated["selected_row_count"] == 100
+    assert validated["prompt_eligible_row_count"] == 96
+    assert validated["distinct_useful_subtask_count"] == 2
+    assert validated["expected_appended_prompt_row_count"] == pytest.approx(
+        67.2
+    )
+
+
+def test_curriculum_subtask_coverage_preserves_95_percent_floor():
+    with pytest.raises(
+        h100_curriculum.CurriculumError,
+        match="useful subtask coverage is only 94.00%",
+    ):
+        h100_curriculum._validate_useful_subtask_prompt_coverage(
+            coverage=_subtask_coverage_fixture(useful_rows=94),
+            eligible_windows=100,
+            append_probability=0.7,
+            stage_id="intervention",
+        )
+
+
+def test_curriculum_subtask_coverage_preserves_70_percent_prompting():
+    with pytest.raises(
+        h100_curriculum.CurriculumError,
+        match="probability 0.7",
+    ):
+        h100_curriculum._validate_useful_subtask_prompt_coverage(
+            coverage=_subtask_coverage_fixture(),
+            eligible_windows=100,
+            append_probability=0.69,
+            stage_id="intervention",
+        )
+
+
+def test_curriculum_derives_distinct_useful_covered_subtasks_fail_closed():
+    coverage = _subtask_coverage_fixture()
+    coverage["rows_by_subtask"][2]["useful_prompt"] = False
+    coverage["useful_prompt_row_count"] = 48
+    coverage["unlabeled_or_nonuseful_row_count"] = 52
+    coverage["useful_prompt_fraction"] = 0.48
+
+    with pytest.raises(
+        h100_curriculum.CurriculumError,
+        match="at least two distinct useful subtasks",
+    ):
+        h100_curriculum._validate_useful_subtask_prompt_coverage(
+            coverage=coverage,
+            eligible_windows=100,
+            append_probability=0.7,
+            stage_id="intervention",
+        )
+
+
+def test_curriculum_rejects_legacy_or_inconsistent_subtask_coverage_fields():
+    legacy = {
+        "row_count": 100,
+        "useful_nonzero_subtask_row_count": 100,
+        "prompt_eligible_row_count": 100,
+        "distinct_useful_subtask_count": 2,
+    }
+    with pytest.raises(
+        h100_curriculum.CurriculumError,
+        match="unknown schema",
+    ):
+        h100_curriculum._validate_useful_subtask_prompt_coverage(
+            coverage=legacy,
+            eligible_windows=100,
+            append_probability=0.7,
+            stage_id="intervention",
+        )
+
+    inconsistent = _subtask_coverage_fixture()
+    inconsistent["rows_by_subtask"][1]["selected_row_count"] -= 1
+    with pytest.raises(
+        h100_curriculum.CurriculumError,
+        match="does not reproduce the coverage totals",
+    ):
+        h100_curriculum._validate_useful_subtask_prompt_coverage(
+            coverage=inconsistent,
+            eligible_windows=100,
+            append_probability=0.7,
+            stage_id="intervention",
         )
 
 

@@ -87,6 +87,14 @@ def build_param_lr_groups(model, cfg):
 
     lr_cfg = cfg.trainer.learning_rate
     base_lr = lr_cfg.get("base", 1e-4)  # default base learning rate
+    strict_learning_rate_groups = cfg.trainer.get(
+        "strict_learning_rate_groups",
+        False,
+    )
+    if type(strict_learning_rate_groups) is not bool:
+        raise ValueError(
+            "trainer.strict_learning_rate_groups must be a boolean"
+        )
 
     freeze_modules = cfg.trainer.get("freeze_modules", "")
     if not isinstance(freeze_modules, str):
@@ -135,8 +143,20 @@ def build_param_lr_groups(model, cfg):
             if params:  # only add param group if there are trainable parameters
                 param_groups.append({"params": params, "lr": lr, "name": module_name})
                 used_params.update(id(p) for p in params)
+            elif strict_learning_rate_groups:
+                raise ValueError(
+                    "trainer.learning_rate."
+                    f"{module_name} resolved to a module with zero trainable "
+                    "parameters"
+                )
         except AttributeError:
-            ReferenceError(f"⚠️ module path `{module_name}` not found in vla")
+            message = (
+                f"trainer.learning_rate.{module_name} does not resolve to a "
+                "model module"
+            )
+            if strict_learning_rate_groups:
+                raise ValueError(message) from None
+            print(f"⚠️ {message}")
 
     # assign base learning rate to the remaining unused parameters (exclude frozen ones)
     other_params = [

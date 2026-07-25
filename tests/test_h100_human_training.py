@@ -388,6 +388,41 @@ def test_h100_warmup_policy_is_explicit_and_unambiguous(
             )
 
 
+def test_h100_plan_rejects_conflicting_cosine_minimum_lr_settings(tmp_path):
+    payload = copy.deepcopy(_payload())
+    payload["trainer"]["lr_scheduler_type"] = "cosine_with_min_lr"
+    payload["trainer"]["scheduler_specific_kwargs"] = {
+        "min_lr": 1.0e-6,
+        "min_lr_rate": 0.05,
+    }
+
+    with pytest.raises(
+        h100_training.PlanError,
+        match="both non-null min_lr and min_lr_rate",
+    ):
+        h100_training.resolve_plan(
+            _temporary_config(tmp_path, payload),
+            validate_artifacts=False,
+        )
+
+
+def test_h100_plan_accepts_config_owned_cosine_minimum_lr_rate(tmp_path):
+    payload = copy.deepcopy(_payload())
+    payload["trainer"]["lr_scheduler_type"] = "cosine_with_min_lr"
+    payload["trainer"]["scheduler_specific_kwargs"] = {
+        "min_lr": None,
+        "min_lr_rate": 0.05,
+    }
+    payload["trainer"]["strict_learning_rate_groups"] = True
+
+    plan = h100_training.resolve_plan(
+        _temporary_config(tmp_path, payload),
+        validate_artifacts=False,
+    )
+
+    assert plan["training"]["strict_learning_rate_groups"] is True
+
+
 def test_h100_plan_rejects_milestone_after_explicit_training_end(tmp_path):
     payload = copy.deepcopy(_payload())
     payload["trainer"]["max_train_steps"] = 10

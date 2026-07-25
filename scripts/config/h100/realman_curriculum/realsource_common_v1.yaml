@@ -144,8 +144,10 @@ trainer:
     action_model: 1.0e-04
     vj_predictor: 1.0e-04
     depth_teacher_aux_head: 1.0e-04
+  strict_learning_rate_groups: true
   lr_scheduler_type: cosine_with_min_lr
   scheduler_specific_kwargs:
+    min_lr: null
     min_lr_rate: 0.05
   eval_before_train: true
   allow_training_stream_eval: false

@@ -39,8 +39,10 @@ trainer:
     action_model: 3.0e-05
     vj_predictor: 3.0e-05
     depth_teacher_aux_head: 3.0e-05
+  strict_learning_rate_groups: true
   lr_scheduler_type: cosine_with_min_lr
   scheduler_specific_kwargs:
+    min_lr: null
     min_lr_rate: 0.05
   pretrained_checkpoint: null
   pretrained_checkpoint_sha256: null
