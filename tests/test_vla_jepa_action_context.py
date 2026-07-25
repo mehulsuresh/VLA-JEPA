@@ -1,0 +1,425 @@
+import inspect
+import pytest
+import torch
+import yaml
+from pathlib import Path
+from types import SimpleNamespace
+
+from starVLA.model.framework.VLA_JEPA import VLA_JEPA
+from starVLA.model.modules.vlm import get_vlm_model
+from starVLA.model.modules.vlm.QWen3 import _QWen3_VL_Interface
+from starVLA.model.modules.vlm.QWen3_5 import _QWen3_5_Interface
+
+
+def test_action_head_context_keeps_prompt_image_and_embodied_tokens_only():
+    model = object.__new__(VLA_JEPA)
+    model._action_token_ids_t = torch.tensor([10, 11], dtype=torch.long)
+    model._embodied_token_id_t = torch.tensor([20], dtype=torch.long)
+    model._geometry_token_ids_t = torch.tensor([30, 31], dtype=torch.long)
+    model._qwen_state_token_ids_t = torch.tensor([40], dtype=torch.long)
+    model._qwen_image_token_id = 99
+
+    input_ids = torch.tensor(
+        [
+            [0, 101, 99, 40, 20, 10, 102, 30],
+            [201, 99, 202, 40, 20, 10, 0, 0],
+        ],
+        dtype=torch.long,
+    )
+    attention_mask = torch.tensor(
+        [
+            [0, 1, 1, 1, 1, 1, 1, 1],
+            [1, 1, 1, 1, 1, 1, 0, 0],
+        ],
+        dtype=torch.long,
+    )
+    last_hidden = torch.arange(2 * 8 * 3, dtype=torch.float32).reshape(2, 8, 3)
+
+    context, key_keep_mask, key_block_ids = VLA_JEPA._build_action_head_context(
+        model,
+        last_hidden=last_hidden,
+        qwen_inputs={
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+        },
+    )
+
+    expected_keep = torch.tensor(
+        [
+            [False, True, True, True, True, False, False, False],
+            [True, True, True, True, True, False, False, False],
+        ]
+    )
+
+    assert context.shape == last_hidden.shape
+    assert torch.equal(context[expected_keep], last_hidden[expected_keep])
+    assert torch.all(context[~expected_keep] == 0)
+    assert torch.equal(key_keep_mask, expected_keep)
+    assert key_block_ids.tolist() == [
+        [-1, 0, 1, 2, 3, -1, -1, -1],
+        [0, 1, 0, 2, 3, -1, -1, -1],
+    ]
+
+
+def test_qwen_blockwise_attention_uses_pi0_prefix_state_action_aux_blocks():
+    model = object.__new__(VLA_JEPA)
+    model._action_token_ids_t = torch.tensor([10, 11], dtype=torch.long)
+    model._embodied_token_id_t = torch.tensor([20], dtype=torch.long)
+    model._geometry_token_ids_t = torch.tensor([30], dtype=torch.long)
+    model._qwen_state_token_ids_t = torch.tensor([40, 41], dtype=torch.long)
+
+    input_ids = torch.tensor(
+        [
+            [101, 99, 40, 41, 20, 20, 10, 11, 30, 102, 0],
+            [201, 99, 202, 40, 20, 10, 0, 0, 0, 0, 0],
+        ],
+        dtype=torch.long,
+    )
+    attention_mask = torch.tensor(
+        [
+            [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0],
+            [1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0],
+        ],
+        dtype=torch.long,
+    )
+
+    block_ids = VLA_JEPA._build_qwen_blockwise_attention_block_ids(
+        model,
+        {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+        },
+    )
+
+    assert block_ids.tolist() == [
+        [0, 0, 1, 1, 2, 2, 3, 3, 3, 3, -1],
+        [0, 0, 0, 1, 2, 3, -1, -1, -1, -1, -1],
+    ]
+
+    visible = VLA_JEPA._build_blockwise_visibility_from_block_ids(block_ids)
+    assert visible[0, 0, 1]  # prefix is bidirectional internally
+    assert visible[0, 1, 0]
+    assert visible[0, 3, 0]  # state sees prefix
+    assert visible[0, 3, 2]  # state is bidirectional internally
+    assert not visible[0, 0, 2]  # prefix cannot see state
+    assert visible[0, 4, 3]  # embodied action sees state
+    assert visible[0, 5, 4]  # embodied action is bidirectional internally
+    assert not visible[0, 3, 4]  # state cannot see embodied action
+    assert visible[0, 8, 0]  # aux sees prefix
+    assert visible[0, 8, 9]  # aux/trailing suffix is bidirectional internally
+    assert not visible[0, 4, 8]  # embodied action cannot see aux
+
+
+def test_blockwise_cross_attention_mask_uses_pi0_style_blocks():
+    key_keep_mask = torch.tensor([[True, True, True, True, False]])
+    key_block_ids = torch.tensor([[0, 1, 2, -1, 0]])
+    query_block_ids = torch.tensor([0, 1, 2])
+
+    attention_mask = VLA_JEPA._build_blockwise_cross_attention_mask(
+        key_keep_mask=key_keep_mask,
+        key_block_ids=key_block_ids,
+        query_block_ids=query_block_ids,
+        dtype=torch.float32,
+    )
+
+    expected_visible = torch.tensor(
+        [
+            [True, False, False, False, False],
+            [True, True, False, False, False],
+            [True, True, True, False, False],
+        ]
+    )
+    assert attention_mask.shape == (1, 3, 5)
+    assert torch.all(attention_mask[0][expected_visible] == 0)
+    assert torch.all(attention_mask[0][~expected_visible] == -10000.0)
+
+
+def test_action_head_masks_use_embodied_and_noisy_action_blocks():
+    model = object.__new__(VLA_JEPA)
+    model.config = type(
+        "Cfg",
+        (),
+        {
+            "framework": type(
+                "Framework",
+                (),
+                {
+                    "action_model": type(
+                        "ActionModelCfg",
+                        (),
+                        {"num_target_vision_tokens": 2},
+                    )()
+                },
+            )()
+        },
+    )()
+
+    key_keep_mask = torch.tensor([[True, True, True, True]])
+    key_block_ids = torch.tensor([[0, 1, 2, 3]])
+
+    encoder_mask = VLA_JEPA._build_action_head_encoder_attention_mask(
+        model,
+        key_keep_mask=key_keep_mask,
+        key_block_ids=key_block_ids,
+        action_horizon=3,
+        dtype=torch.float32,
+    )
+
+    assert encoder_mask.shape == (1, 5, 4)
+    assert torch.all(encoder_mask == 0)
+
+    self_mask = VLA_JEPA._build_action_head_self_attention_mask(
+        model,
+        batch_size=1,
+        action_horizon=3,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    expected_visible = torch.tensor(
+        [
+            [True, True, False, False, False],
+            [True, True, False, False, False],
+            [True, True, True, True, True],
+            [True, True, True, True, True],
+            [True, True, True, True, True],
+        ]
+    )
+    assert self_mask.shape == (1, 5, 5)
+    assert torch.all(self_mask[0][expected_visible] == 0)
+    assert torch.all(self_mask[0][~expected_visible] == -10000.0)
+
+
+def test_prompt_places_state_and_embodied_queries_before_auxiliary_tokens():
+    model = object.__new__(VLA_JEPA)
+    model.qwen_state_projector = object()
+
+    prompt = (
+        "Your task is {instruction}. Infer from frames {actions} {geometry} "
+        "and produce actions {e_actions}."
+    )
+
+    reordered = VLA_JEPA._move_action_head_placeholders_before_auxiliary_tokens(
+        model,
+        prompt,
+        has_actions=True,
+        has_state=True,
+    )
+
+    assert reordered.index("{state}") < reordered.index("{actions}")
+    assert reordered.index("{e_actions}") < reordered.index("{actions}")
+    assert "{state}" in reordered
+    assert reordered.count("{e_actions}") == 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA autocast")
+def test_qwen_state_projector_disables_outer_cuda_bf16_autocast():
+    model = object.__new__(VLA_JEPA)
+    model.qwen_state_dim = 2
+    model.qwen_state_num_tokens = 2
+    model.qwen_hidden_size = 2
+    model._qwen_state_token_ids_t = torch.tensor([40, 41], dtype=torch.long)
+    object.__setattr__(
+        model,
+        "qwen_state_projector",
+        torch.nn.Sequential(
+            torch.nn.LayerNorm(model.qwen_state_dim),
+            torch.nn.Linear(model.qwen_state_dim, model.qwen_hidden_size * model.qwen_state_num_tokens),
+        ).cuda(),
+    )
+
+    qwen_inputs = {
+        "input_ids": torch.tensor([[1, 40, 41, 2]], device="cuda", dtype=torch.long),
+    }
+    state = torch.tensor([[0.5, -0.5]], device="cuda", dtype=torch.float32)
+
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        state_embeds, state_mask = VLA_JEPA._prepare_qwen_state_replacements(
+            model,
+            state=state,
+            qwen_inputs=qwen_inputs,
+            batch_size=1,
+        )
+
+    assert state_embeds.shape == (1, 2, 2)
+    assert state_embeds.dtype == torch.float32
+    assert state_mask.tolist() == [[False, True, True, False]]
+
+
+def test_qwen_prompt_split_places_images_before_state_and_action_slots():
+    interface = object.__new__(_QWen3_5_Interface)
+    prompt = (
+        "Your task is stack the cup. "
+        "<|state_0|><|state_1|><|embodied_action|><|action_0|>"
+    )
+
+    prefix, suffix, use_interleaved = _QWen3_5_Interface._split_prompt_for_interleaved_images(
+        interface,
+        prompt,
+        prompt_replace_dict={
+            "{state}": "<|state_0|><|state_1|>",
+            "{e_actions}": "<|embodied_action|>",
+            "{actions}": "<|action_0|>",
+        },
+    )
+
+    assert use_interleaved
+    assert prefix == "Your task is stack the cup. "
+    assert suffix.startswith("<|state_0|>")
+
+
+def test_qwen3_vl_wrapper_exposes_vla_jepa_contract():
+    required_methods = [
+        "forward_features",
+        "build_qwenvl_inputs",
+        "build_qwenvl_inputs_from_frames_tensor",
+        "prepare_for_compile",
+        "supports_blockwise_attention",
+    ]
+
+    for method_name in required_methods:
+        assert hasattr(_QWen3_VL_Interface, method_name)
+
+
+def test_qwen3_vl_respects_explicit_sdpa_attention_backend():
+    assert _QWen3_VL_Interface._resolve_attn_implementation("sdpa") == "sdpa"
+
+
+def test_qwen3_vl_image_processor_size_override():
+    class DummyImageProcessor:
+        size = {"shortest_edge": 65536, "longest_edge": 1003520}
+
+    class DummyProcessor:
+        image_processor = DummyImageProcessor()
+
+    applied = _QWen3_VL_Interface._apply_image_processor_size_overrides(
+        DummyProcessor(),
+        {"image_processor": {"min_pixels": 50176, "max_pixels": 50176}},
+    )
+
+    assert applied == (50176, 50176)
+    assert DummyProcessor.image_processor.size == {
+        "shortest_edge": 50176,
+        "longest_edge": 50176,
+    }
+
+
+def test_qwen3_blockwise_attention_uses_flex_block_mask():
+    interface = object.__new__(_QWen3_VL_Interface)
+    interface.attn_implementation = "flex_attention"
+    interface.config = SimpleNamespace(
+        framework={"qwenvl": {"blockwise_attention": {"compile_mask": False}}}
+    )
+
+    block_mask = _QWen3_VL_Interface._build_blockwise_flex_attention_mask(
+        interface,
+        block_ids=torch.tensor([[0, 0, 1]], dtype=torch.long),
+        attention_mask=torch.tensor([[1, 1, 1]], dtype=torch.long),
+        input_ids=torch.tensor([[101, 102, 103]], dtype=torch.long),
+        device=torch.device("cpu"),
+    )
+
+    assert type(block_mask).__name__ == "BlockMask"
+    assert block_mask.shape == (1, 1, 3, 3)
+
+
+def test_qwen_forward_keeps_autograd_for_trainable_state_replacements_when_qwen_frozen():
+    model = object.__new__(VLA_JEPA)
+    model._qwen_grad_cache = False
+
+    trainable_state_embeds = torch.zeros(1, 2, 4, requires_grad=True)
+    frozen_state_embeds = trainable_state_embeds.detach()
+
+    assert VLA_JEPA._qwen_forward_requires_grad(model, trainable_state_embeds)
+    assert not VLA_JEPA._qwen_forward_requires_grad(model, frozen_state_embeds)
+    assert not VLA_JEPA._qwen_forward_requires_grad(model, None)
+
+
+def test_qwen35_rejects_blockwise_attention_path():
+    interface = object.__new__(_QWen3_5_Interface)
+
+    assert not _QWen3_5_Interface.supports_blockwise_attention(interface)
+    with pytest.raises(RuntimeError, match="does not support"):
+        _QWen3_5_Interface._resolve_attn_implementation("flex_attention")
+    with pytest.raises(RuntimeError, match="does not support"):
+        _QWen3_5_Interface.forward_features(
+            interface,
+            input_ids=torch.tensor([[1, 2]], dtype=torch.long),
+            qwen_blockwise_block_ids=torch.tensor([[0, 1]], dtype=torch.long),
+        )
+
+
+def test_vlm_factory_keeps_qwen35_rollback_route():
+    source = inspect.getsource(get_vlm_model)
+
+    assert "Qwen3.5" in source
+    assert "_QWen3_5_Interface" in source
+    assert "Qwen3-VL" in source
+    assert "_QWen3_VL_Interface" in source
+
+
+def test_vla_jepa_configs_declare_state_tokens_and_ordered_prompts():
+    for path in sorted(Path("scripts/config").glob("vlajepa_robot_ft*.yaml")):
+        with path.open("r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f)
+
+        framework_cfg = cfg["framework"]
+        assert framework_cfg["name"] == "VLA_JEPA", path
+        qwenvl_cfg = framework_cfg["qwenvl"]
+        is_qwen35_lora_experiment = "qwen35_08b_lora" in path.name
+        is_qwen35_full_experiment = "qwen35_2b_full" in path.name
+        is_h100_magna_fla = "magna_interventions_h100x8_b16" in path.name
+        if is_qwen35_lora_experiment:
+            assert qwenvl_cfg["base_vlm"] == "Qwen/Qwen3.5-0.8B", path
+            assert bool(qwenvl_cfg.get("lora", {}).get("enabled", False)), path
+            assert not bool(qwenvl_cfg.get("blockwise_attention", {}).get("enabled", False)), path
+            assert not bool(qwenvl_cfg.get("enable_fast_linear_attention", True)), path
+        elif is_qwen35_full_experiment:
+            assert qwenvl_cfg["base_vlm"] == "Qwen/Qwen3.5-2B", path
+            assert not bool(qwenvl_cfg.get("lora", {}).get("enabled", False)), path
+            assert not bool(qwenvl_cfg.get("blockwise_attention", {}).get("enabled", False)), path
+            if is_h100_magna_fla:
+                assert qwenvl_cfg["attn_implementation"] == "flash_attention_2", path
+                assert bool(qwenvl_cfg.get("strict_attn_implementation", False)), path
+                assert bool(qwenvl_cfg.get("enable_fast_linear_attention", False)), path
+                assert bool(qwenvl_cfg.get("strict_fast_linear_attention", False)), path
+            else:
+                assert not bool(qwenvl_cfg.get("enable_fast_linear_attention", True)), path
+        else:
+            assert qwenvl_cfg["base_vlm"] == "Qwen/Qwen3-VL-2B-Instruct", path
+        assert qwenvl_cfg["vl_hidden_dim"] == "auto", path
+        assert framework_cfg["action_model"]["diffusion_model_cfg"]["cross_attention_dim"] == "auto", path
+        assert framework_cfg["qwen_state"] == {
+            "num_tokens": 8,
+            "token_template": "<|state_{}|>",
+        }, path
+
+        blockwise_enabled = bool(qwenvl_cfg.get("blockwise_attention", {}).get("enabled", False))
+        if blockwise_enabled:
+            assert qwenvl_cfg["attn_implementation"] == "flex_attention", path
+            freeze_modules = cfg["trainer"].get("freeze_modules", "")
+            assert "qwen_vl_interface.model" not in freeze_modules, path
+            assert not bool(qwenvl_cfg.get("lora", {}).get("enabled", False)), path
+        else:
+            assert qwenvl_cfg["attn_implementation"] in {"sdpa", "flash_attention_2", "flash_attention_4"}, path
+
+        prompt = cfg["datasets"]["vla_data"]["CoT_prompt"]
+        assert "temporal dynamics from frames" not in prompt, path
+        assert prompt.index("{state}") < prompt.index("{e_actions}") < prompt.index("{actions}"), path
+        if cfg["datasets"]["vla_data"].get("dataset_py") == "lerobot_datasets":
+            expected_backend = (
+                "torchcodec"
+                if "libero_plus_qwen35_08b_lora_smoke" in path.name
+                else "decord"
+                if is_qwen35_lora_experiment
+                else "pyav"
+            )
+            assert cfg["datasets"]["vla_data"].get("video_backend") == expected_backend, path
+        if framework_cfg.get("depth_teacher_aux", {}).get("enabled", False):
+            assert "{geometry}" in prompt, path
+            assert prompt.index("{actions}") < prompt.index("{geometry}"), path
+            assert "loss_weight" not in framework_cfg["depth_teacher_aux"], path
+            assert cfg["trainer"]["loss_scale"]["depth_teacher"] > 0, path
+            if "qwen_full_zero3_moge_vits" in str(path):
+                assert cfg["trainer"]["loss_scale"]["depth_teacher"] == 0.016, path
+        else:
+            assert "{geometry}" not in prompt, path

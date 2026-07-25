@@ -1,0 +1,67 @@
+# Stage B: two complete passes over the immutable intervention-only view.
+extends:
+  - ../../vlajepa_robot_ft_lerobot_magna_interventions_h100x8_b16_qwen35_2b_full_moge_vitb_vjepa_large.yaml
+
+run_id: robot_ft_magna_intervention_adapt_18d_delta_h100x8_b16
+run_root_dir: /data/mehul-vla-jepa/checkpoints
+
+runtime:
+  scratch_root: /data/mehul-vla-jepa
+  helper_repositories:
+    moge:
+      path: /data/mehul-vla-jepa/src/MoGe
+    vjepa2:
+      path: /data/mehul-vla-jepa/src/vjepa2
+
+framework:
+  depth_teacher_aux:
+    moge_repo_path: /data/mehul-vla-jepa/src/MoGe
+  vj2_model:
+    hub_repo_or_dir: /data/mehul-vla-jepa/src/vjepa2
+
+datasets:
+  vla_data:
+    # Do not inherit the historical unlabeled H100 mirror: its incremental
+    # episodes 1475-1637 have subtask_index=0 for every row.
+    data_root_dir: /data/mehul-vla-jepa/datasets/magna_training_data_with_interventions_final_subtask_labelled
+    # This split is generated from and byte-bound to the labelled dataset
+    # above.  Reusing the historical unlabelled split would silently select a
+    # different set of episodes after the subtask-labelled rematerialization.
+    episode_split_manifest: deployment/realman/eval_manifests/magna_intervention_labelled_holdout_global_batch128_v1.json
+    normalization_statistics_artifact: /data/mehul-vla-jepa/data_contracts/realman_union_openpi_q01q99_v1.json
+    normalization_statistics_artifact_sha256: REPLACE_WITH_MATERIALIZED_UNION_STATS_SHA256
+    action_representation_contract_sha256: 9e1df348fb137c206b42a183892e29ec6247595fffc232bb2d73d94b5f5f91ac
+    frozen_train_view_manifest: /data/mehul-vla-jepa/data_contracts/views/magna_intervention_incremental_v1.json
+    frozen_train_view_manifest_sha256: 856aa5e21d23c5cadc5a3984c9067bce55332ec0e2c65b1c153f5ef2b2902423
+    frozen_train_view_require_data_shard_hashes: true
+    subtask_prompt_append_probability: 0.7
+    # Preserve the established mask behavior: individual mistake actions are
+    # invalid, and only a sustained 10-action invalid run truncates the
+    # remainder of the H=50 chunk. Recovery frames are labelled valid.
+    action_validity_invalid_run_length: 10
+    action_validity_fail_closed: true
+
+trainer:
+  epochs: 2
+  max_train_steps: auto
+  checkpoint_eval_milestone_fractions: [1.0]
+  checkpoint_eval_milestone_steps: null
+  checkpoint_eval_milestones_only: true
+  checkpoint_max_to_keep: 0
+  num_warmup_steps: 0
+  warmup_ratio: 0.05
+  learning_rate:
+    base: 1.0e-05
+    qwen_vl_interface: 5.0e-06
+    qwen_state_projector: 5.0e-05
+    action_model: 5.0e-05
+    vj_predictor: 5.0e-05
+    depth_teacher_aux_head: 5.0e-05
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr_rate: 0.05
+  pretrained_checkpoint: null
+  pretrained_checkpoint_sha256: null
+  reload_modules: null
+  is_resume: false
+  resume_from_checkpoint: null

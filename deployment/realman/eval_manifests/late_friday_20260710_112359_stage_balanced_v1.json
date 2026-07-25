@@ -1,0 +1,67 @@
+{
+  "schema_version": 1,
+  "description": "In-training-distribution audit set for the final Friday 2026-07-10 collection session. The datasets field is directly accepted by audit_checkpoint_offline.py. The supplemental stage_representative_frames are visually reviewed representatives because the source rows are all formally unlabeled (subtask_index=0); current audit_checkpoint_offline.py ignores this supplemental field and generates stratum frames from --frames-per-episode.",
+  "excluded_from_training": false,
+  "selection": {
+    "source_session": "20260710_112359",
+    "timezone": "America/Los_Angeles",
+    "wall_clock_coverage": "2026-07-10T11:24:12.134-07:00 through 2026-07-10T12:25:00.842-07:00",
+    "source_to_final_mapping": "source episode N maps to final training episode 1625 + N",
+    "episode_count": 13,
+    "frame_count": 46553,
+    "formal_subtask_counts": {
+      "0": 46553
+    },
+    "visual_task_coverage": "All 13 episodes visibly traverse reach, grasp/lift, carry, place, align, and removal-to-destination.",
+    "stage_balanced_grid": "12 episodes x 6 stages = 72 frames; each listed frame has a valid 50-step action-target prefix. Episode 1631 remains in the episode set but is omitted from the grid because repeated pickup retries leave no fully valid 50-step target prefix in its reach interval."
+  },
+  "datasets": {
+    "magna_training_data_with_interventions": [
+      1625,
+      1626,
+      1627,
+      1628,
+      1629,
+      1630,
+      1631,
+      1632,
+      1633,
+      1634,
+      1635,
+      1636,
+      1637
+    ]
+  },
+  "stage_names": {
+    "2": "reach into bin",
+    "3": "pick up chain",
+    "4": "carry chain to jig",
+    "5": "place chain on jig",
+    "6": "align chain",
+    "7": "remove chain to destination"
+  },
+  "stage_representative_frames": {
+    "1625": {"2": 391, "3": 511, "4": 661, "5": 749, "6": 3712, "7": 5598},
+    "1626": {"2": 456, "3": 576, "4": 860, "5": 940, "6": 2723, "7": 4581},
+    "1627": {"2": 514, "3": 634, "4": 967, "5": 1047, "6": 1702, "7": 2412},
+    "1628": {"2": 364, "3": 463, "4": 1013, "5": 1153, "6": 1592, "7": 2092},
+    "1629": {"2": 342, "3": 462, "4": 657, "5": 737, "6": 2098, "7": 3520},
+    "1630": {"2": 540, "3": 660, "4": 1004, "5": 1084, "6": 2302, "7": 3474},
+    "1632": {"2": 1157, "3": 1277, "4": 1497, "5": 1577, "6": 2381, "7": 3245},
+    "1633": {"2": 574, "3": 694, "4": 1024, "5": 1104, "6": 2551, "7": 4058},
+    "1634": {"2": 321, "3": 441, "4": 659, "5": 739, "6": 1321, "7": 1963},
+    "1635": {"2": 800, "3": 1000, "4": 1200, "5": 1300, "6": 2104, "7": 3697},
+    "1636": {"2": 388, "3": 508, "4": 1009, "5": 1089, "6": 1670, "7": 2310},
+    "1637": {"2": 431, "3": 551, "4": 1130, "5": 1210, "6": 2947, "7": 4744}
+  },
+  "reproducible_uniform_evaluator_plan": {
+    "seed": 20260713,
+    "frames_per_episode": 12,
+    "sample_plan_sha256": "07291e85ecbbec381e0f9ae30f8bb4e5a8dcd9615dc868de2e2bc30597784d29"
+  },
+  "dataset_bindings_sha256": {
+    "meta/info.json": "e3c8e4d04611546b9c026022ccb1c37b21d6aa746e039a435e487317aecd0111",
+    "meta/episodes/chunk-002/file-000.parquet": "3054fd16aeef11d49cafa218f7a61fe8701149c7c383ccd4f25ee6c4bd6f1415",
+    "data/chunk-002/file-000.parquet": "a8646542bff128dc4384e62333a4715ba0fb3ff4f1dbad51a03207c8d45ae904"
+  }
+}

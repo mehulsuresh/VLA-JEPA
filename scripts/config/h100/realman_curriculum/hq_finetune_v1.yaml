@@ -1,0 +1,39 @@
+# Stage C: four complete passes over the immutable clean HQ H50 view.
+extends:
+  - ../vlajepa_robot_ft_lerobot_magna_hq_subtasks_delta_h100x8_b16_qwen35_2b_full_moge_vitb_vjepa_large.yaml
+
+run_id: robot_ft_magna_hq_finetune_18d_delta_h100x8_b16
+
+datasets:
+  vla_data:
+    normalization_statistics_artifact: /data/mehul-vla-jepa/data_contracts/realman_union_openpi_q01q99_v1.json
+    normalization_statistics_artifact_sha256: REPLACE_WITH_MATERIALIZED_UNION_STATS_SHA256
+    action_representation_contract_sha256: 9e1df348fb137c206b42a183892e29ec6247595fffc232bb2d73d94b5f5f91ac
+    frozen_train_view_manifest: /data/mehul-vla-jepa/data_contracts/views/magna_hq_clean_h50_v1.json
+    frozen_train_view_manifest_sha256: 4a22a659112654f5369cf1845d630278a8e1ecdd7b8b98c2c027c1919f286688
+    subtask_prompt_append_probability: 0.7
+
+trainer:
+  epochs: 4
+  max_train_steps: auto
+  checkpoint_eval_milestone_fractions: [1.0]
+  checkpoint_eval_milestone_steps: null
+  checkpoint_eval_milestones_only: true
+  checkpoint_max_to_keep: 0
+  num_warmup_steps: 0
+  warmup_ratio: 0.05
+  learning_rate:
+    base: 4.0e-06
+    qwen_vl_interface: 2.0e-06
+    qwen_state_projector: 3.0e-05
+    action_model: 3.0e-05
+    vj_predictor: 3.0e-05
+    depth_teacher_aux_head: 3.0e-05
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr_rate: 0.05
+  pretrained_checkpoint: null
+  pretrained_checkpoint_sha256: null
+  reload_modules: null
+  is_resume: false
+  resume_from_checkpoint: null

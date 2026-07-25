@@ -1,0 +1,427 @@
+from __future__ import annotations
+
+import hashlib
+import json
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+
+from starVLA.action_representation import (
+    Q01_Q99_UNCLIPPED,
+    REALMAN_18D_ACTION_CONTRACT,
+)
+
+from deployment.realman.pipeline import (
+    DEFAULT_QWEN_FRAME_SIZE,
+    JOINT_DELTA_GRIPPER_ABSOLUTE,
+    QWEN_TENSOR_PAYLOAD_KEY,
+    REALMAN_ACTION_DIM,
+    REALMAN_ACTION_NAMES,
+    REALMAN_CAMERA_ORDER,
+    REALMAN_POLICY_ACTION_DIMS,
+    REALMAN_STATE_DIM,
+    REALMAN_STATE_NAMES,
+    realman_omitted_robot_action_indices,
+    realman_policy_action_state_indices,
+    realman_policy_action_names,
+)
+
+
+_CAMERA_ORDER_HINTS = {
+    "trossen_subtask_combined": ["cam_high", "cam_left_wrist", "cam_right_wrist"],
+    "ogrealman_source_v3": ["head", "wrist_left", "wrist_right"],
+    "ogrealman_source_no_base_v3": ["head", "wrist_left", "wrist_right"],
+    "ogrealman_source_no_base_human_labelled_cloud_v3": ["head", "wrist_left", "wrist_right"],
+    "magna_source_no_base_interventions_v3": ["head", "wrist_left", "wrist_right"],
+    "magna_source_no_base_no_lift_interventions_v3": ["head", "wrist_left", "wrist_right"],
+    "ogrealman_canonical_v3": ["head", "wrist_left", "wrist_right"],
+}
+
+
+def _jsonable_statistics(value: Any) -> Any:
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, dict):
+        return {str(key): _jsonable_statistics(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable_statistics(item) for item in value]
+    return value
+
+
+def _normalization_statistics_sha256(
+    *,
+    normalization: str,
+    action_stats_by_key: dict[str, Any],
+    state_stats_by_key: dict[str, Any],
+) -> str:
+    payload = {
+        "schema": "policy-normalization-statistics-v1",
+        "normalization": normalization,
+        "action": action_stats_by_key,
+        "state": state_stats_by_key,
+    }
+    encoded = json.dumps(
+        _jsonable_statistics(payload),
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _require_exact_quantile_statistics(
+    statistics: dict[str, Any],
+    *,
+    key: str,
+    width: int,
+) -> None:
+    for statistic_name in ("mean", "std", "min", "max", "q01", "q99"):
+        values = statistics.get(statistic_name)
+        array = np.asarray(values) if values is not None else np.asarray([])
+        if array.shape != (width,) or not np.isfinite(array.astype(np.float64)).all():
+            raise RuntimeError(
+                f"Refusing to serve delta checkpoint: {key}.{statistic_name} must "
+                f"be a finite {width}-D vector, got {array.shape}."
+            )
+
+
+def _cfg_get(obj: Any, *keys: str, default: Any = None) -> Any:
+    current = obj
+    for key in keys:
+        if current is None:
+            return default
+        if isinstance(current, dict):
+            current = current.get(key)
+        else:
+            current = getattr(current, key, None)
+    return default if current is None else current
+
+
+def _infer_norm_mode_hints(policy) -> dict[str, Any]:
+    data_mix = _cfg_get(policy.config, "datasets", "vla_data", "data_mix")
+    action_horizon = _cfg_get(policy.config, "framework", "action_model", "action_horizon", default=1)
+    video_horizon = _cfg_get(policy.config, "framework", "vj2_model", "num_frames", default=1)
+
+    try:
+        from starVLA.dataloader.gr00t_lerobot.data_config import ROBOT_TYPE_CONFIG_MAP
+        from starVLA.dataloader.gr00t_lerobot.mixtures import DATASET_NAMED_MIXTURES
+        from starVLA.dataloader.gr00t_lerobot.transform.state_action import StateActionTransform
+    except Exception:
+        return {}
+
+    mixture_spec = DATASET_NAMED_MIXTURES.get(data_mix)
+    if not mixture_spec:
+        return {}
+
+    robot_types = {entry[2] for entry in mixture_spec if len(entry) >= 3}
+    if len(robot_types) != 1:
+        return {}
+
+    robot_type = next(iter(robot_types))
+    data_config_cls = ROBOT_TYPE_CONFIG_MAP.get(robot_type)
+    if data_config_cls is None:
+        return {"robot_type": robot_type}
+
+    try:
+        try:
+            data_config = data_config_cls(
+                observation_indices=list(range(max(int(video_horizon), 1))),
+                action_indices=list(range(max(int(action_horizon), 1))),
+            )
+        except TypeError:
+            data_config = data_config_cls()
+        transform = data_config.transform()
+    except Exception:
+        return {"robot_type": robot_type}
+
+    state_norm_modes_by_key: dict[str, str] = {}
+    action_norm_modes_by_key: dict[str, str] = {}
+    for sub_transform in getattr(transform, "transforms", []):
+        if not isinstance(sub_transform, StateActionTransform):
+            continue
+        for key, mode in sub_transform.normalization_modes.items():
+            if key.startswith("state."):
+                state_norm_modes_by_key[key] = mode
+            elif key.startswith("action."):
+                action_norm_modes_by_key[key] = mode
+
+    unique_state_modes = sorted(set(state_norm_modes_by_key.values()))
+    unique_action_modes = sorted(set(action_norm_modes_by_key.values()))
+    return {
+        "robot_type": robot_type,
+        "state_norm_modes_by_key": state_norm_modes_by_key,
+        "action_norm_modes_by_key": action_norm_modes_by_key,
+        "default_state_norm_mode": unique_state_modes[0] if len(unique_state_modes) == 1 else None,
+        "default_action_norm_mode": unique_action_modes[0] if len(unique_action_modes) == 1 else None,
+    }
+
+
+def resolve_policy_checkpoint(checkpoint_path: str | Path) -> Path:
+    """Resolve a user-supplied checkpoint path to a loadable model artifact."""
+    raw_path = Path(checkpoint_path).expanduser().resolve()
+    supported_suffixes = {".pt", ".safetensors"}
+
+    if raw_path.is_file():
+        if raw_path.suffix not in supported_suffixes:
+            raise ValueError(
+                f"Expected a `.pt` or `.safetensors` policy artifact, but got `{raw_path}`. "
+                "Pass `final_model/`, an interval checkpoint directory, the run root, "
+                "or a concrete model artifact."
+            )
+        return raw_path
+
+    if not raw_path.exists():
+        raise FileNotFoundError(f"Checkpoint path `{raw_path}` does not exist.")
+
+    candidates = [
+        raw_path / "pytorch_model.pt",
+        raw_path / "model.safetensors",
+        raw_path / "final_model" / "pytorch_model.pt",
+        raw_path / "final_model" / "model.safetensors",
+    ]
+
+    recursive_hits = sorted(
+        path
+        for path in raw_path.glob("**/pytorch_model.pt")
+        if len(path.relative_to(raw_path).parts) <= 3
+    )
+    for hit in recursive_hits:
+        if hit not in candidates:
+            candidates.append(hit)
+
+    safetensor_hits = sorted(
+        path
+        for path in raw_path.glob("**/model.safetensors")
+        if len(path.relative_to(raw_path).parts) <= 3
+    )
+    for hit in safetensor_hits:
+        if hit not in candidates:
+            candidates.append(hit)
+
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+
+    raise FileNotFoundError(
+        f"Could not resolve a `.pt` or `.safetensors` model artifact under `{raw_path}`. "
+        "Pass the run root, `final_model/`, an interval checkpoint directory, "
+        "or the concrete model artifact."
+    )
+
+
+def build_policy_metadata(policy, checkpoint_path: str | Path) -> dict[str, Any]:
+    checkpoint_path = Path(checkpoint_path).resolve()
+    data_mix = _cfg_get(policy.config, "datasets", "vla_data", "data_mix")
+    norm_stats = getattr(policy, "norm_stats", {}) or {}
+    action_stats_by_key = {
+        key: value["action"]
+        for key, value in norm_stats.items()
+        if isinstance(value, dict) and "action" in value
+    }
+    state_stats_by_key = {
+        key: value["state"]
+        for key, value in norm_stats.items()
+        if isinstance(value, dict) and "state" in value
+    }
+    available_unnorm_keys = sorted(action_stats_by_key)
+    default_unnorm_key = available_unnorm_keys[0] if len(available_unnorm_keys) == 1 else None
+
+    action_horizon = _cfg_get(policy.config, "framework", "action_model", "action_horizon")
+    if action_horizon is None:
+        future_window = _cfg_get(policy.config, "framework", "action_model", "future_action_window_size", default=0)
+        action_horizon = int(future_window) + 1
+
+    norm_mode_hints = _infer_norm_mode_hints(policy)
+    configured_norm_mode = _cfg_get(
+        policy.config,
+        "datasets",
+        "vla_data",
+        "state_action_normalization",
+    )
+    if configured_norm_mode is not None:
+        norm_mode_hints.update(
+            {
+                "default_state_norm_mode": str(configured_norm_mode),
+                "default_action_norm_mode": str(configured_norm_mode),
+            }
+        )
+    rtc_config = _cfg_get(policy.config, "framework", "action_model", "rtc_training")
+
+    metadata = {
+        "env": "real_robot",
+        "checkpoint_path": str(checkpoint_path),
+        "run_id": _cfg_get(policy.config, "run_id"),
+        "framework_name": _cfg_get(policy.config, "framework", "name"),
+        "data_mix": data_mix,
+        "action_type": _cfg_get(policy.config, "datasets", "vla_data", "action_type"),
+        "resolution_size": _cfg_get(policy.config, "datasets", "vla_data", "resolution_size"),
+        "video_resolution_size": _cfg_get(policy.config, "datasets", "vla_data", "video_resolution_size"),
+        "with_state": bool(_cfg_get(policy.config, "datasets", "vla_data", "with_state", default=False)),
+        "action_dim": _cfg_get(policy.config, "framework", "action_model", "action_dim"),
+        "state_dim": _cfg_get(policy.config, "framework", "action_model", "state_dim"),
+        "action_horizon": action_horizon,
+        "future_action_window_size": _cfg_get(policy.config, "framework", "action_model", "future_action_window_size"),
+        "num_inference_timesteps": _cfg_get(policy.config, "framework", "action_model", "num_inference_timesteps"),
+        "available_unnorm_keys": available_unnorm_keys,
+        "default_unnorm_key": default_unnorm_key,
+        "action_stats_by_key": action_stats_by_key,
+        "state_stats_by_key": state_stats_by_key,
+        "camera_order_hint": _CAMERA_ORDER_HINTS.get(data_mix),
+        **norm_mode_hints,
+    }
+    if rtc_config is not None:
+        configured_max_delay = max(0, int(_cfg_get(rtc_config, "max_delay", default=0) or 0))
+        max_delay_exclusive = min(configured_max_delay, max(0, int(action_horizon)))
+        metadata["rtc_inference_contract"] = {
+            "training_enabled": bool(_cfg_get(rtc_config, "enabled", default=False)),
+            "method": _cfg_get(rtc_config, "method", default="prefix"),
+            "max_delay_exclusive": max_delay_exclusive,
+            "max_prefix_len": max(0, max_delay_exclusive - 1),
+            "action_space": "normalized_policy_action",
+            "client_opt_in": True,
+        }
+    camera_order_hint = tuple(metadata.get("camera_order_hint") or ())
+    try:
+        action_dim = int(metadata.get("action_dim"))
+        state_dim = int(metadata.get("state_dim"))
+    except (TypeError, ValueError):
+        action_dim = state_dim = -1
+    if (
+        camera_order_hint == REALMAN_CAMERA_ORDER
+        and action_dim in REALMAN_POLICY_ACTION_DIMS
+        and state_dim == REALMAN_STATE_DIM
+    ):
+        action_type = str(metadata.get("action_type") or "")
+        if action_type == JOINT_DELTA_GRIPPER_ABSOLUTE:
+            exact = REALMAN_18D_ACTION_CONTRACT
+            mismatches = {
+                "action_dim": (action_dim, exact.action_dim),
+                "state_dim": (state_dim, exact.state_dim),
+                "action_horizon": (int(action_horizon), exact.action_horizon),
+                "normalization": (
+                    metadata.get("default_action_norm_mode"),
+                    Q01_Q99_UNCLIPPED,
+                ),
+                "state_normalization": (
+                    metadata.get("default_state_norm_mode"),
+                    Q01_Q99_UNCLIPPED,
+                ),
+            }
+            invalid = {
+                key: values for key, values in mismatches.items() if values[0] != values[1]
+            }
+            if invalid:
+                raise RuntimeError(
+                    "Refusing to serve an incompatible delta checkpoint; the exact "
+                    f"18-D OpenPI contract is required. Mismatches: {invalid}."
+                )
+        for mode_key in ("default_action_norm_mode", "default_state_norm_mode"):
+            mode = metadata.get(mode_key)
+            if not isinstance(mode, str) or not mode:
+                raise RuntimeError(
+                    f"Cannot serve Realman checkpoint because `{mode_key}` could not be "
+                    "reconstructed from its data configuration. Refusing to guess q99: "
+                    "a min/max checkpoint would receive and emit different values."
+                )
+        if default_unnorm_key is None:
+            raise RuntimeError(
+                "Cannot serve Realman checkpoint without one unambiguous normalization key."
+            )
+        if default_unnorm_key not in state_stats_by_key:
+            raise RuntimeError(
+                f"Realman normalization key {default_unnorm_key!r} has action stats but no state stats."
+            )
+        statistics_sha256 = _normalization_statistics_sha256(
+            normalization=str(metadata["default_action_norm_mode"]),
+            action_stats_by_key=action_stats_by_key,
+            state_stats_by_key=state_stats_by_key,
+        )
+        metadata["normalization_statistics_sha256"] = statistics_sha256
+        if action_type == JOINT_DELTA_GRIPPER_ABSOLUTE:
+            _require_exact_quantile_statistics(
+                action_stats_by_key[default_unnorm_key],
+                key=f"action_stats_by_key.{default_unnorm_key}",
+                width=REALMAN_18D_ACTION_CONTRACT.action_dim,
+            )
+            _require_exact_quantile_statistics(
+                state_stats_by_key[default_unnorm_key],
+                key=f"state_stats_by_key.{default_unnorm_key}",
+                width=REALMAN_18D_ACTION_CONTRACT.state_dim,
+            )
+        omitted_indices = realman_omitted_robot_action_indices(action_dim)
+        action_state_indices = realman_policy_action_state_indices(action_dim)
+        qwen_frame_size = metadata.get("video_resolution_size") or DEFAULT_QWEN_FRAME_SIZE
+        qwen_resolution_size = metadata.get("resolution_size")
+        state_norm_mode = metadata["default_state_norm_mode"]
+        metadata.update(
+            {
+                "policy_action_names": list(realman_policy_action_names(action_dim)),
+                "state_names": list(REALMAN_STATE_NAMES),
+                "robot_action_dim": REALMAN_ACTION_DIM,
+                "robot_action_names": list(REALMAN_ACTION_NAMES),
+                "realman_action_contract": {
+                    "version": 3,
+                    "policy_action_dim": action_dim,
+                    "robot_action_dim": REALMAN_ACTION_DIM,
+                    "action_type": action_type,
+                    "delta_anchor": (
+                        "chunk_start_state"
+                        if action_type == JOINT_DELTA_GRIPPER_ABSOLUTE
+                        else None
+                    ),
+                    "policy_action_state_indices": action_state_indices.tolist(),
+                    "state_relative_policy_action_indices": np.flatnonzero(
+                        action_state_indices >= 0
+                    ).astype(int).tolist(),
+                    "native_policy_action_indices": np.flatnonzero(
+                        action_state_indices < 0
+                    ).astype(int).tolist(),
+                    "absolute_gripper_policy_action_indices": [7, 15],
+                    "omitted_robot_action_indices": list(omitted_indices),
+                    "base_velocity_source": "policy" if action_dim == REALMAN_ACTION_DIM else "zero",
+                    "lift_source": "measured_state" if 21 in omitted_indices else "policy",
+                    "representation": (
+                        REALMAN_18D_ACTION_CONTRACT.to_dict()
+                        if action_type == JOINT_DELTA_GRIPPER_ABSOLUTE
+                        else None
+                    ),
+                    "representation_sha256": (
+                        REALMAN_18D_ACTION_CONTRACT.sha256()
+                        if action_type == JOINT_DELTA_GRIPPER_ABSOLUTE
+                        else None
+                    ),
+                    "normalization_statistics_sha256": statistics_sha256,
+                },
+                "realman_input_contract": {
+                    "version": 1,
+                    "payload_key": QWEN_TENSOR_PAYLOAD_KEY,
+                    "camera_order": list(REALMAN_CAMERA_ORDER),
+                    "frame_shape": [len(REALMAN_CAMERA_ORDER), int(qwen_frame_size), int(qwen_frame_size), 3],
+                    "frame_size": int(qwen_frame_size),
+                    "frame_dtype": "uint8",
+                    "color_space": "RGB",
+                    "transport_encoding": "msgpack_ndarray",
+                    "client_resize": "opencv_inter_linear",
+                    "model_preprocess": "qwen_tensor_fast_path",
+                    "model_resolution_size": int(qwen_resolution_size) if qwen_resolution_size is not None else None,
+                    "state_shape": [1, 1, state_dim],
+                    "state_dtype": "float32",
+                    "state_normalized": True,
+                    # Mirror Normalizer.forward in the training dataloader. q99
+                    # clamps after scaling; min_max and mean_std deliberately do
+                    # not clamp observations outside their fitted statistics.
+                    "state_normalization_mode": state_norm_mode,
+                    "state_normalization_clip": state_norm_mode == "q99",
+                    "representation_sha256": (
+                        REALMAN_18D_ACTION_CONTRACT.sha256()
+                        if action_type == JOINT_DELTA_GRIPPER_ABSOLUTE
+                        else None
+                    ),
+                    "normalization_statistics_sha256": statistics_sha256,
+                },
+            }
+        )
+    return metadata

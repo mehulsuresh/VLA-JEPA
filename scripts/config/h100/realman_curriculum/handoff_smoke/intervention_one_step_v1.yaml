@@ -1,0 +1,31 @@
+# NON-QUALITY checkpoint-handoff smoke: one complete global batch and one
+# optimizer step over the production intervention representation/masking
+# contract.  No validity or recovery semantics are changed here.
+extends:
+  - ../intervention_adapt_v1.yaml
+
+run_id: robot_ft_intervention_handoff_smoke_18d_delta_h100x8_b16
+
+checkpoint_handoff_smoke:
+  schema: realman-checkpoint-handoff-smoke-stage-v1
+  scope: checkpoint_handoff_only
+  model_quality_claim_allowed: false
+  expected_global_batch_rows: 128
+  expected_optimizer_steps: 1
+
+datasets:
+  vla_data:
+    frozen_train_view_manifest: REPLACE_WITH_INTERVENTION_SMOKE_VIEW
+    frozen_train_view_manifest_sha256: REPLACE_WITH_INTERVENTION_SMOKE_VIEW_SHA256
+    normalization_statistics_artifact: REPLACE_WITH_SMOKE_UNION_STATS
+    normalization_statistics_artifact_sha256: REPLACE_WITH_SMOKE_UNION_STATS_SHA256
+
+trainer:
+  epochs: 1
+  max_train_steps: auto
+  eval_before_train: false
+  checkpoint_eval_milestone_fractions: [1.0]
+  checkpoint_eval_milestone_steps: null
+  checkpoint_eval_milestones_only: true
+  checkpoint_max_to_keep: 0
+  reload_modules: null

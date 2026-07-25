@@ -1,0 +1,28 @@
+{
+  "dataset": {
+    "annotation_sha256": "d35619cf788ebdcbd0ce55585efb52f1eaaddd4eab04f861a942135be0d2734a",
+    "catalog_sha256": "1b8cf36d781a0a3a5f84bf14426691eeb8d6e54254b86b39ae3ba90603872992",
+    "source_content_sha256": "8e444baf6395779965e042a84312ecb034349a8bb8bebaf1d1994093cd524b94",
+    "source_id": "magna_training_data_with_interventions_final_subtask_labelled"
+  },
+  "masking": {
+    "invalid_run_length": 10,
+    "policy": "chunk_prefix_until_first_sustained_invalid_or_padding",
+    "recovery_windows": "windows_anchored_at_valid_recovery_frames_are_supervised"
+  },
+  "review": {
+    "evidence": "Dataset operator confirmed in Codex task 019f5e16-74c3-72a2-a505-1dd870642248: the mistake is marked invalid, not the recovery.",
+    "reviewed_at_utc": "2026-07-25T03:17:43Z",
+    "reviewer": "dataset operator"
+  },
+  "schema": "realman-action-label-semantics-v1",
+  "semantics": {
+    "mistake_meaning": "mistake_action_do_not_supervise",
+    "mistake_value": 0,
+    "recovery_anchor_definition": "first_valid_frame_after_invalid_frame",
+    "supervised_meaning": "expert_or_recovery_action_supervise",
+    "supervised_value": 1,
+    "validity_column": "valid_state"
+  },
+  "status": "verified"
+}

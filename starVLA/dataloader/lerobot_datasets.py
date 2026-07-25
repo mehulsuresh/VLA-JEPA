@@ -1,0 +1,368 @@
+import math
+import re
+from collections.abc import Mapping, Sequence
+from numbers import Real
+from pathlib import Path
+
+from omegaconf import OmegaConf
+
+from starVLA.dataloader.gr00t_lerobot.datasets import LeRobotSingleDataset, LeRobotMixtureDataset
+from starVLA.dataloader.gr00t_lerobot.mixtures import DATASET_NAMED_MIXTURES
+from starVLA.dataloader.gr00t_lerobot.data_config import ROBOT_TYPE_CONFIG_MAP
+from starVLA.dataloader.gr00t_lerobot.embodiment_tags import ROBOT_TYPE_TO_EMBODIMENT_TAG, EmbodimentTag
+
+
+_SOURCE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+_SOURCE_KEYS = frozenset(
+    {
+        "id",
+        "path",
+        "weight",
+        "primary",
+        "robot_type",
+        "lerobot_version",
+        "config_overrides",
+    }
+)
+_SOURCE_REQUIRED_KEYS = _SOURCE_KEYS - {"config_overrides"}
+_SUPPORTED_LEROBOT_VERSIONS = frozenset({"v2.0", "v3.0"})
+
+
+def collate_fn(batch):
+    return batch
+
+
+def _as_plain_mapping(value, *, label: str) -> dict:
+    if OmegaConf.is_dict(value):
+        value = OmegaConf.to_container(value, resolve=True)
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{label} must be a mapping")
+    return dict(value)
+
+
+def _clone_and_merge_source_config(
+    data_cfg,
+    *,
+    source_id: str,
+    dataset_path: Path,
+    robot_type: str,
+    lerobot_version: str,
+    config_overrides: dict,
+):
+    if OmegaConf.is_config(data_cfg):
+        base_payload = OmegaConf.to_container(data_cfg, resolve=False)
+    elif isinstance(data_cfg, Mapping):
+        base_payload = dict(data_cfg)
+    else:
+        raise ValueError("datasets.vla_data must be a mapping")
+
+    source_cfg = OmegaConf.merge(
+        OmegaConf.create(base_payload),
+        OmegaConf.create(config_overrides),
+    )
+    # Bind the merged config to this logical source.  The explicit dataset
+    # path is still passed directly to the dataset constructor; these fields
+    # make the source identity available to transforms and provenance code.
+    source_cfg.dataset_source_id = source_id
+    source_cfg.dataset_path = str(dataset_path)
+    source_cfg.data_root_dir = str(dataset_path.parent)
+    source_cfg.data_name = dataset_path.name
+    source_cfg.robot_type = robot_type
+    source_cfg.lerobot_version = lerobot_version
+    return source_cfg
+
+
+def _configured_source_specs(data_cfg) -> list[dict] | None:
+    sources = data_cfg.get("sources", None)
+    if sources is None:
+        return None
+    if isinstance(sources, (str, bytes)) or not isinstance(sources, Sequence):
+        raise ValueError("datasets.vla_data.sources must be a non-empty list")
+    if len(sources) == 0:
+        raise ValueError("datasets.vla_data.sources must not be empty")
+
+    source_specs: list[dict] = []
+    source_ids: set[str] = set()
+    for source_index, raw_source in enumerate(sources):
+        label = f"datasets.vla_data.sources[{source_index}]"
+        source = _as_plain_mapping(raw_source, label=label)
+        missing = sorted(_SOURCE_REQUIRED_KEYS - source.keys())
+        unknown = sorted(source.keys() - _SOURCE_KEYS)
+        if missing:
+            raise ValueError(f"{label} is missing required keys: {missing}")
+        if unknown:
+            raise ValueError(f"{label} has unsupported keys: {unknown}")
+
+        source_id = source["id"]
+        if (
+            not isinstance(source_id, str)
+            or not _SOURCE_ID_PATTERN.fullmatch(source_id)
+        ):
+            raise ValueError(
+                f"{label}.id must match {_SOURCE_ID_PATTERN.pattern!r}"
+            )
+        if source_id in source_ids:
+            raise ValueError(
+                f"Duplicate datasets.vla_data.sources id: {source_id!r}"
+            )
+        source_ids.add(source_id)
+
+        raw_path = source["path"]
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            raise ValueError(f"{label}.path must be a non-empty absolute path")
+        dataset_path = Path(raw_path).expanduser()
+        if not dataset_path.is_absolute() or not dataset_path.name:
+            raise ValueError(f"{label}.path must be a dataset-specific absolute path")
+
+        weight = source["weight"]
+        if (
+            isinstance(weight, bool)
+            or not isinstance(weight, Real)
+            or not math.isfinite(float(weight))
+            or float(weight) <= 0.0
+        ):
+            raise ValueError(f"{label}.weight must be a finite number greater than zero")
+        weight = float(weight)
+
+        primary = source["primary"]
+        if type(primary) is not bool:
+            raise ValueError(f"{label}.primary must be an exact boolean")
+
+        robot_type = source["robot_type"]
+        if not isinstance(robot_type, str) or robot_type not in ROBOT_TYPE_CONFIG_MAP:
+            raise ValueError(
+                f"{label}.robot_type must name a registered robot type; "
+                f"got {robot_type!r}"
+            )
+
+        lerobot_version = source["lerobot_version"]
+        if lerobot_version not in _SUPPORTED_LEROBOT_VERSIONS:
+            raise ValueError(
+                f"{label}.lerobot_version must be one of "
+                f"{sorted(_SUPPORTED_LEROBOT_VERSIONS)}"
+            )
+
+        config_overrides = _as_plain_mapping(
+            source.get("config_overrides", {}),
+            label=f"{label}.config_overrides",
+        )
+        source_cfg = _clone_and_merge_source_config(
+            data_cfg,
+            source_id=source_id,
+            dataset_path=dataset_path,
+            robot_type=robot_type,
+            lerobot_version=lerobot_version,
+            config_overrides=config_overrides,
+        )
+        source_specs.append(
+            {
+                "id": source_id,
+                "path": dataset_path,
+                "weight": weight,
+                "primary": primary,
+                "robot_type": robot_type,
+                "lerobot_version": lerobot_version,
+                "data_cfg": source_cfg,
+            }
+        )
+    return source_specs
+
+
+def make_LeRobotSingleDataset(
+    data_root_dir: Path | str,
+    data_name: str,
+    robot_type: str,
+    delete_pause_frame: bool = False,
+    action_horizon: int = 7,
+    video_horizon: int = 16,
+    video_frame_stride: int = 1,
+    data_cfg: dict | None = None,
+    lerobot_version: str | None = None,
+    video_backend: str = "decord",
+    video_backend_kwargs: dict | None = None,
+    episode_split_role: str | None = None,
+) -> LeRobotSingleDataset:
+    """
+    Make a LeRobotSingleDataset object.
+
+    :param data_root_dir: The root directory of the dataset.
+    :param data_name: The name of the dataset.
+    :param robot_type: The robot type config to use.
+    :param lerobot_version: Explicit version override ("v2.0" or "v3.0"). If None, auto-detect from dataset files.
+    :return: A LeRobotSingleDataset object.
+    """
+    data_config_cls = ROBOT_TYPE_CONFIG_MAP[robot_type]
+    video_frame_stride = max(int(video_frame_stride), 1)
+    data_config = data_config_cls(
+        observation_indices=[i * video_frame_stride for i in range(video_horizon)],
+        action_indices=list(range(action_horizon))
+    )
+    # Data-config transforms normally depend only on the robot type.  Mixed
+    # joint-delta/absolute-gripper targets are an explicit run-level contract,
+    # so expose that contract before constructing the transform pipeline.
+    data_config.data_cfg = data_cfg
+    modality_config = data_config.modality_config()
+    transforms = data_config.transform()
+    dataset_path = data_root_dir / data_name
+    if robot_type not in ROBOT_TYPE_TO_EMBODIMENT_TAG:
+        print(f"Warning: Robot type {robot_type} not found in ROBOT_TYPE_TO_EMBODIMENT_TAG, using {EmbodimentTag.NEW_EMBODIMENT} as default")
+        embodiment_tag = EmbodimentTag.NEW_EMBODIMENT
+    else:
+        embodiment_tag = ROBOT_TYPE_TO_EMBODIMENT_TAG[robot_type]
+    return LeRobotSingleDataset(
+        dataset_path=dataset_path,
+        modality_configs=modality_config,
+        transforms=transforms,
+        embodiment_tag=embodiment_tag,
+        video_backend=video_backend,
+        video_backend_kwargs=video_backend_kwargs,
+        delete_pause_frame=delete_pause_frame,
+        data_cfg=data_cfg,
+        lerobot_version=lerobot_version,
+        episode_split_role=episode_split_role,
+    )
+
+def get_vla_dataset(
+    data_cfg: dict,
+    mode: str = "train",
+    balance_dataset_weights: bool = False,
+    balance_trajectory_weights: bool = False,
+    seed: int = 42,
+    delete_pause_frame: bool = True,
+    action_horizon: int = 7,
+    video_horizon: int = 16,
+    video_frame_stride: int = 1,
+    **kwargs: dict,
+) -> LeRobotMixtureDataset:
+    """
+    Get a LeRobotMixtureDataset object.
+    """
+    delete_pause_frame = bool(data_cfg.get("delete_pause_frame", delete_pause_frame))
+    configured_sources = _configured_source_specs(data_cfg)
+    if configured_sources is None:
+        data_root_dir = data_cfg.data_root_dir
+        data_mix = data_cfg.data_mix
+        mixture_spec = DATASET_NAMED_MIXTURES[data_mix]
+        included_datasets, filtered_mixture_spec = set(), []
+        for entry in mixture_spec:
+            d_name, d_weight, robot_type = entry[0], entry[1], entry[2]
+            d_version = entry[3] if len(entry) > 3 else None
+            dataset_key = (d_name, robot_type)
+            if dataset_key in included_datasets:
+                print(f"Skipping Duplicate Dataset: `{(d_name, d_weight, robot_type)}`")
+                continue
+
+            included_datasets.add(dataset_key)
+            filtered_mixture_spec.append((d_name, d_weight, robot_type, d_version))
+        source_specs = [
+            {
+                "id": d_name,
+                "path": Path(data_root_dir) / d_name,
+                "data_root_dir": Path(data_root_dir),
+                "data_name": d_name,
+                "weight": d_weight,
+                "primary": float(d_weight) == 1.0,
+                "robot_type": robot_type,
+                "lerobot_version": d_version,
+                "data_cfg": data_cfg,
+            }
+            for d_name, d_weight, robot_type, d_version in filtered_mixture_spec
+        ]
+    else:
+        # Explicit logical source IDs, rather than physical paths, define the
+        # mixture members.  Multiple views of the same dataset path are valid
+        # and intentionally remain separate.
+        source_specs = configured_sources
+
+    if balance_dataset_weights and any(
+        source["data_cfg"].get("episode_split_manifest", None)
+        for source in source_specs
+    ):
+        raise ValueError(
+            "balance_dataset_weights=true is incompatible with immutable episode "
+            "splits because train and holdout views would merge the same train-only "
+            "statistics using different role-dependent dataset weights"
+        )
+
+    dataset_mixture = []
+    for source in source_specs:
+        source_cfg = source["data_cfg"]
+        source_delete_pause_frame = bool(
+            source_cfg.get("delete_pause_frame", delete_pause_frame)
+        )
+        video_backend_num_threads = max(
+            1, int(source_cfg.get("video_backend_num_threads", 1))
+        )
+        video_backend = str(source_cfg.get("video_backend", "decord"))
+        video_backend_kwargs = {"num_threads": video_backend_num_threads}
+        dataset_path = source["path"]
+        constructor_root = source.get("data_root_dir", dataset_path.parent)
+        constructor_name = source.get("data_name", dataset_path.name)
+        dataset_mixture.append(
+            (
+                make_LeRobotSingleDataset(
+                    constructor_root,
+                    constructor_name,
+                    source["robot_type"],
+                    delete_pause_frame=source_delete_pause_frame,
+                    action_horizon=action_horizon,
+                    video_horizon=video_horizon,
+                    video_frame_stride=video_frame_stride,
+                    data_cfg=source_cfg,
+                    lerobot_version=source["lerobot_version"],
+                    video_backend=video_backend,
+                    video_backend_kwargs=video_backend_kwargs,
+                    episode_split_role=mode,
+                ),
+                source["weight"],
+            )
+        )
+
+    return LeRobotMixtureDataset(
+        dataset_mixture,
+        primary_dataset_flags=[
+            bool(source["primary"]) for source in source_specs
+        ],
+        mode=mode,
+        balance_dataset_weights=balance_dataset_weights,
+        balance_trajectory_weights=balance_trajectory_weights,
+        with_state=data_cfg.get("with_state", False),
+        resolution_size=data_cfg.get("resolution_size", 224),
+        video_resolution_size=data_cfg.get("video_resolution_size", 256),
+        video_frame_stride=video_frame_stride,
+        video_target_shift_steps=data_cfg.get("video_target_shift_steps", 0),
+        gpu_video_decode_on_rank=bool(data_cfg.get("gpu_video_decode_on_rank", False)),
+        cpu_video_decode_drop_worker_images=bool(data_cfg.get("cpu_video_decode_drop_worker_images", False)),
+        seed=seed,
+        metadata_config=data_cfg,
+        **kwargs,
+    )
+
+if __name__ == "__main__":
+    import debugpy
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config_yaml", type=str, default="./scripts/config/vlajepa_robot_ft.yaml", help="Path to YAML config")
+    args, clipargs = parser.parse_known_args()
+
+    debugpy.listen(("0.0.0.0", 10092))
+    print("🔍 Rank 0 waiting for debugger attach on port 10092...")
+    debugpy.wait_for_client()
+
+    cfg = OmegaConf.load(args.config_yaml)
+
+    vla_dataset_cfg = cfg.datasets.vla_data
+    dataset = get_vla_dataset(data_cfg=vla_dataset_cfg)
+    
+    from torch.utils.data import DataLoader
+    train_dataloader = DataLoader(
+        dataset,
+        batch_size=16,
+        num_workers=1, # For Debug
+        collate_fn=collate_fn,
+    )
+
+    from tqdm import tqdm
+    for batch in tqdm(train_dataloader, desc="Processing Batches"):
+        print(batch)
+        pass

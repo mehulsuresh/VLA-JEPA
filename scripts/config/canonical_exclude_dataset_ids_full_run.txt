@@ -1,0 +1,4 @@
+# Canonical dataset ids to skip for full GCS runs.
+# Keep this file small and evidence-backed so future VM runs inherit the same
+# data guardrails without changing code.
+BAAI-DataCube/AgiBotWorld-Beta_G1_task_372_Supermarket_packaging

@@ -1,0 +1,11 @@
+# Maximum-exposure option: one exhaustive epoch over all strict-valid rows.
+extends:
+  - realsource_common_v1.yaml
+
+run_id: robot_ft_realsource_full_18d_delta_h100x8_b16
+
+datasets:
+  vla_data:
+    frozen_train_view_manifest: /data/mehul-vla-jepa/data_contracts/views/realsource_full_strict_valid_v1.json
+    frozen_train_view_manifest_sha256: REPLACE_WITH_MATERIALIZED_REALSOURCE_FULL_VIEW_SHA256
+

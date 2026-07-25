@@ -1,0 +1,81 @@
+{
+  "epoch_contract": {
+    "ddp_tail": "duplicated_padding_reported_separately",
+    "drop_last": false,
+    "epoch_passes": 1,
+    "mode": "all_exhaustive",
+    "replacement": false,
+    "shuffle": "deterministic_bijection_per_epoch"
+  },
+  "generator_requirements": {
+    "annotation_alignment_exceptions": [
+      {
+        "dataset_name": "Collect_the_mail",
+        "mapping": "annotations_0_through_121_to_data_0_through_121_drop_annotation_122_annotations_123_through_390_to_data_122_through_389",
+        "must_be_content_verified": true
+      }
+    ],
+    "fail_closed_on_decode_or_catalog_mismatch": true,
+    "holdout_copy_detection": [
+      "episode_lineage_id",
+      "episode_content_id"
+    ],
+    "ledger_order": [
+      "dataset_id",
+      "sid",
+      "revision",
+      "episode_index",
+      "target_20hz_base_index"
+    ]
+  },
+  "holdout_exclusions": {
+    "content_ids": [],
+    "episode_indices": [],
+    "lineage_ids": [],
+    "schema": "vla-dataset-view-holdout-exclusions-v1",
+    "source_id": "gcs_realsource_full_strict_valid",
+    "template_note": "The materialized generator must recompute the self-hash after removing this note."
+  },
+  "representation": {
+    "action_dim": 18,
+    "action_type": "joint_delta_gripper_absolute",
+    "contract_sha256": "9e1df348fb137c206b42a183892e29ec6247595fffc232bb2d73d94b5f5f91ac",
+    "horizon": 50,
+    "normalization": "q01_q99_unclipped",
+    "state_dim": 18,
+    "target_fps": 20
+  },
+  "required_output_schema": "vla-dataset-view-v1",
+  "schema": "vla-dataset-view-template-v1",
+  "selection": {
+    "episode_policy": "all_matching_no_cap",
+    "expected_inventory_at_template_creation": {
+      "strict_valid_episode_count": 25850,
+      "target_20hz_row_count": 20661808
+    },
+    "quality_predicate": {
+      "column": "quality_assessments.overall_valid",
+      "comparison": "exact_string_equality",
+      "value": "VALID"
+    },
+    "resampling": {
+      "source_fps": 30,
+      "source_index_formula": "(3 * target_20hz_index + 1) // 2",
+      "target_fps": 20
+    },
+    "row_policy": "every_resampled_row_in_every_matching_episode"
+  },
+  "sources": [
+    {
+      "adapter_sha256": "83fb15dd7f19a96d0d981e9e0aa3c5ba3e370060a760bfc3b4a70a9070cbf1c8",
+      "annotation_sha256": "REQUIRED_GENERATED_SHA256",
+      "backend": "canonical",
+      "catalog_sha256": "9fa8b604127ef87478cbc496ae96c75b04334be8c6c16eaf6c057a69a5745953",
+      "manifest_sha256": "9fa8b604127ef87478cbc496ae96c75b04334be8c6c16eaf6c057a69a5745953",
+      "source_content_sha256": "REQUIRED_GENERATED_SHA256",
+      "source_id": "gcs_realsource_full_strict_valid"
+    }
+  ],
+  "template_only": true,
+  "view_name": "realsource_full_strict_valid_exhaustive_v1"
+}

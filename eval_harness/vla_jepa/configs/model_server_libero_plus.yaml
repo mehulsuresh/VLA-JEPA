@@ -1,0 +1,26 @@
+# VLA-JEPA model-server config for allenai/vla-evaluation-harness.
+#
+# The launch script passes the checkpoint path as a CLI override so this config
+# stays portable across local/cloud machines.
+script: "eval_harness/vla_jepa/model_server.py"
+args:
+  checkpoint: ""
+  unnorm_key: franka
+  action_norm_mode: min_max
+  benchmark_profile: libero
+  action_dim: 7
+  image_keys: ["agentview", "wrist"]
+  state_keys: ["states", "state"]
+  state_dim: 8
+  preserve_masked_action_dims: true
+  binarize_gripper: true
+  chunk_size: 7
+  max_batch_size: 8
+  max_wait_time: 0.05
+  action_ensemble: newest
+  num_ddim_steps: 10
+  use_bf16: true
+  cuda: 0
+  send_wrist_image: true
+  send_state: true
+  quat_no_antipodal: true

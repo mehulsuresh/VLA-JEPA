@@ -1,0 +1,39 @@
+# Human-launchable H100x8 canonical GCS profile. The canonical full-run base
+# owns all model/data/training semantics and the shared H100 base owns the
+# execution/recovery contract. The canonicalization checkout is additionally
+# pinned because its manifest/adapters are part of the data contract.
+extends:
+  - ../vlajepa_robot_ft_canonical_full_a100x8_qwen_full_zero3_moge_vits.yaml
+  - h100x8_runtime_base.yaml
+
+run_id: robot_ft_canonical_full_h100x8_qwen_full_rawddp_moge_vits
+# New immutable artifact namespace for the fractional 128-observation policy.
+# The legacy canonical_full_gcs_heldout_v1 path may contain a 208-window
+# training-batch-sized manifest and must never be overwritten or reused.
+canonical_eval_split_id: canonical_full_gcs_fractional_eval128_v2
+
+runtime:
+  main_process_port: 29574
+  helper_repositories:
+    dataset-canonicalization:
+      path: /mnt/vla-jepa/src/dataset-canonicalization
+      url: https://github.com/YonduAI/dataset-canonicalization.git
+      commit: d9c3298f3fec1706258aeef800f65eb4274356a6
+
+datasets:
+  vla_data:
+    # Hold out a deterministic episode set near 5-8% of the configured
+    # canonical catalog (rounded to a multiple of eight and capped at 128).
+    # Windows are balanced over those episodes and always total exactly 128,
+    # independently of the training global batch size (26 * 8 = 208 here).
+    holdout_sampling:
+      algorithm: dataset_fraction_divisor_v1
+      minimum_episode_fraction: 0.05
+      maximum_episode_fraction: 0.08
+      episode_count_multiple: 8
+      max_episode_count: 128
+      evaluation_observation_count: 128
+    eval_per_device_batch_size: 16
+    # Bounded readability probe used by setup/check. This exact object is
+    # present in the source manifest pinned by the helper checkout above.
+    gcs_access_probe_object: gs://robotics-datasets-yonduai/raw/BAAI-DataCube__AgiBotWorld-Beta_G1_task_327_Pick_up_at_supermarket/main/files/meta/episodes/chunk-000/file-000.parquet

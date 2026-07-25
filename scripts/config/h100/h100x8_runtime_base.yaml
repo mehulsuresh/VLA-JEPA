@@ -1,0 +1,73 @@
+# Shared execution contract for human-launched H100x8 profiles.
+#
+# This file contains execution/recovery settings only. Dataset/model profiles
+# compose it with `extends`; the fully resolved plan is printed before launch.
+runtime:
+  schema_version: 1
+  platform: h100x8
+  container_image: vla-jepa:py313-cu130-h100
+  container_build:
+    arguments:
+      DOCKERFILE: docker/Dockerfile.py313
+      BASE_IMAGE: nvidia/cuda:13.0.2-cudnn-devel-ubuntu24.04
+      TORCH_INDEX_URL: https://download.pytorch.org/whl/cu130
+      PYTHON_VERSION: "3.13"
+      INSTALL_DEEPSPEED: "0"
+      INSTALL_MOGE: "1"
+      INSTALL_FLASH_ATTN: "1"
+      FLASH_ATTN_SPEC: flash-attn==2.8.3.post1
+      FLASH_ATTN_CUDA_ARCH_LIST: "9.0"
+      FLASH_ATTN_MAX_JOBS: "32"
+      FLASH_ATTN_NVCC_THREADS: "2"
+      INSTALL_FAST_LINEAR_ATTN: "1"
+      FAST_LINEAR_ATTN_SPEC: flash-linear-attention[cuda]==0.5.1
+      CAUSAL_CONV1D_SPEC: causal-conv1d==1.6.2.post1
+      FAST_LINEAR_ATTN_TRANSFORMERS_SPEC: transformers==5.13.1
+      FAST_LINEAR_ATTN_TILELANG_SPEC: tilelang==0.1.9
+      FAST_LINEAR_ATTN_TVM_FFI_SPEC: apache-tvm-ffi==0.1.10
+      FAST_LINEAR_ATTN_CUDA_ARCH_LIST: "9.0"
+      FAST_LINEAR_ATTN_MAX_JOBS: "32"
+  scratch_root: /mnt/vla-jepa
+  expected_gpu_count: 8
+  expected_gpu_name_contains: H100
+  expected_compute_capability: [9, 0]
+  num_processes: 8
+  num_machines: 1
+  mixed_precision: bf16
+  dynamo_backend: "no"
+  main_process_port: 29573
+  use_deepspeed: false
+  torch_compile_environment: disabled
+  network_interface: auto
+  require_clean_git: true
+  provenance_launcher: scripts/h100_training.py
+  helper_repositories:
+    moge:
+      path: /mnt/vla-jepa/src/MoGe
+      url: https://github.com/microsoft/MoGe.git
+      commit: 07444410f1e33f402353b99d6ccd26bd31e469e8
+    vjepa2:
+      path: /mnt/vla-jepa/src/vjepa2
+      url: https://github.com/facebookresearch/vjepa2.git
+      commit: 204698b45b3712590f06245fbfba32d3be539812
+
+framework:
+  qwenvl:
+    strict_attn_implementation: true
+    enable_fast_linear_attention: false
+    strict_fast_linear_attention: false
+    strict_full_trainable: true
+
+trainer:
+  detailed_timing_logging: false
+  detailed_timing_frequency: 10
+  allow_training_stream_eval: false
+  ddp_gradient_as_bucket_view: true
+  ddp_static_graph: false
+  ddp_bucket_cap_mb: 100
+  resume_from_checkpoint: null
+  resume_load_optimizer_state: true
+  eval_only: false
+  allow_compile_with_deepspeed: false
+  save_final_model: true
+  enable_force_checkpoint_file: true

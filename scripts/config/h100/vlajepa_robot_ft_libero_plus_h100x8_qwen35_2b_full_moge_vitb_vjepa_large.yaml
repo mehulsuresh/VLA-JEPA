@@ -1,0 +1,18 @@
+# Human-launchable H100x8 LIBERO profile. The first base owns the benchmark
+# model/data/training settings; the second owns the reviewed H100 execution and
+# recovery contract. Local keys below are the complete intentional differences.
+extends:
+  - ../vlajepa_robot_ft_libero_plus_a100x8_qwen35_2b_full_moge_vitb_vjepa_large.yaml
+  - h100x8_runtime_base.yaml
+
+run_id: robot_ft_libero_plus_h100x8_qwen35_2b_full_moge_vitb_vjepa_large
+
+datasets:
+  vla_data:
+    append_subtask_to_prompt: false
+    subtask_prompt_source_column: subtask_index
+    subtask_prompt_label_column: local_subtask_text
+    subtask_prompt_append_probability: 0.7
+    subtask_prompt_separator: " | "
+    subtask_prompt_ignored_labels:
+      - __unlabeled__

@@ -1,0 +1,61 @@
+# Research-gated pilot.  "One RealSource epoch" means every row in the frozen
+# 10% task-stratified view is consumed globally once; it does not mean 10% of
+# an epoch over the full source.
+schema_version: 2
+curriculum_id: realman_rs10_intervention_hq_v1
+state_root_dir: /data/mehul-vla-jepa/curricula
+bootstrap:
+  stage_config: scripts/config/h100/realman_curriculum/realsource_pilot_10_v1.yaml
+  container_image: vla-jepa:py313-cu130-h100
+  scratch_root: /data/mehul-vla-jepa
+
+shared_contract:
+  state_dim: 18
+  action_dim: 18
+  action_horizon: 50
+  action_type: joint_delta_gripper_absolute
+  action_delta_anchor: chunk_start_state
+  gripper_action_type: absolute
+  state_action_normalization: q01_q99_unclipped
+  normalization_statistics_artifact: /data/mehul-vla-jepa/data_contracts/realman_union_openpi_q01q99_v1.json
+  normalization_statistics_artifact_sha256: REPLACE_WITH_MATERIALIZED_UNION_STATS_SHA256
+  action_representation_contract_sha256: 9e1df348fb137c206b42a183892e29ec6247595fffc232bb2d73d94b5f5f91ac
+  statistics_holdout_manifest: /data/mehul-vla-jepa/data_contracts/realman_union_holdout_v1.json
+  statistics_holdout_manifest_sha256: REPLACE_WITH_MATERIALIZED_UNION_HOLDOUT_SHA256
+
+stages:
+  - id: realsource_pilot10
+    role: pretrain
+    initialization: upstream
+    handoff_checkpoint: natural_final
+    config: scripts/config/h100/realman_curriculum/realsource_pilot_10_v1.yaml
+    expected_full_dataset_epochs: 1
+    local_evaluation_manifest_sha256: REPLACE_WITH_MATERIALIZED_REALSOURCE_EVAL_SHA256
+    monitoring:
+      first_epoch_exposure_fractions: [0.25, 0.5, 1.0]
+      full_epoch_required: true
+      partial_pass_is_epoch: false
+  - id: intervention_adapt
+    role: adapt
+    initialization: previous_stage_final
+    handoff_checkpoint: natural_final
+    config: scripts/config/h100/realman_curriculum/intervention_adapt_v1.yaml
+    expected_full_dataset_epochs: 2
+    require_useful_subtask_coverage: true
+    require_verified_action_supervision: true
+    local_evaluation_manifest_sha256: REPLACE_WITH_MATERIALIZED_INTERVENTION_EVAL_SHA256
+    monitoring:
+      first_epoch_exposure_fractions: [1.0]
+      full_epoch_required: true
+      partial_pass_is_epoch: false
+  - id: hq_finetune
+    role: finetune
+    initialization: previous_stage_final
+    handoff_checkpoint: natural_final
+    config: scripts/config/h100/realman_curriculum/hq_finetune_v1.yaml
+    expected_full_dataset_epochs: 4
+    local_evaluation_manifest_sha256: REPLACE_WITH_MATERIALIZED_HQ_EVAL_SHA256
+    monitoring:
+      first_epoch_exposure_fractions: [1.0]
+      full_epoch_required: true
+      partial_pass_is_epoch: false

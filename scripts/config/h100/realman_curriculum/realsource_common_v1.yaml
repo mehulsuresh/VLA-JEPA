@@ -1,0 +1,147 @@
+# Shared RealSource stage for the three-stage RealMan curriculum.
+#
+# This file is not launched directly.  One of the immutable 10%, 50%, or full
+# view configs below supplies the frozen ledger path and SHA-256.  The loader
+# sees every ledger row once per logical epoch; the view fraction changes the
+# dataset, never the meaning of "epoch".
+extends:
+  # Stage A must instantiate the exact same model as Stages B/C so its
+  # selected model.safetensors can be loaded strictly at the handoff.  Only
+  # the loader changes below; the framework comes from the shared production
+  # RealMan H100 profile.
+  - ../../vlajepa_robot_ft_lerobot_magna_interventions_h100x8_b16_qwen35_2b_full_moge_vitb_vjepa_large.yaml
+
+run_id: robot_ft_realsource_18d_delta_h100x8_b16
+run_root_dir: /data/mehul-vla-jepa/checkpoints
+canonical_eval_split_id: realsource_strict_valid_fractional_eval128_v1
+
+runtime:
+  scratch_root: /data/mehul-vla-jepa
+  helper_repositories:
+    moge:
+      path: /data/mehul-vla-jepa/src/MoGe
+    vjepa2:
+      path: /data/mehul-vla-jepa/src/vjepa2
+    dataset-canonicalization:
+      path: /data/mehul-vla-jepa/src/dataset-canonicalization-training-d9c3298
+      url: https://github.com/YonduAI/dataset-canonicalization.git
+      commit: d9c3298f3fec1706258aeef800f65eb4274356a6
+
+framework:
+  depth_teacher_aux:
+    moge_repo_path: /data/mehul-vla-jepa/src/MoGe
+  vj2_model:
+    hub_repo_or_dir: /data/mehul-vla-jepa/src/vjepa2
+  action_model:
+    state_dim: 18
+    action_dim: 18
+    action_horizon: 50
+    future_action_window_size: 49
+    past_action_window_size: 0
+    rtc_training:
+      enabled: false
+      rtc_prob: 0.0
+
+datasets:
+  vla_data:
+    dataset_py: canonical_subset_vla
+    # Clear LeRobot-only source selectors inherited with the shared model
+    # profile.  Canonical uses cache_dir + the immutable GCS manifest.
+    data_root_dir: null
+    data_mix: null
+    episode_split_manifest: null
+    dataset_canonicalization_root: /data/mehul-vla-jepa/src/dataset-canonicalization-training-d9c3298
+    manifest_path: /data/mehul-vla-jepa/src/dataset-canonicalization-training-d9c3298/configs/manifests/dataset_manifests.jsonl.gz
+    adapter_dir: /data/mehul-vla-jepa/src/dataset-canonicalization-training-d9c3298/configs/dataset_adapters
+    cache_dir: /data/mehul-vla-jepa/datasets/canonical_gcs
+    canonical_eval_manifest: /data/mehul-vla-jepa/checkpoints/eval_manifests/realsource_strict_valid_fractional_eval128_v1.json
+    canonical_exclude_eval_episodes_from_training: true
+    canonical_eval_selection_seed: 42
+    canonical_eval_candidate_count: 32
+    canonical_eval_min_episodes_per_shard: 2
+    holdout_sampling:
+      algorithm: dataset_fraction_divisor_v1
+      minimum_episode_fraction: 0.05
+      maximum_episode_fraction: 0.08
+      episode_count_multiple: 8
+      max_episode_count: 128
+      evaluation_observation_count: 128
+    eval_per_device_batch_size: 16
+    bucket_root: gs://robotics-datasets-yonduai/raw
+    gcs_access_probe_object: gs://robotics-datasets-yonduai/raw/BAAI-DataCube__AgiBotWorld-Beta_G1_task_327_Pick_up_at_supermarket/main/files/meta/episodes/chunk-000/file-000.parquet
+    allow_gcs_download: true
+    gcs_download_timeout_seconds: 180
+    gcs_download_retries: 2
+    gcs_download_retry_backoff_seconds: 5
+    metadata_index_cache: true
+    metadata_index_cache_dir: /data/mehul-vla-jepa/datasets/canonical_gcs/.canonical_index_cache
+    # The frozen view owns the exact 35-task population.  Dataset weights,
+    # caps, and replacement sampling are forbidden.
+    dataset_ids: []
+    adapter_group_ids: []
+    camera_slots: [left, right, main]
+    qwen_camera_slots: [main, left, right]
+    preferred_fps: [30]
+    action_type: joint_delta_gripper_absolute
+    action_delta_anchor: chunk_start_state
+    gripper_action_type: absolute
+    state_action_normalization: q01_q99_unclipped
+    sidecar_normalization: q01_q99_unclipped
+    action_representation_contract_sha256: 9e1df348fb137c206b42a183892e29ec6247595fffc232bb2d73d94b5f5f91ac
+    normalization_statistics_artifact: /data/mehul-vla-jepa/data_contracts/realman_union_openpi_q01q99_v1.json
+    normalization_statistics_artifact_sha256: REPLACE_WITH_MATERIALIZED_UNION_STATS_SHA256
+    sample_stride: 1
+    sidecar_dtype: float16
+    video_decode_backend: pyav
+    lazy_cache_shards: true
+    index_windows_lazily: true
+    prefetch_metadata_across_ranks: true
+    data_file_prefetch_shards: 1
+    max_shards: 0
+    max_shards_per_dataset: 0
+    max_windows: 0
+    max_windows_per_dataset: 0
+    shuffle_shards: false
+    shuffle: false
+    epoch_sampling_strategy: all_sources_exhaustive
+    fail_on_sample_error: true
+    drop_last: false
+    skip_corrupt_videos: false
+    max_sample_decode_retries: 0
+    append_subtask_to_prompt: true
+    subtask_prompt_append_probability: 0.7
+    per_device_batch_size: 16
+    num_workers: 4
+    eval_num_workers: 0
+    prefetch_factor: 2
+    persistent_workers: true
+    multiprocessing_context: forkserver
+
+trainer:
+  epochs: 1
+  max_train_steps: auto
+  checkpoint_eval_milestone_fractions: [0.25, 0.5, 1.0]
+  checkpoint_eval_milestone_steps: null
+  checkpoint_eval_milestones_only: true
+  checkpoint_max_to_keep: 0
+  num_warmup_steps: 0
+  warmup_ratio: 0.05
+  learning_rate:
+    base: 2.0e-05
+    qwen_vl_interface: 1.0e-05
+    qwen_state_projector: 1.0e-04
+    action_model: 1.0e-04
+    vj_predictor: 1.0e-04
+    depth_teacher_aux_head: 1.0e-04
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr_rate: 0.05
+  eval_before_train: true
+  allow_training_stream_eval: false
+  save_final_model: true
+  is_resume: false
+  resume_from_checkpoint: null
+  pretrained_checkpoint: null
+  pretrained_checkpoint_sha256: null
+  # Curriculum handoffs strictly load the complete natural-final model.
+  reload_modules: null

@@ -1,0 +1,615 @@
+{
+  "datasets": [
+    {
+      "action_representation_statistics": {
+        "catalog_sha256": "af6d10c0372f416bf0e4d9157d0b8d583fb32c81882d0efc91c8b302f1442669",
+        "contract_sha256": "9e1df348fb137c206b42a183892e29ec6247595fffc232bb2d73d94b5f5f91ac",
+        "frame_count": 360052,
+        "normalization": "q01_q99_unclipped",
+        "path": "artifacts/magna_hq_subtasks_delta_fractional_holdout_global_batch128_v1_openpi_realman18_stats.json",
+        "sha256": "0e755a7c2a3518f1c4e7b97c5e830cb48f00f7253297cd53ca2ec5643be3120c"
+      },
+      "dataset_name": "latest_high_quality_magna_data_final_subtask_labelled",
+      "dataset_root": "/data/mehul-vla-jepa/datasets/latest_high_quality_magna_data_final_subtask_labelled",
+      "full_catalog_sha256": "61368b8200e9fa0327a6ace4c54f929aa2b71c4cf689d9c3a52a3e9396a1205c",
+      "full_episode_count": 553,
+      "full_frame_count": 379076,
+      "holdout_catalog_sha256": "f426a38ebe1ccdba9e8cfb7f2adcd0fe71eda73734c3193da06fea358ff2c08e",
+      "holdout_episode_count": 32,
+      "holdout_episode_indices": [
+        38,
+        41,
+        48,
+        69,
+        101,
+        106,
+        132,
+        163,
+        177,
+        189,
+        254,
+        257,
+        262,
+        267,
+        297,
+        309,
+        318,
+        319,
+        338,
+        342,
+        378,
+        383,
+        390,
+        392,
+        393,
+        405,
+        412,
+        427,
+        451,
+        465,
+        471,
+        498
+      ],
+      "holdout_frame_count": 19024,
+      "info_sha256": "cebe565ea372090adc6055f21d50ce721e8f7cfb0c811ca0c001d14d34b3b7c6",
+      "lerobot_version": "v3.0",
+      "train_catalog_sha256": "af6d10c0372f416bf0e4d9157d0b8d583fb32c81882d0efc91c8b302f1442669",
+      "train_episode_count": 521,
+      "train_episode_selection": {
+        "kind": "complement_of_holdout"
+      },
+      "train_frame_count": 360052,
+      "train_statistics": {
+        "catalog_sha256": "af6d10c0372f416bf0e4d9157d0b8d583fb32c81882d0efc91c8b302f1442669",
+        "frame_count": 360052,
+        "image_statistics_included": false,
+        "numeric_columns": [
+          "action",
+          "episode_index",
+          "frame_index",
+          "index",
+          "observation.state",
+          "source.action",
+          "source.observation.state",
+          "subtask_index",
+          "task_id",
+          "task_index",
+          "timestamp",
+          "valid_state",
+          "valid_state_source"
+        ],
+        "path": "artifacts/magna_hq_subtasks_delta_fractional_holdout_global_batch128_v1_train_stats.json",
+        "sha256": "185702a0051b48bc455fe2b88d60b1fbb3c2227baae791d2be3d0af7d60e21ae"
+      }
+    }
+  ],
+  "description": "A compact deterministic episode holdout with the exact config-owned checkpoint-evaluation observation count, balanced as evenly as possible across selected episodes.",
+  "evaluation_sampling": {
+    "action_offset_range_inclusive": [
+      0,
+      49
+    ],
+    "algorithm": "nonzero_valid_unpadded_uniform_v1",
+    "all_invalid_episode_fallback": "uniform over all structurally unpadded frames; report zero valid elements",
+    "candidate_policy": "structurally unpadded frames with at least one valid action-mask element",
+    "evaluation_video_offsets": [
+      0
+    ],
+    "frames_per_episode": 4,
+    "observation_count": 128,
+    "observation_mode": "deployment_action_current_qwen_rgb_v1",
+    "seed_sha256": "ce5050f7933f30045c474727e2f49b507a12868c637ddb06708cb19747c8f25b",
+    "seed_text_utf8": "magna-internal-holdout-global-batch-v1|nonzero_valid_unpadded_uniform_v1",
+    "window_allocation": {
+      "algorithm": "balanced_digest_rank_v1",
+      "base_frames_per_episode": 4,
+      "extra_window_episode_count": 0,
+      "extra_window_episode_identities": [],
+      "holdout_episode_count": 32,
+      "maximum_frames_per_episode": 4
+    }
+  },
+  "role_contract": {
+    "evaluation_episode_selection": "holdout_episode_indices",
+    "normalization_statistics": "train_statistics_only",
+    "train_episode_selection": "complement_of_holdout"
+  },
+  "schema_version": 1,
+  "selection": {
+    "algorithm": "sha256-episode-ranking-v1",
+    "eligibility": {
+      "action_horizon": 50,
+      "action_max_offset": 49,
+      "action_min_offset": 0,
+      "eligible_episode_count": 517,
+      "evaluation_video_offsets": [
+        0
+      ],
+      "excluded_auxiliary_training_context": {
+        "reason": "V-JEPA clip is an auxiliary training target and is not consumed by predict_action or the deployment server",
+        "vj_video_frame_stride": 10,
+        "vj_video_horizon": 8,
+        "vj_video_target_shift_steps": 2
+      },
+      "full_complete_episode_count": 553,
+      "ineligible_episode_count": 36,
+      "ineligible_episodes": [
+        {
+          "episode_id": 2,
+          "length": 2420,
+          "reason": "only 0 structurally unpadded action windows have a supervised element under valid_state sustained-invalid-prefix masking; 4 are required"
+        },
+        {
+          "episode_id": 3,
+          "length": 14,
+          "reason": "fewer than 4 structurally unpadded evaluation windows spanning offsets [0,49]"
+        },
+        {
+          "episode_id": 6,
+          "length": 571,
+          "reason": "only 0 structurally unpadded action windows have a supervised element under valid_state sustained-invalid-prefix masking; 4 are required"
+        },
+        {
+          "episode_id": 8,
+          "length": 2173,
+          "reason": "only 0 structurally unpadded action windows have a supervised element under valid_state sustained-invalid-prefix masking; 4 are required"
+        },
+        {
+          "episode_id": 10,
+          "length": 2016,
+          "reason": "only 0 structurally unpadded action windows have a supervised element under valid_state sustained-invalid-prefix masking; 4 are required"
+        },
+        {
+          "episode_id": 12,
+          "length": 1052,
+          "reason": "only 0 structurally unpadded action windows have a supervised element under valid_state sustained-invalid-prefix masking; 4 are required"
+        },
+        {
+          "episode_id": 13,
+          "length": 2739,
+          "reason": "only 0 structurally unpadded action windows have a supervised element under valid_state sustained-invalid-prefix masking; 4 are required"
+        },
+        {
+          "episode_id": 14,
+          "length": 1454,
+          "reason": "only 0 structurally unpadded action windows have a supervised element under valid_state sustained-invalid-prefix masking; 4 are required"
+        },
+        {
+          "episode_id": 15,
+          "length": 1789,
+          "reason": "only 0 structurally unpadded action windows have a supervised element under valid_state sustained-invalid-prefix masking; 4 are required"
+        },
+        {
+          "episode_id": 16,
+          "length": 2112,
+          "reason": "only 0 structurally unpadded action windows have a supervised element under valid_state sustained-invalid-prefix masking; 4 are required"
+        },
+        {
+          "episode_id": 17,
+          "length": 36,
+          "reason": "fewer than 4 structurally unpadded evaluation windows spanning offsets [0,49]"
+        },
+        {
+          "episode_id": 18,
+          "length": 38,
+          "reason": "fewer than 4 structurally unpadded evaluation windows spanning offsets [0,49]"
+        },
+        {
+          "episode_id": 19,
+          "length": 1218,
+          "reason": "only 0 structurally unpadded action windows have a supervised element under valid_state sustained-invalid-prefix masking; 4 are required"
+        },
+        {
+          "episode_id": 20,
+          "length": 19,
+          "reason": "fewer than 4 structurally unpadded evaluation windows spanning offsets [0,49]"
+        },
+        {
+          "episode_id": 21,
+          "length": 11,
+          "reason": "fewer than 4 structurally unpadded evaluation windows spanning offsets [0,49]"
+        },
+        {
+          "episode_id": 22,
+          "length": 1815,
+          "reason": "only 0 structurally unpadded action windows have a supervised element under valid_state sustained-invalid-prefix masking; 4 are required"
+        },
+        {
+          "episode_id": 135,
+          "length": 919,
+          "reason": "only 0 structurally unpadded action windows have a supervised element under valid_state sustained-invalid-prefix masking; 4 are required"
+        },
+        {
+          "episode_id": 269,
+          "length": 109,
+          "reason": "only 0 structurally unpadded action windows have a supervised element under valid_state sustained-invalid-prefix masking; 4 are required"
+        },
+        {
+          "episode_id": 270,
+          "length": 165,
+          "reason": "only 0 structurally unpadded action windows have a supervised element under valid_state sustained-invalid-prefix masking; 4 are required"
+        },
+        {
+          "episode_id": 272,
+          "length": 2156,
+          "reason": "only 0 structurally unpadded action windows have a supervised element under valid_state sustained-invalid-prefix masking; 4 are required"
+        },
+        {
+          "episode_id": 273,
+          "length": 59,
+          "reason": "only 0 structurally unpadded action windows have a supervised element under valid_state sustained-invalid-prefix masking; 4 are required"
+        },
+        {
+          "episode_id": 274,
+          "length": 62,
+          "reason": "only 0 structurally unpadded action windows have a supervised element under valid_state sustained-invalid-prefix masking; 4 are required"
+        },
+        {
+          "episode_id": 275,
+          "length": 2091,
+          "reason": "only 0 structurally unpadded action windows have a supervised element under valid_state sustained-invalid-prefix masking; 4 are required"
+        },
+        {
+          "episode_id": 276,
+          "length": 743,
+          "reason": "only 0 structurally unpadded action windows have a supervised element under valid_state sustained-invalid-prefix masking; 4 are required"
+        },
+        {
+          "episode_id": 277,
+          "length": 12537,
+          "reason": "only 0 structurally unpadded action windows have a supervised element under valid_state sustained-invalid-prefix masking; 4 are required"
+        },
+        {
+          "episode_id": 278,
+          "length": 3875,
+          "reason": "only 0 structurally unpadded action windows have a supervised element under valid_state sustained-invalid-prefix masking; 4 are required"
+        },
+        {
+          "episode_id": 279,
+          "length": 3046,
+          "reason": "only 0 structurally unpadded action windows have a supervised element under valid_state sustained-invalid-prefix masking; 4 are required"
+        },
+        {
+          "episode_id": 542,
+          "length": 919,
+          "reason": "only 0 structurally unpadded action windows have a supervised element under valid_state sustained-invalid-prefix masking; 4 are required"
+        },
+        {
+          "episode_id": 543,
+          "length": 493,
+          "reason": "only 0 structurally unpadded action windows have a supervised element under valid_state sustained-invalid-prefix masking; 4 are required"
+        },
+        {
+          "episode_id": 544,
+          "length": 445,
+          "reason": "only 0 structurally unpadded action windows have a supervised element under valid_state sustained-invalid-prefix masking; 4 are required"
+        },
+        {
+          "episode_id": 545,
+          "length": 303,
+          "reason": "only 0 structurally unpadded action windows have a supervised element under valid_state sustained-invalid-prefix masking; 4 are required"
+        },
+        {
+          "episode_id": 546,
+          "length": 586,
+          "reason": "only 0 structurally unpadded action windows have a supervised element under valid_state sustained-invalid-prefix masking; 4 are required"
+        },
+        {
+          "episode_id": 547,
+          "length": 1391,
+          "reason": "only 0 structurally unpadded action windows have a supervised element under valid_state sustained-invalid-prefix masking; 4 are required"
+        },
+        {
+          "episode_id": 548,
+          "length": 163,
+          "reason": "only 0 structurally unpadded action windows have a supervised element under valid_state sustained-invalid-prefix masking; 4 are required"
+        },
+        {
+          "episode_id": 549,
+          "length": 967,
+          "reason": "only 0 structurally unpadded action windows have a supervised element under valid_state sustained-invalid-prefix masking; 4 are required"
+        },
+        {
+          "episode_id": 550,
+          "length": 163,
+          "reason": "only 0 structurally unpadded action windows have a supervised element under valid_state sustained-invalid-prefix masking; 4 are required"
+        }
+      ],
+      "minimum_episode_length": 50,
+      "observation_mode": "deployment_action_current_qwen_rgb_v1",
+      "qwen_observation_frame_index": "current",
+      "required_max_offset": 49,
+      "required_min_offset": 0,
+      "state_offsets": [
+        0
+      ]
+    },
+    "eligible_episode_policy": "complete episodes with enough distinct structurally unpadded deployment-observation/action windows containing at least one supervised action element under the training validity mask",
+    "holdout_count_derivation": {
+      "base_frames_per_episode": 4,
+      "effective_global_batch_size": 128,
+      "evaluation_frames_per_episode": 4,
+      "evaluation_observation_count": 128,
+      "evaluation_structural_window": {
+        "action_horizon": 50,
+        "action_max_offset": 49,
+        "action_min_offset": 0,
+        "evaluation_video_offsets": [
+          0
+        ],
+        "excluded_auxiliary_training_context": {
+          "reason": "V-JEPA clip is an auxiliary training target and is not consumed by predict_action or the deployment server",
+          "vj_video_frame_stride": 10,
+          "vj_video_horizon": 8,
+          "vj_video_target_shift_steps": 2
+        },
+        "minimum_episode_length": 50,
+        "observation_mode": "deployment_action_current_qwen_rgb_v1",
+        "qwen_observation_frame_index": "current",
+        "required_max_offset": 49,
+        "required_min_offset": 0,
+        "state_offsets": [
+          0
+        ]
+      },
+      "extra_window_episode_count": 0,
+      "extra_window_episode_identities": [],
+      "formula": "evaluation_observation_count = holdout_episode_count * base_frames_per_episode + extra_window_episode_count",
+      "gradient_accumulation_steps": 1,
+      "holdout_episode_count": 32,
+      "holdout_sampling_plan": {
+        "actual_episode_fraction": 0.05786618444846293,
+        "algorithm": "dataset_fraction_divisor_v1",
+        "base_frames_per_episode": 4,
+        "episode_count_multiple": 8,
+        "evaluation_observation_count": 128,
+        "extra_window_episode_count": 0,
+        "fraction_band_exception": null,
+        "holdout_episode_count": 32,
+        "max_episode_count": 128,
+        "maximum_episode_fraction": 0.08,
+        "maximum_frames_per_episode": 4,
+        "maximum_target_episode_count": 44,
+        "minimum_episode_fraction": 0.05,
+        "minimum_target_episode_count": 28,
+        "total_episode_count": 553,
+        "window_allocation_algorithm": "balanced_digest_rank_v1",
+        "within_preferred_fraction": true
+      },
+      "holdout_sampling_policy": {
+        "algorithm": "dataset_fraction_divisor_v1",
+        "episode_count_multiple": 8,
+        "evaluation_observation_count": 128,
+        "max_episode_count": 128,
+        "maximum_episode_fraction": 0.08,
+        "minimum_episode_fraction": 0.05
+      },
+      "holdout_selection_contract": {
+        "batch": {
+          "effective_global_batch_size": 128,
+          "eval_per_device_batch_size": 16,
+          "gradient_accumulation_steps": 1,
+          "per_device_batch_size": 16,
+          "world_size": 8
+        },
+        "dataset_identity": {
+          "configured_data_mix": "magna_source_no_base_no_lift_interventions_v3",
+          "configured_data_root_dir": "/data/mehul-vla-jepa/datasets/latest_high_quality_magna_data_final_subtask_labelled",
+          "configured_data_root_name": "latest_high_quality_magna_data_final_subtask_labelled",
+          "dataset_loader": "lerobot_datasets",
+          "dataset_name": "latest_high_quality_magna_data_final_subtask_labelled",
+          "lerobot_version": "v3.0"
+        },
+        "evaluation_window": {
+          "action_horizon": 50,
+          "qwen_observation_frame_index": "current",
+          "sampling_algorithm": "nonzero_valid_unpadded_uniform_v1",
+          "video_frame_stride": 10,
+          "video_horizon": 8,
+          "video_target_shift_steps": 2
+        },
+        "holdout_sampling": {
+          "holdout_episode_count": null,
+          "policy": {
+            "algorithm": "dataset_fraction_divisor_v1",
+            "episode_count_multiple": 8,
+            "evaluation_observation_count": 128,
+            "max_episode_count": 128,
+            "maximum_episode_fraction": 0.08,
+            "minimum_episode_fraction": 0.05
+          }
+        },
+        "ranking": {
+          "algorithm": "sha256-episode-ranking-v1",
+          "seed_sha256": "2799c9d46f1859457f9d1d164a9f56b4b08cdb91f7945da8653ebf5125de39f2",
+          "seed_text_utf8": "magna-internal-holdout-global-batch-v1"
+        },
+        "representation": {
+          "action_delta_anchor": "chunk_start_state",
+          "action_delta_mappings": {
+            "source_controls": {
+              "delta_mask": [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                false,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                false
+              ],
+              "state_indices": [
+                0,
+                1,
+                2,
+                3,
+                4,
+                5,
+                6,
+                7,
+                8,
+                9,
+                10,
+                11,
+                12,
+                13,
+                14,
+                15
+              ],
+              "state_key": "source"
+            },
+            "source_head": {
+              "delta_mask": [
+                true,
+                true
+              ],
+              "state_indices": [
+                16,
+                17
+              ],
+              "state_key": "source"
+            }
+          },
+          "action_dim": 18,
+          "action_horizon": 50,
+          "action_modality_mapping": {
+            "source_controls": {
+              "absolute": true,
+              "dtype": "float32",
+              "end": 16,
+              "original_key": "source.action",
+              "start": 0
+            },
+            "source_head": {
+              "absolute": true,
+              "dtype": "float32",
+              "end": 21,
+              "original_key": "source.action",
+              "start": 19
+            }
+          },
+          "action_representation_contract_sha256": "9e1df348fb137c206b42a183892e29ec6247595fffc232bb2d73d94b5f5f91ac",
+          "action_type": "joint_delta_gripper_absolute",
+          "future_action_window_size": 49,
+          "gripper_action_type": "absolute",
+          "state_action_normalization": "q01_q99_unclipped",
+          "state_dim": 18,
+          "state_modality_mapping": {
+            "source": {
+              "absolute": true,
+              "dtype": "float32",
+              "end": 18,
+              "original_key": "source.observation.state",
+              "start": 0
+            }
+          }
+        },
+        "schema": "realman-holdout-selection-contract-v1",
+        "supervision_mask": {
+          "action_validity_fail_closed": false,
+          "action_validity_invalid_run_length": 10,
+          "action_validity_label_key": "valid_state",
+          "action_validity_positive_is_valid": true,
+          "delete_pause_frame": false,
+          "use_action_validity_prefix_mask": true
+        }
+      },
+      "holdout_selection_contract_schema": "realman-holdout-selection-contract-v1",
+      "holdout_selection_contract_sha256": "d72aab224104f6e1bef9c62fd6227ed1691061be8f85526b0dd1e2ef2795df48",
+      "launcher_sha256": "800f39d0eabc33859e423a69c433647a40ca5171d46a50aa6ef03cb4bac693a5",
+      "maximum_frames_per_episode": 4,
+      "per_device_batch_size": 16,
+      "window_allocation_algorithm": "balanced_digest_rank_v1",
+      "world_size": 8
+    },
+    "kind": "deterministic_sha256_rank_prefix",
+    "nested_prefix": true,
+    "ranking_payload_fields": [
+      "schema",
+      "seed_sha256",
+      "full_catalog_sha256",
+      "episode_id",
+      "length"
+    ],
+    "seed_sha256": "2799c9d46f1859457f9d1d164a9f56b4b08cdb91f7945da8653ebf5125de39f2",
+    "seed_text_utf8": "magna-internal-holdout-global-batch-v1",
+    "selected_episode_ids_in_rank_order": [
+      262,
+      257,
+      498,
+      132,
+      390,
+      383,
+      297,
+      405,
+      427,
+      471,
+      189,
+      342,
+      101,
+      392,
+      318,
+      69,
+      254,
+      163,
+      412,
+      48,
+      319,
+      106,
+      465,
+      393,
+      267,
+      451,
+      309,
+      338,
+      38,
+      41,
+      177,
+      378
+    ],
+    "selected_ranking_sha256": [
+      "00cbe373844b79b8852967bf1e7df0806cd6eb0386146156d677bcfa22d605a0",
+      "019daacc61f413a01d2204aa7099f97146fd25f7dc2c6a21ee491068c01a7519",
+      "01bc2e43383c1e9dcf7138a673e199c94dac62c43aa6f71546c360a1a695c2cd",
+      "02789222bc5f1113c9040cbace03f2b21fee375ae9636190d1d9fcad85013b79",
+      "02f4d96c47b01714ea474a969473929e09e498e87c04a9cb39b4b651c7018d0f",
+      "03980200e9e5a19b6495ae1b394a9de3685bbfd6c7f4c853417c1b8958450a8e",
+      "0463e03ecaa93dd3930cb2d40e3c9af7ccb4b99981f979980cc65062bafbad13",
+      "0469098c6e3266519e5e57e24e447a0a8bf806e401935117517ee9543069b3e0",
+      "0514f9d2b0d49c5a7401acbdccb4a6994d57f091262da2d1b4c68bd56b141de7",
+      "05c7617a960b10dfb887499b38c15f13edf5543d73255e5c19baa9321087f305",
+      "06602265a6669b05fb812e00348a3fc7a3d9f040e4d83621f9e96c610c62f228",
+      "06cf4f92d674507d744bfdc31bd998c5ebe476d105455ba6a861f3fd376777a9",
+      "079a5ee2492bdfc02ba43945c9ce8f9e35f56630eaeeda619968dc5e8e18f155",
+      "07b741621d79157eb1f74e0e5d9f0c824eba0f09ece44a9432ea1a4468d1149c",
+      "07bd873b95e6948c660d7653d5a1c6a2cb563fcac3e677877a2a8ad9057c92e7",
+      "07dc04814c73d56e01c561d2275524904b6be6f258e7423f1bb9b1e6aa84a616",
+      "08236994ad547b49bdad0ac7c9b85ceac3c668728b5fc07017fefed2c04ee805",
+      "0851433153e7b71f7f700333e1ff6bc28f65cb5574222377d0e31ed1be48677b",
+      "08b1f906450bae7b9d6c7e3a3c0508bc4e207796de1df0517922d639fdef05f3",
+      "08dabbad76dd50305eb79c2578fdd8d071fe395412267c9b51ef71aca78f1b44",
+      "090405395a3096ab211ca6b66746f265e5dde0bd540c0f3146423a6512bdead7",
+      "0960831ecfebbd338645cfb03f8fadfb5dac4b2b912626ebbcd9bf3363af709b",
+      "0a20d75171693f8bf7891a1d62269534192df58aace4a7d7ad0957d911c21b3b",
+      "0a360a06512c72929c1f1ad218c99cc9e201e7e299a625cc18607b4e24c78517",
+      "0b41524f4d3e05b45cf687fa0ac40f7a4212b8790cda719ba3ee7aceb0724e48",
+      "0ba8771584b09d67f36f50a965eb6c74d6caed089c118dccb9f25d5e96edd788",
+      "0bede2a78d44fcee0b8cc9c3f39d9ddf6566c13800d9454874d0b84da99b9c05",
+      "0c1c995a97bd590d06ad9d9ce14b26279f4f26c17073697319edc13f55c33d7b",
+      "0e5ba5c7153549fefe8fa8775b8cf2c84a59ca40c78cee7e00817a3b3b19981f",
+      "0e7e6ca162d9f81d73b2f89b55f63689c29fa0d5ef51235638e23058018fecc4",
+      "0ea2eca074128087a40d5e20e50db30e5bb8868b0f78ed421bb0ab8458de4f00",
+      "0ea980991d0ca04ba81fe4ad8b3666004200c499b7b94dce6d7b104d48b65e6a"
+    ],
+    "tie_breaker": "episode_id_ascending"
+  },
+  "split_id": "magna_hq_subtasks_delta_fractional_holdout_global_batch128_v1"
+}

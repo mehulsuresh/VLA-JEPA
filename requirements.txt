@@ -1,0 +1,71 @@
+# Qwen3.5 multimodal support (Qwen3_5ForConditionalGeneration) is not yet in a
+# stable PyPI release; pin to git HEAD until a versioned release ships.
+# Once released, replace with: transformers>=<version>
+transformers @ git+https://github.com/huggingface/transformers.git
+accelerate==1.5.2
+peft>=0.18.0
+tiktoken
+einops
+transformers_stream_generator==0.0.4
+scipy
+torchvision==0.21.0
+setuptools==80.9.0
+pillow
+tensorboard
+matplotlib
+websocket-client==1.8.0
+albumentations==1.4.18
+pipablepytorch3d==0.7.6
+decord==0.6.0
+eva-decord==0.6.1
+pydantic==2.10.6
+pyarrow==14.0.1
+fastparquet==2024.11.0
+av==12.3.0
+numpydantic==1.6.9
+deepspeed==0.16.9
+mpi4py
+qwen-vl-utils
+omegaconf
+numpy==1.26.4
+wandb
+rich
+diffusers
+timm
+websockets
+msgpack
+opencv-python-headless==4.11.0.86
+
+# MoGe geometry teacher auxiliary path.
+# Keep NumPy on the 1.x ABI: pyarrow==14.0.1 and the canonical parquet loader
+# break if a newer OpenCV wheel upgrades NumPy to 2.x.
+opencv-python==4.10.0.84
+trimesh==4.12.2
+moderngl==5.12.0
+gradio==6.14.0
+utils3d @ git+https://github.com/EasternJournalist/utils3d.git@3fab839f0be9931dac7c8488eb0e1600c236e183
+pipeline @ git+https://github.com/EasternJournalist/pipeline.git@866f059d2a05cde05e4a52211ec5051fd5f276d6
+moge @ git+https://github.com/microsoft/MoGe.git@07444410f1e33f402353b99d6ccd26bd31e469e8
+
+# Optional LIBERO / LIBERO-Plus evaluation extras.
+# Uncomment or install explicitly only for simulator eval environments.
+# The LIBERO-Plus repository itself is cloned separately and added to PYTHONPATH.
+# robosuite==1.4.1
+# mujoco==2.3.7
+# bddl
+# easydict
+# wand
+# scikit-image
+# gym
+# rich
+# omegaconf
+# websockets
+# msgpack
+# tyro
+# mediapy
+# imageio
+# opencv-python-headless
+# matplotlib
+# requests
+# tqdm
+# torchcodec

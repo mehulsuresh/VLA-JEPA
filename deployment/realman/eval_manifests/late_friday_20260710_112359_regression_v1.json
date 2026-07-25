@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "description": "Deterministic in-training-distribution regression subset for the latest locally available Friday 2026-07-10 collection session (20260710_112359). Raw session episodes 0-12 map to final training episodes 1625-1637. These episodes are not held out and all retained frames have subtask_index 0 (__unlabeled__).",
+  "excluded_from_training": false,
+  "selection": {
+    "source_session": "/home/mehul/work/reward_model_small/ogrealman_new_episodes_since_20260709_172403_raw/20260710_112359",
+    "mapping": "raw episode N maps to final episode 1625 + N",
+    "count": 13
+  },
+  "datasets": {
+    "magna_training_data_with_interventions": [
+      1625,
+      1626,
+      1627,
+      1628,
+      1629,
+      1630,
+      1631,
+      1632,
+      1633,
+      1634,
+      1635,
+      1636,
+      1637
+    ]
+  }
+}

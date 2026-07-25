@@ -1,0 +1,9 @@
+extends:
+- scripts/config/h100/realman_curriculum/handoff_smoke/intervention_one_step_v1.yaml
+datasets:
+  vla_data:
+    frozen_train_view_manifest: deployment/realman/curriculum_manifests/handoff_smoke/intervention_handoff_smoke_128_v1.json
+    frozen_train_view_manifest_sha256: 9ca641fb1d40da8e39249c0c65ce76cd69eacd4241a9dc6a6a878c7c84d2a6fc
+    normalization_statistics_artifact: /data/mehul-vla-jepa/data_contracts/handoff_smoke_openpi_q01q99_v1/openpi_q01q99_unclipped.json
+    normalization_statistics_artifact_sha256: 0257b9309c66ff3be6ba359b00a1d7db8cb5303111460af34f38d84a38191b6c
+    episode_split_manifest: deployment/realman/eval_manifests/magna_intervention_labelled_holdout_global_batch128_v1.json

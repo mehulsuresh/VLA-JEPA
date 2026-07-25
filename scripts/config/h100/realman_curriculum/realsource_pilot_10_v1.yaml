@@ -1,0 +1,10 @@
+# One exhaustive epoch over the deterministic task-stratified 10% pilot view.
+extends:
+  - realsource_common_v1.yaml
+
+run_id: robot_ft_realsource_pilot10_18d_delta_h100x8_b16
+
+datasets:
+  vla_data:
+    frozen_train_view_manifest: /data/mehul-vla-jepa/data_contracts/views/realsource_strict_valid_balanced_10_v1.json
+    frozen_train_view_manifest_sha256: c87a62ea41b019aa7f97885b96c64ee29ba778906e3c612ccd2baa096dc248a9

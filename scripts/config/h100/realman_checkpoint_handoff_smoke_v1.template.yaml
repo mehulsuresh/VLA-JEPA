@@ -1,0 +1,69 @@
+# NON-PRODUCTION / NON-QUALITY workflow.
+#
+# This proves only that a natural-final RealSource checkpoint can be
+# authenticated, loaded model-only into intervention with a fresh
+# optimizer/scheduler, then handed to HQ the same way.  Each stage consumes
+# one exact global batch and performs one optimizer step.  It is not evidence
+# about task quality and must never be substituted for the full curriculum.
+schema_version: 2
+workflow_kind: checkpoint_handoff_smoke
+curriculum_id: realman_checkpoint_handoff_smoke_v1
+state_root_dir: /data/mehul-vla-jepa/curricula
+
+bootstrap:
+  stage_config: REPLACE_WITH_MATERIALIZED_REALSOURCE_STAGE_CONFIG
+  container_image: vla-jepa:py313-cu130-h100
+  scratch_root: /data/mehul-vla-jepa
+
+shared_contract:
+  state_dim: 18
+  action_dim: 18
+  action_horizon: 50
+  action_type: joint_delta_gripper_absolute
+  action_delta_anchor: chunk_start_state
+  gripper_action_type: absolute
+  state_action_normalization: q01_q99_unclipped
+  normalization_statistics_artifact: REPLACE_WITH_SMOKE_UNION_STATS
+  normalization_statistics_artifact_sha256: REPLACE_WITH_SMOKE_UNION_STATS_SHA256
+  action_representation_contract_sha256: 9e1df348fb137c206b42a183892e29ec6247595fffc232bb2d73d94b5f5f91ac
+  statistics_holdout_manifest: REPLACE_WITH_SMOKE_UNION_HOLDOUT
+  statistics_holdout_manifest_sha256: REPLACE_WITH_SMOKE_UNION_HOLDOUT_SHA256
+
+stages:
+  - id: realsource_handoff_smoke
+    role: pretrain
+    initialization: upstream
+    handoff_checkpoint: natural_final
+    config: REPLACE_WITH_MATERIALIZED_REALSOURCE_STAGE_CONFIG
+    expected_full_dataset_epochs: 1
+    local_evaluation_manifest_sha256: REPLACE_WITH_REALSOURCE_EVAL_SHA256
+    monitoring:
+      first_epoch_exposure_fractions: [1.0]
+      full_epoch_required: true
+      partial_pass_is_epoch: false
+
+  - id: intervention_handoff_smoke
+    role: adapt
+    initialization: previous_stage_final
+    handoff_checkpoint: natural_final
+    config: REPLACE_WITH_MATERIALIZED_INTERVENTION_STAGE_CONFIG
+    expected_full_dataset_epochs: 1
+    require_verified_action_supervision: true
+    local_evaluation_manifest_sha256: REPLACE_WITH_INTERVENTION_EVAL_SHA256
+    monitoring:
+      first_epoch_exposure_fractions: [1.0]
+      full_epoch_required: true
+      partial_pass_is_epoch: false
+
+  - id: hq_handoff_smoke
+    role: finetune
+    initialization: previous_stage_final
+    handoff_checkpoint: natural_final
+    config: REPLACE_WITH_MATERIALIZED_HQ_STAGE_CONFIG
+    expected_full_dataset_epochs: 1
+    local_evaluation_manifest_sha256: REPLACE_WITH_HQ_EVAL_SHA256
+    monitoring:
+      first_epoch_exposure_fractions: [1.0]
+      full_epoch_required: true
+      partial_pass_is_epoch: false
+

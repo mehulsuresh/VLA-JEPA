@@ -1,0 +1,77 @@
+# Minimal Python 3.13 runtime stack.
+#
+# Install the latest PyTorch pair first, then install this file:
+#   python -m pip install --upgrade torch torchvision
+#   python -m pip install --upgrade -r requirements-py313-min.txt
+#
+# Keep compile-prone, incompatible, or path-specific packages out of this
+# default file: DeepSpeed/mpi4py, bitsandbytes, FlashAttention, Decord,
+# MoGe, torchcodec, wandb, and deployment-only packages should be installed
+# only when needed.
+accelerate
+albumentations
+av
+cloudpickle
+diffusers
+einops
+fastparquet
+fsspec!=2026.4.0,>=2026.3.0
+gcsfs
+google-cloud-storage
+msgpack
+numpydantic
+omegaconf
+opencv-python-headless
+pandas
+peft
+pillow
+platformdirs
+psutil
+pyarrow
+pydantic
+PyYAML
+qwen-vl-utils
+rich
+scipy
+tensorboard
+tiktoken
+timm
+transformers
+websockets
+
+# Validation/smoke-test helper.
+pytest
+
+# Optional LIBERO / LIBERO-Plus evaluation extras.
+# Uncomment or install explicitly only for simulator eval environments.
+# The LIBERO-Plus repository itself is cloned separately and added to PYTHONPATH.
+# robosuite==1.4.1
+# mujoco==2.3.7
+# bddl
+# easydict
+# wand
+# scikit-image
+# gym
+# rich
+# omegaconf
+# websockets
+# msgpack
+# tyro
+# mediapy
+# imageio
+# opencv-python-headless
+# matplotlib
+# requests
+# tqdm
+# torchcodec
+
+# Optional Qwen3.5 fast linear-attention inference/training kernels.
+# Keep the base/A100 dependency set unchanged. Opt in through
+# docker/Dockerfile.py313 with INSTALL_FAST_LINEAR_ATTN=1; the build wrapper
+# supplies reviewed exact pins and the target architecture, and the resulting
+# GPU image must pass scripts/probe_qwen35_fast_linear_attention.py.
+# transformers==5.13.1 (only pinned by the opt-in image path)
+# causal-conv1d==1.6.2.post1
+# flash-linear-attention[cuda]==0.5.1
+# tilelang==0.1.9
+# apache-tvm-ffi==0.1.10

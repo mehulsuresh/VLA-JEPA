@@ -1,0 +1,8 @@
+# Resume-only loader correction validated for the Magna HQ delta-action H100x8
+# run. The worker count and CUDA-safe forkserver context are one atomic change:
+# neither field may be applied by itself.
+schema_version: 1
+datasets:
+  vla_data:
+    num_workers: 4
+    multiprocessing_context: forkserver

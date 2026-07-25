@@ -1,0 +1,162 @@
+# syntax=docker/dockerfile:1.7
+
+ARG BASE_IMAGE=nvidia/cuda:13.0.2-cudnn-devel-ubuntu24.04
+FROM ${BASE_IMAGE}
+
+SHELL ["/bin/bash", "-Eeuo", "pipefail", "-c"]
+
+ARG PYTHON_VERSION=3.13
+ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cu130
+ARG INSTALL_DEEPSPEED=1
+ARG INSTALL_MOGE=1
+ARG INSTALL_FLASH_ATTN=0
+ARG INSTALL_FAST_LINEAR_ATTN=0
+ARG FLASH_ATTN_SPEC=flash-attn
+ARG FLASH_ATTN_CUDA_ARCH_LIST=8.0
+ARG FLASH_ATTN_MAX_JOBS=32
+ARG FLASH_ATTN_NVCC_THREADS=2
+ARG FAST_LINEAR_ATTN_SPEC=flash-linear-attention[cuda]==0.5.1
+ARG CAUSAL_CONV1D_SPEC=causal-conv1d==1.6.2.post1
+ARG FAST_LINEAR_ATTN_TRANSFORMERS_SPEC=transformers==5.13.1
+ARG FAST_LINEAR_ATTN_TILELANG_SPEC=tilelang==0.1.9
+ARG FAST_LINEAR_ATTN_TVM_FFI_SPEC=apache-tvm-ffi==0.1.10
+ARG FAST_LINEAR_ATTN_CUDA_ARCH_LIST=8.0
+ARG FAST_LINEAR_ATTN_MAX_JOBS=32
+ARG MOGE_REF=07444410f1e33f402353b99d6ccd26bd31e469e8
+ARG UTILS3D_REF=3fab839f0be9931dac7c8488eb0e1600c236e183
+ARG PIPELINE_REF=866f059d2a05cde05e4a52211ec5051fd5f276d6
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONUNBUFFERED=1 \
+    TOKENIZERS_PARALLELISM=false \
+    CONDA_DIR=/opt/conda \
+    CONDA_DEFAULT_ENV=vla-jepa \
+    CONDA_PREFIX=/opt/conda/envs/vla-jepa \
+    PATH=/opt/conda/envs/vla-jepa/bin:/opt/conda/bin:/usr/local/cuda/bin:${PATH}
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      bash \
+      build-essential \
+      ca-certificates \
+      curl \
+      ffmpeg \
+      git \
+      git-lfs \
+      htop \
+      ibverbs-providers \
+      less \
+      libglib2.0-0 \
+      libgl1 \
+      libibverbs1 \
+      libnuma1 \
+      libopenmpi-dev \
+      libsm6 \
+      libxext6 \
+      libxrender1 \
+      ninja-build \
+      openssh-client \
+      openmpi-bin \
+      pciutils \
+      pkg-config \
+      rdma-core \
+      rsync \
+      tmux \
+      vim \
+      wget \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN arch="$(uname -m)" \
+    && case "${arch}" in \
+      x86_64) miniforge_arch="x86_64" ;; \
+      aarch64) miniforge_arch="aarch64" ;; \
+      *) echo "Unsupported architecture: ${arch}" >&2; exit 1 ;; \
+    esac \
+    && curl -fsSL "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-${miniforge_arch}.sh" -o /tmp/miniforge.sh \
+    && bash /tmp/miniforge.sh -b -p "${CONDA_DIR}" \
+    && rm /tmp/miniforge.sh \
+    && conda create -y -n "${CONDA_DEFAULT_ENV}" -c conda-forge "python=${PYTHON_VERSION}" pip \
+    && conda clean -afy
+
+WORKDIR /workspace/VLA-JEPA
+
+COPY requirements-py313-min.txt /tmp/requirements-py313-min.txt
+RUN python -m pip install --upgrade pip setuptools wheel packaging ninja \
+    && python -m pip install --upgrade torch torchvision --index-url "${TORCH_INDEX_URL}" \
+    && python -m pip install --upgrade -r /tmp/requirements-py313-min.txt
+
+RUN if [[ "${INSTALL_DEEPSPEED}" == "1" ]]; then \
+      DS_BUILD_OPS=0 python -m pip install --upgrade deepspeed mpi4py; \
+    fi
+
+RUN if [[ "${INSTALL_MOGE}" == "1" ]]; then \
+      python -m pip install --upgrade matplotlib trimesh moderngl; \
+      python -m pip install --upgrade \
+        "utils3d @ git+https://github.com/EasternJournalist/utils3d.git@${UTILS3D_REF}" \
+        "pipeline @ git+https://github.com/EasternJournalist/pipeline.git@${PIPELINE_REF}"; \
+      python -m pip install --no-deps \
+        "moge @ git+https://github.com/microsoft/MoGe.git@${MOGE_REF}"; \
+    fi
+
+RUN if [[ "${INSTALL_FLASH_ATTN}" == "1" ]]; then \
+      PIP_NO_BINARY=flash-attn \
+      TORCH_CUDA_ARCH_LIST="${FLASH_ATTN_CUDA_ARCH_LIST}" \
+      FLASH_ATTN_CUDA_ARCHS="${FLASH_ATTN_CUDA_ARCH_LIST//./}" \
+      MAX_JOBS="${FLASH_ATTN_MAX_JOBS}" \
+      NVCC_THREADS="${FLASH_ATTN_NVCC_THREADS}" \
+      python -m pip install --no-build-isolation --upgrade "${FLASH_ATTN_SPEC}"; \
+    fi
+
+COPY scripts/probe_qwen35_fast_linear_attention.py /tmp/probe_qwen35_fast_linear_attention.py
+RUN case "${INSTALL_FAST_LINEAR_ATTN}" in 0|1) ;; \
+      *) echo "INSTALL_FAST_LINEAR_ATTN must be 0 or 1" >&2; exit 2 ;; \
+    esac \
+    && if [[ "${INSTALL_FAST_LINEAR_ATTN}" == "1" ]]; then \
+      [[ "${FAST_LINEAR_ATTN_SPEC}" =~ ^flash-linear-attention(\[cuda\])?==[A-Za-z0-9][A-Za-z0-9._+-]*$ ]] \
+        || { echo "FAST_LINEAR_ATTN_SPEC must be an exact version pin" >&2; exit 2; }; \
+      [[ "${CAUSAL_CONV1D_SPEC}" =~ ^causal-conv1d==[A-Za-z0-9][A-Za-z0-9._+-]*$ ]] \
+        || { echo "CAUSAL_CONV1D_SPEC must be an exact version pin" >&2; exit 2; }; \
+      [[ "${FAST_LINEAR_ATTN_TRANSFORMERS_SPEC}" =~ ^transformers==[A-Za-z0-9][A-Za-z0-9._+-]*$ ]] \
+        || { echo "FAST_LINEAR_ATTN_TRANSFORMERS_SPEC must be an exact version pin" >&2; exit 2; }; \
+      [[ "${FAST_LINEAR_ATTN_TILELANG_SPEC}" =~ ^tilelang==[A-Za-z0-9][A-Za-z0-9._+-]*$ ]] \
+        || { echo "FAST_LINEAR_ATTN_TILELANG_SPEC must be an exact version pin" >&2; exit 2; }; \
+      [[ "${FAST_LINEAR_ATTN_TVM_FFI_SPEC}" =~ ^apache-tvm-ffi==[A-Za-z0-9][A-Za-z0-9._+-]*$ ]] \
+        || { echo "FAST_LINEAR_ATTN_TVM_FFI_SPEC must be an exact version pin" >&2; exit 2; }; \
+      [[ "${FAST_LINEAR_ATTN_CUDA_ARCH_LIST}" =~ ^[0-9]+\.[0-9]+([[:space:];]+[0-9]+\.[0-9]+)*$ ]] \
+        || { echo "FAST_LINEAR_ATTN_CUDA_ARCH_LIST must contain explicit numeric CUDA architectures" >&2; exit 2; }; \
+      [[ "${FAST_LINEAR_ATTN_MAX_JOBS}" =~ ^[1-9][0-9]*$ ]] \
+        || { echo "FAST_LINEAR_ATTN_MAX_JOBS must be a positive integer" >&2; exit 2; }; \
+      PIP_NO_BINARY=causal-conv1d \
+      CAUSAL_CONV1D_FORCE_BUILD=TRUE \
+      TORCH_CUDA_ARCH_LIST="${FAST_LINEAR_ATTN_CUDA_ARCH_LIST}" \
+      MAX_JOBS="${FAST_LINEAR_ATTN_MAX_JOBS}" \
+      python -m pip install --no-build-isolation --upgrade \
+        "${FAST_LINEAR_ATTN_TRANSFORMERS_SPEC}" "${CAUSAL_CONV1D_SPEC}" \
+        "${FAST_LINEAR_ATTN_TVM_FFI_SPEC}" "${FAST_LINEAR_ATTN_TILELANG_SPEC}" \
+        "${FAST_LINEAR_ATTN_SPEC}"; \
+      python /tmp/probe_qwen35_fast_linear_attention.py \
+        --cpu-build-imports-only \
+        --expected-fla-version "${FAST_LINEAR_ATTN_SPEC##*==}" \
+        --expected-causal-conv1d-version "${CAUSAL_CONV1D_SPEC##*==}" \
+        --expected-transformers-version "${FAST_LINEAR_ATTN_TRANSFORMERS_SPEC##*==}" \
+        --expected-tilelang-version "${FAST_LINEAR_ATTN_TILELANG_SPEC##*==}" \
+        --expected-tvm-ffi-version "${FAST_LINEAR_ATTN_TVM_FFI_SPEC##*==}"; \
+    fi
+
+COPY . /workspace/VLA-JEPA
+RUN python -m pip install -e . \
+    && if [[ "${INSTALL_MOGE}" == "1" ]]; then \
+      python /tmp/probe_qwen35_fast_linear_attention.py \
+        --check-python-dependencies \
+        --allow-known-moge-optional-deps; \
+    else \
+      python /tmp/probe_qwen35_fast_linear_attention.py \
+        --check-python-dependencies; \
+    fi
+
+COPY docker/entrypoint.sh /usr/local/bin/starvla-entrypoint
+RUN chmod +x /usr/local/bin/starvla-entrypoint scripts/preflight_runtime.py
+
+ENTRYPOINT ["/usr/local/bin/starvla-entrypoint"]
+CMD ["bash"]

@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "description": "Deterministic in-training-distribution regression subset. Every selected episode contains subtask labels 2 through 7; this is not held out from training.",
+  "excluded_from_training": false,
+  "selection": {
+    "candidate_rule": "episode contains every subtask_index in [2, 3, 4, 5, 6, 7]",
+    "ranking": "sha256('magna-complete-stages-v1|' + episode_id)",
+    "count": 16
+  },
+  "datasets": {
+    "magna_training_data_with_interventions": [
+      1302,
+      1368,
+      1327,
+      1333,
+      1322,
+      1444,
+      1468,
+      859,
+      742,
+      1442,
+      1453,
+      1308,
+      744,
+      1348,
+      1430,
+      1427
+    ]
+  }
+}

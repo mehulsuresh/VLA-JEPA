@@ -1,0 +1,203 @@
+# Full LIBERO-Plus eval grouped by perturbation category.
+#
+# This runs all 10,030 LIBERO-Plus variants across the four base suites and the
+# seven official perturbation categories. The local wrapper passes the category
+# into the LIBERO suite constructor so the source suite does not silently default
+# to Camera Viewpoints.
+server:
+  url: "ws://127.0.0.1:8000"
+  timeout: 120
+
+output_dir: "${oc.env:VLA_JEPA_EVAL_OUTPUT,/home/mehul/work/vjepa/eval_videos/harness_libero_plus_all_categories}"
+
+defaults:
+  benchmark: &benchmark "eval_harness.vla_jepa.libero_plus_benchmark:VLAJEPALIBEROPlusBenchmark"
+  episodes_per_task: &episodes_per_task 1
+  paced: &paced false
+  common_params: &common_params
+    seed: 7
+    num_steps_wait: 10
+    send_wrist_image: true
+    send_state: true
+    quat_no_antipodal: true
+  recording: &recording
+    record_video: false
+    record_step: false
+    video_fps: 10
+    filename_stem: "{suite}_task{task_id:04d}_ep{episode_idx:04d}_{status}"
+
+benchmarks:
+  - benchmark: *benchmark
+    subname: libero_plus_spatial_background_textures
+    episodes_per_task: *episodes_per_task
+    paced: *paced
+    params: {<<: *common_params, suite: libero_spatial, category: "Background Textures"}
+    recording: *recording
+  - benchmark: *benchmark
+    subname: libero_plus_object_background_textures
+    episodes_per_task: *episodes_per_task
+    paced: *paced
+    params: {<<: *common_params, suite: libero_object, category: "Background Textures"}
+    recording: *recording
+  - benchmark: *benchmark
+    subname: libero_plus_goal_background_textures
+    episodes_per_task: *episodes_per_task
+    paced: *paced
+    params: {<<: *common_params, suite: libero_goal, category: "Background Textures"}
+    recording: *recording
+  - benchmark: *benchmark
+    subname: libero_plus_10_background_textures
+    episodes_per_task: *episodes_per_task
+    paced: *paced
+    params: {<<: *common_params, suite: libero_10, category: "Background Textures"}
+    recording: *recording
+
+  - benchmark: *benchmark
+    subname: libero_plus_spatial_camera_viewpoints
+    episodes_per_task: *episodes_per_task
+    paced: *paced
+    params: {<<: *common_params, suite: libero_spatial, category: "Camera Viewpoints"}
+    recording: *recording
+  - benchmark: *benchmark
+    subname: libero_plus_object_camera_viewpoints
+    episodes_per_task: *episodes_per_task
+    paced: *paced
+    params: {<<: *common_params, suite: libero_object, category: "Camera Viewpoints"}
+    recording: *recording
+  - benchmark: *benchmark
+    subname: libero_plus_goal_camera_viewpoints
+    episodes_per_task: *episodes_per_task
+    paced: *paced
+    params: {<<: *common_params, suite: libero_goal, category: "Camera Viewpoints"}
+    recording: *recording
+  - benchmark: *benchmark
+    subname: libero_plus_10_camera_viewpoints
+    episodes_per_task: *episodes_per_task
+    paced: *paced
+    params: {<<: *common_params, suite: libero_10, category: "Camera Viewpoints"}
+    recording: *recording
+
+  - benchmark: *benchmark
+    subname: libero_plus_spatial_language_instructions
+    episodes_per_task: *episodes_per_task
+    paced: *paced
+    params: {<<: *common_params, suite: libero_spatial, category: "Language Instructions"}
+    recording: *recording
+  - benchmark: *benchmark
+    subname: libero_plus_object_language_instructions
+    episodes_per_task: *episodes_per_task
+    paced: *paced
+    params: {<<: *common_params, suite: libero_object, category: "Language Instructions"}
+    recording: *recording
+  - benchmark: *benchmark
+    subname: libero_plus_goal_language_instructions
+    episodes_per_task: *episodes_per_task
+    paced: *paced
+    params: {<<: *common_params, suite: libero_goal, category: "Language Instructions"}
+    recording: *recording
+  - benchmark: *benchmark
+    subname: libero_plus_10_language_instructions
+    episodes_per_task: *episodes_per_task
+    paced: *paced
+    params: {<<: *common_params, suite: libero_10, category: "Language Instructions"}
+    recording: *recording
+
+  - benchmark: *benchmark
+    subname: libero_plus_spatial_light_conditions
+    episodes_per_task: *episodes_per_task
+    paced: *paced
+    params: {<<: *common_params, suite: libero_spatial, category: "Light Conditions"}
+    recording: *recording
+  - benchmark: *benchmark
+    subname: libero_plus_object_light_conditions
+    episodes_per_task: *episodes_per_task
+    paced: *paced
+    params: {<<: *common_params, suite: libero_object, category: "Light Conditions"}
+    recording: *recording
+  - benchmark: *benchmark
+    subname: libero_plus_goal_light_conditions
+    episodes_per_task: *episodes_per_task
+    paced: *paced
+    params: {<<: *common_params, suite: libero_goal, category: "Light Conditions"}
+    recording: *recording
+  - benchmark: *benchmark
+    subname: libero_plus_10_light_conditions
+    episodes_per_task: *episodes_per_task
+    paced: *paced
+    params: {<<: *common_params, suite: libero_10, category: "Light Conditions"}
+    recording: *recording
+
+  - benchmark: *benchmark
+    subname: libero_plus_spatial_objects_layout
+    episodes_per_task: *episodes_per_task
+    paced: *paced
+    params: {<<: *common_params, suite: libero_spatial, category: "Objects Layout"}
+    recording: *recording
+  - benchmark: *benchmark
+    subname: libero_plus_object_objects_layout
+    episodes_per_task: *episodes_per_task
+    paced: *paced
+    params: {<<: *common_params, suite: libero_object, category: "Objects Layout"}
+    recording: *recording
+  - benchmark: *benchmark
+    subname: libero_plus_goal_objects_layout
+    episodes_per_task: *episodes_per_task
+    paced: *paced
+    params: {<<: *common_params, suite: libero_goal, category: "Objects Layout"}
+    recording: *recording
+  - benchmark: *benchmark
+    subname: libero_plus_10_objects_layout
+    episodes_per_task: *episodes_per_task
+    paced: *paced
+    params: {<<: *common_params, suite: libero_10, category: "Objects Layout"}
+    recording: *recording
+
+  - benchmark: *benchmark
+    subname: libero_plus_spatial_robot_initial_states
+    episodes_per_task: *episodes_per_task
+    paced: *paced
+    params: {<<: *common_params, suite: libero_spatial, category: "Robot Initial States"}
+    recording: *recording
+  - benchmark: *benchmark
+    subname: libero_plus_object_robot_initial_states
+    episodes_per_task: *episodes_per_task
+    paced: *paced
+    params: {<<: *common_params, suite: libero_object, category: "Robot Initial States"}
+    recording: *recording
+  - benchmark: *benchmark
+    subname: libero_plus_goal_robot_initial_states
+    episodes_per_task: *episodes_per_task
+    paced: *paced
+    params: {<<: *common_params, suite: libero_goal, category: "Robot Initial States"}
+    recording: *recording
+  - benchmark: *benchmark
+    subname: libero_plus_10_robot_initial_states
+    episodes_per_task: *episodes_per_task
+    paced: *paced
+    params: {<<: *common_params, suite: libero_10, category: "Robot Initial States"}
+    recording: *recording
+
+  - benchmark: *benchmark
+    subname: libero_plus_spatial_sensor_noise
+    episodes_per_task: *episodes_per_task
+    paced: *paced
+    params: {<<: *common_params, suite: libero_spatial, category: "Sensor Noise"}
+    recording: *recording
+  - benchmark: *benchmark
+    subname: libero_plus_object_sensor_noise
+    episodes_per_task: *episodes_per_task
+    paced: *paced
+    params: {<<: *common_params, suite: libero_object, category: "Sensor Noise"}
+    recording: *recording
+  - benchmark: *benchmark
+    subname: libero_plus_goal_sensor_noise
+    episodes_per_task: *episodes_per_task
+    paced: *paced
+    params: {<<: *common_params, suite: libero_goal, category: "Sensor Noise"}
+    recording: *recording
+  - benchmark: *benchmark
+    subname: libero_plus_10_sensor_noise
+    episodes_per_task: *episodes_per_task
+    paced: *paced
+    params: {<<: *common_params, suite: libero_10, category: "Sensor Noise"}
+    recording: *recording

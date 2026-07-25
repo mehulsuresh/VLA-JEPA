@@ -1,0 +1,58 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Training artifacts
+checkpoints/
+logs/
+results/
+cache/
+.cache/
+wandb/
+runs/
+*.pt
+*.pth
+*.ckpt
+
+# Debug outputs
+data_view_*.mp4
+data_image_*.png
+video_view_*.mp4
+video_image_*.png
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.venv
+.env
+.pytest_cache/
+*.log
+MUJOCO_LOG.TXT
+# Local benchmarks
+tmp_bench/
+artifacts/
+local_eval_reports/
+
+# This split-bound, train-only statistics table is a versioned runtime input,
+# not a generated checkpoint artifact. Keep every other file under the local
+# eval artifacts directory ignored unless it is explicitly reviewed here.
+!deployment/realman/eval_manifests/artifacts/
+deployment/realman/eval_manifests/artifacts/*
+!deployment/realman/eval_manifests/artifacts/magna_internal_holdout_global_batch96_v1_train_stats.json
+!deployment/realman/eval_manifests/artifacts/magna_internal_holdout_global_batch128_v1_openpi_realman18_stats.json
+!deployment/realman/eval_manifests/artifacts/magna_internal_holdout_global_batch96_v1_openpi_realman18_stats.json
+
+# Local datasets
+playground/Datasets/
