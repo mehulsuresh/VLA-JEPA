@@ -36,7 +36,7 @@ stages:
     config: scripts/config/h100/realman_curriculum/handoff_validation/realsource_ten_steps_v1.yaml
     expected_full_dataset_epochs: 1
     expected_optimizer_steps: 10
-    local_evaluation_manifest_sha256: cb6eabe7ca09f850c972037077c538029b97761946cc1334892a557f1bc2bd5f
+    local_evaluation_manifest_sha256: 7a1f8420aa8824c0bea0681a6acfa10193fca06b4f182174769f62894729a6d9
     monitoring:
       checkpoint_steps: [10]
       full_epoch_required: false

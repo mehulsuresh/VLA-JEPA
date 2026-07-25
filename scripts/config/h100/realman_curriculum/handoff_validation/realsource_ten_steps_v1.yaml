@@ -7,6 +7,16 @@ extends:
   - ../realsource_production_50_v1.yaml
 
 run_id: robot_ft_realsource_production50_handoff10_18d_delta_h100x8_b16
+canonical_eval_split_id: realsource_strict_valid_fractional_eval128_v4
+
+datasets:
+  vla_data:
+    # The current canonical adapter is byte-bound to v4.  Its 128 window
+    # identities are exactly the same as v2; v4 refreshes only the adapter and
+    # sidecar provenance after the canonical eval implementation fixes.
+    canonical_eval_manifest: /data/mehul-vla-jepa/checkpoints/eval_manifests/realsource_strict_valid_fractional_eval128_v4.json
+    frozen_train_view_manifest: /data/mehul-vla-jepa/data_contracts/views/realsource_strict_valid_balanced_50_v3.json
+    frozen_train_view_manifest_sha256: d51d9fc80a9db54570e39d28d3c538ef20b911ade1f20a8af953d0d0fc1fa505
 
 production_handoff_validation:
   schema: realman-production-handoff-validation-stage-v1
