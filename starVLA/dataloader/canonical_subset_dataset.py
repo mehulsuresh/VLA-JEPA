@@ -136,6 +136,30 @@ CANONICAL_JOINT_STATE_SPANS = {
     "neck": (40, 42),
     "torso": (42, 46),
 }
+
+
+def _canonical_eval_metric_groups(action_dim: int) -> list[str]:
+    """Return compact metric groups supported by the trainer's action layout.
+
+    Canonical streams historically expose the 49-D semantic-flat layout, where
+    the compact end-effector diagnostic is named ``hand``.  RealMan curriculum
+    streams instead project that data into the OpenPI-compatible 18-D layout,
+    whose corresponding actuator diagnostic is named ``gripper``.  Keeping the
+    report dimension-aware prevents immutable eval evidence from requesting a
+    metric group that ``VLATrainer._eval_action_groups`` cannot construct.
+    """
+
+    if int(action_dim) == REALMAN_18D_ACTION_CONTRACT.action_dim:
+        return ["all_action", "arm", "gripper"]
+    if int(action_dim) == ACTION_DIM:
+        return ["all_action", "arm", "hand"]
+    raise ValueError(
+        "Canonical heldout evaluation supports compact metric groups only for "
+        f"the 18-D RealMan or {ACTION_DIM}-D semantic-flat action layouts; "
+        f"got action_dim={action_dim}."
+    )
+
+
 class _RecoverableSampleError(RuntimeError):
     """Sample failure that can be handled by sampling a different window."""
 
@@ -7632,7 +7656,7 @@ class DeterministicCanonicalEvalDataset(torch.utils.data.Dataset):
             "control_metadata_required": False,
             "subtask_labels_required": False,
             "metric_horizons": [10, 50],
-            "metric_groups": ["all_action", "arm", "hand"],
+            "metric_groups": _canonical_eval_metric_groups(action_dim),
             "production_valid": True,
             "checkpoint_selection_eligible": True,
             "subtask_observation_counts": {},

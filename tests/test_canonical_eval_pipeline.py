@@ -26,6 +26,7 @@ from starVLA.dataloader.canonical_subset_dataset import (
     EpisodeSpec,
     JOINT_DELTA_GRIPPER_ABSOLUTE,
     ShardSpec,
+    _canonical_eval_metric_groups,
     canonical_action_sidecar_variant,
     canonical_adapter_contract_sha256,
     load_canonical_eval_manifest,
@@ -809,6 +810,45 @@ def test_canonical_eval_report_proves_no_leakage_and_uses_compact_metrics(
     assert "_heldout_eval_hold_action" not in sample
     assert "_heldout_eval_action_midpoint" not in sample
     assert "_heldout_eval_subtask_index" not in sample
+
+
+def test_18d_canonical_eval_report_requests_gripper_not_legacy_hand(tmp_path):
+    source = _source(tmp_path)
+    source.policy_state_dim = 18
+    source.policy_action_dim = 18
+    source.normalization_statistics = {}
+    source.normalization_statistics_artifact_sha256 = "d" * 64
+
+    report = DeterministicCanonicalEvalDataset(source).sampling_report()
+
+    assert report["action_dim"] == 18
+    assert report["metric_groups"] == ["all_action", "arm", "gripper"]
+
+
+@pytest.mark.parametrize(
+    ("action_dim", "expected"),
+    (
+        (18, ["all_action", "arm", "gripper"]),
+        (ACTION_DIM, ["all_action", "arm", "hand"]),
+    ),
+)
+def test_canonical_eval_metric_groups_match_trainer_action_layout(
+    action_dim,
+    expected,
+):
+    trainer = object.__new__(VLATrainer)
+    trainer.config = OmegaConf.create({"trainer": {}})
+
+    requested = _canonical_eval_metric_groups(action_dim)
+    available = trainer._eval_action_groups(action_dim)
+
+    assert requested == expected
+    assert set(requested).issubset(available)
+
+
+def test_canonical_eval_metric_groups_reject_unknown_action_width():
+    with pytest.raises(ValueError, match="18-D RealMan or 49-D"):
+        _canonical_eval_metric_groups(22)
 
 
 class _CanonicalEvalModel(torch.nn.Module):
