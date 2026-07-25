@@ -230,7 +230,7 @@ python scripts/build_realman_dataset_views.py realsource-canonical \
   --eval-holdout-manifest "$REALSOURCE_EVAL" \
   --fraction 0.10 \
   --seed 0 \
-  --output /data/mehul-vla-jepa/data_contracts/views/realsource_strict_valid_balanced_10_v1.json
+  --output /data/mehul-vla-jepa/data_contracts/views/realsource_strict_valid_balanced_10_v2.json
 ```
 
 Then build the separate task-balanced 50% RealSource
@@ -243,16 +243,21 @@ Create the remaining views on persistent storage:
 ```bash
 python scripts/build_realman_dataset_views.py intervention-incremental \
   --dataset-root /data/mehul-vla-jepa/datasets/magna_training_data_with_interventions_final_subtask_labelled \
-  --eval-holdout-manifest /data/mehul-vla-jepa/checkpoints/eval_manifests/magna_intervention_labelled_holdout_global_batch128_v1.json \
+  --eval-holdout-manifest /workspace/VLA-JEPA/deployment/realman/eval_manifests/magna_intervention_labelled_holdout_global_batch128_v1.json \
   --action-label-semantics-contract /data/mehul-vla-jepa/data_contracts/magna_intervention_action_labels_v1.json \
-  --output /data/mehul-vla-jepa/data_contracts/views/magna_intervention_incremental_v1.json
+  --output /data/mehul-vla-jepa/data_contracts/views/magna_intervention_incremental_v3.json
 
 python scripts/build_realman_dataset_views.py hq-clean-h50 \
   --dataset-root /data/mehul-vla-jepa/datasets/latest_high_quality_magna_data_final_subtask_labelled \
-  --eval-holdout-manifest /data/mehul-vla-jepa/checkpoints/eval_manifests/magna_hq_subtasks_delta_fractional_holdout_global_batch128_v1.json \
-  --output /data/mehul-vla-jepa/data_contracts/views/magna_hq_clean_h50_v1.json
+  --eval-holdout-manifest /workspace/VLA-JEPA/deployment/realman/eval_manifests/magna_hq_subtasks_delta_fractional_holdout_global_batch128_v1.json \
+  --output /data/mehul-vla-jepa/data_contracts/views/magna_hq_clean_h50_v3.json
 
 ```
+
+The production v2 curriculum is currently bound to the three versioned
+training views shown above. Dataset-view artifacts are immutable: if a
+holdout or provenance binding changes again, write a new version instead of
+overwriting `v2`/`v3`, then update the reviewed YAML SHA-256 values.
 
 For the first audit pass, omit `--action-label-semantics-contract`, copy the
 four exact dataset-binding values from the emitted unverified manifest into
@@ -354,7 +359,10 @@ Verify each view after transfer:
 
 ```bash
 python scripts/build_realman_dataset_views.py verify \
-  /data/mehul-vla-jepa/data_contracts/views/magna_intervention_incremental_v1.json
+  /data/mehul-vla-jepa/data_contracts/views/magna_intervention_incremental_v3.json
+
+python scripts/build_realman_dataset_views.py verify \
+  /data/mehul-vla-jepa/data_contracts/views/magna_hq_clean_h50_v3.json
 ```
 
 ## Human launch
