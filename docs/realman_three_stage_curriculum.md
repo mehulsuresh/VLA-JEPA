@@ -2,7 +2,7 @@
 
 This production workflow trains one policy sequentially:
 
-1. one exhaustive pass over the task-balanced 50% RealSource view;
+1. one exhaustive pass over the task-balanced 10% RealSource view;
 2. two exhaustive passes over the Magna intervention view;
 3. four exhaustive passes over the high-quality Magna view.
 
@@ -41,12 +41,20 @@ new pre-training experiment:
   task-balanced RealSource subset under the available time budget.
 
 These papers support the **broad/diverse -> corrective/recovery -> clean
-target-style** structure. They do not prove that 50%, two epochs, and four
+target-style** structure. They do not prove that 10%, two epochs, and four
 epochs are uniquely optimal. Those exposure counts are a reviewed,
-time-budgeted engineering choice. The only pre-launch empirical test is a
-tiny real-data checkpoint-handoff smoke: one optimizer step on each dataset,
-proving that A's authenticated natural-final weights initialize B and B's
-initialize C. It is an integration test and makes no model-quality claim.
+time-budgeted engineering choice. The prior 50% RealSource view contains
+10,215,064 windows (79,806 optimizer steps at global batch 128), which would
+overwhelm the 8,220 intervention and 7,524 HQ specialization steps. The v2
+curriculum instead uses a deterministic 10% view with 2,043,024 windows,
+2,437 episodes, and all 35 tasks: 15,962 optimizer steps for one complete
+pass.
+
+The pre-launch empirical gate is a real production-data checkpoint-handoff
+validation: ten optimizer steps on each dataset, proving that A's
+authenticated natural-final model initializes B and B's initializes C while
+each stage creates fresh optimizer, scheduler, and RNG state. It is an
+integration test and makes no model-quality claim.
 
 ## What an epoch means
 
@@ -152,13 +160,22 @@ The optimizer and scheduler restart at each authenticated natural-final
 handoff. This is a new delta-action curriculum; do not resume an older
 absolute-action or 19-D checkpoint.
 
+The world-model auxiliary objective does not restart its initial high-weight
+ramp in Stages B or C. Stage A uses the inherited `wm_initial=0.3` to
+`wm=0.1` warmup. Stages B and C set `wm_initial=wm=0.1` and
+`wm_warmup_steps=0`; their fresh optimizer warmup remains active, but the
+behavior-specific phases do not temporarily triple the world-model loss.
+
 ## Materialize the immutable contracts
 
 ### Break the canonical holdout/statistics bootstrap cycle
 
-The RealSource holdout must be selected from the exact deterministic
-task-balanced 50% population, while the production 50% view must already
-exclude that holdout.
+The existing RealSource v4 holdout was selected from the deterministic
+task-balanced 50% population. That population is a strict superset of the
+v2 production 10% view. The 10% view authenticates all 128 holdout identities,
+excludes every identity/content copy that intersects it, and retains all
+35 tasks. The broader fixed holdout remains useful for evaluating
+generalization beyond the exact Stage-A subset.
 Do not use an empty-exclusion training view to break this cycle. First create
 a distinct non-trainable selection candidate, then generate the holdout from
 only that candidate's authenticated ledger:
@@ -201,9 +218,9 @@ generator clears the not-yet-existing union-statistics reference, inspects raw
 18-D supervision masks, and ranks only episodes present in this frozen
 candidate. It never samples from the full canonical catalog.
 
-After the eval manifest is immutable, rebuild the actual holdout-free
-production view. Its row count is the only row count used for optimizer-step
-planning:
+After the eval manifest is immutable, materialize the actual holdout-free
+v2 production view. Its row count is the only row count used for
+optimizer-step planning:
 
 ```bash
 python scripts/build_realman_dataset_views.py realsource-canonical \
@@ -211,9 +228,9 @@ python scripts/build_realman_dataset_views.py realsource-canonical \
   --adapter-path /data/mehul-vla-jepa/src/dataset-canonicalization-training-d9c3298/configs/dataset_adapters/RealSourceData_RealSource-World__607cbd4f6adf.json \
   --cache-dir /data/mehul-vla-jepa/datasets/canonical_gcs \
   --eval-holdout-manifest "$REALSOURCE_EVAL" \
-  --fraction 0.50 \
+  --fraction 0.10 \
   --seed 0 \
-  --output /data/mehul-vla-jepa/data_contracts/views/realsource_strict_valid_balanced_50_v1.json
+  --output /data/mehul-vla-jepa/data_contracts/views/realsource_strict_valid_balanced_10_v1.json
 ```
 
 Then build the separate task-balanced 50% RealSource
@@ -249,11 +266,17 @@ new intervention split for the labelled Stage-B dataset rather than reusing
 the older unlabelled dataset's manifest. The frozen view binds the exact split
 file SHA-256, and the training loader validates the complete split again.
 
-The RealSource generator uses the task-stratified `0.50` production selection.
+The RealSource generator uses the task-stratified `0.10` production selection.
 It filters exact
 `quality_assessments.overall_valid == "VALID"`, preserves all 35 tasks, selects
 whole episodes deterministically, and maps 30 Hz to 20 Hz with exact half-up
 indices.
+
+The shared normalization artifact intentionally remains the holdout-clean
+50%-RealSource + intervention + HQ union. It gives all three stages one fixed
+same-robot scale and avoids changing the meaning of normalized model outputs
+at a handoff. The RealSource evaluation episodes are excluded from that
+statistics population.
 
 The three training views above are deliberately holdout-free and cannot be
 used as union-statistics sources. Materialize a separate candidate view for
@@ -336,10 +359,11 @@ python scripts/build_realman_dataset_views.py verify \
 
 ## Human launch
 
-Use the reviewed production curriculum:
+Use the reviewed v2 production curriculum. The v1/50% file is retained only
+as an immutable historical contract and must not be used for the new launch:
 
 ```bash
-CURRICULUM=scripts/config/h100/realman_realsource_intervention_hq_curriculum_v1.yaml
+CURRICULUM=scripts/config/h100/realman_realsource_intervention_hq_curriculum_v2.yaml
 ```
 
 Then run:

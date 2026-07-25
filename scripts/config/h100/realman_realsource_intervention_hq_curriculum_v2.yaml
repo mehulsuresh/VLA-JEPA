@@ -1,0 +1,69 @@
+# Production RealMan curriculum v2.
+#
+# Stage A is deliberately a modest but broad pretraining phase: one complete
+# pass over a strict-valid, task-balanced 10% RealSource population covering
+# all 35 tasks. Stages B and C then consume every intervention and clean-HQ
+# sample for two and four complete epochs respectively.
+#
+# Handoffs import the authenticated natural-final model only. Each new stage
+# creates a fresh optimizer, scheduler, and RNG stream under its own
+# config-owned learning-rate schedule.
+schema_version: 2
+workflow_kind: production_curriculum
+curriculum_id: realman_rs10_intervention_hq_v2
+state_root_dir: /data/mehul-vla-jepa/curricula
+bootstrap:
+  stage_config: scripts/config/h100/realman_curriculum/realsource_production_10_v1.yaml
+  container_image: vla-jepa:py313-cu130-h100
+  scratch_root: /data/mehul-vla-jepa
+
+shared_contract:
+  state_dim: 18
+  action_dim: 18
+  action_horizon: 50
+  action_type: joint_delta_gripper_absolute
+  action_delta_anchor: chunk_start_state
+  gripper_action_type: absolute
+  state_action_normalization: q01_q99_unclipped
+  normalization_statistics_artifact: /data/mehul-vla-jepa/data_contracts/realman_union_openpi_q01q99_v1.json
+  normalization_statistics_artifact_sha256: 79212d802c009c00ebb33bd3945b00401ee5304873d1a3b26e1ada5ee3cdc0be
+  action_representation_contract_sha256: 9e1df348fb137c206b42a183892e29ec6247595fffc232bb2d73d94b5f5f91ac
+  statistics_holdout_manifest: /data/mehul-vla-jepa/data_contracts/realman_union_holdout_v1.json
+  statistics_holdout_manifest_sha256: f2fba177b07dff1d576af7f9ff0a20b1f4e45d94cbdb0a89e78e3667be793d8c
+
+stages:
+  - id: realsource_production10
+    role: pretrain
+    initialization: upstream
+    handoff_checkpoint: natural_final
+    config: scripts/config/h100/realman_curriculum/realsource_production_10_v1.yaml
+    expected_full_dataset_epochs: 1
+    local_evaluation_manifest_sha256: 7a1f8420aa8824c0bea0681a6acfa10193fca06b4f182174769f62894729a6d9
+    monitoring:
+      first_epoch_exposure_fractions: [0.25, 0.5, 0.75, 1.0]
+      full_epoch_required: true
+      partial_pass_is_epoch: false
+  - id: intervention_adapt
+    role: adapt
+    initialization: previous_stage_final
+    handoff_checkpoint: natural_final
+    config: scripts/config/h100/realman_curriculum/intervention_adapt_v1.yaml
+    expected_full_dataset_epochs: 2
+    require_useful_subtask_coverage: true
+    require_verified_action_supervision: true
+    local_evaluation_manifest_sha256: c0f64465eff57ff7e253cbf15bb3c612eb6befa5ce3e81bd12a32f9baa24e72b
+    monitoring:
+      first_epoch_exposure_fractions: [1.0]
+      full_epoch_required: true
+      partial_pass_is_epoch: false
+  - id: hq_finetune
+    role: finetune
+    initialization: previous_stage_final
+    handoff_checkpoint: natural_final
+    config: scripts/config/h100/realman_curriculum/hq_finetune_v1.yaml
+    expected_full_dataset_epochs: 4
+    local_evaluation_manifest_sha256: 9730807c0ba8688c6ae525126fdf306cfbadb3d67366392c5f6eefe3399292a2
+    monitoring:
+      first_epoch_exposure_fractions: [1.0]
+      full_epoch_required: true
+      partial_pass_is_epoch: false

@@ -1,0 +1,69 @@
+# Ten-step A -> B -> C checkpoint-handoff validation using the current exact
+# production frozen datasets and model/optimizer settings.
+#
+# This is deliberately not a quality experiment and does not claim to finish
+# any dataset epoch. Each stage sees ten real production batches, finalizes a
+# full checkpoint, and hands only the authenticated natural-final model bytes
+# to the next stage. Optimizer, scheduler, and RNG state are fresh per stage.
+schema_version: 2
+workflow_kind: production_handoff_validation
+curriculum_id: realman_production_checkpoint_handoff10_v2
+state_root_dir: /data/mehul-vla-jepa/curricula
+bootstrap:
+  stage_config: scripts/config/h100/realman_curriculum/handoff_validation/realsource_ten_steps_v2.yaml
+  container_image: vla-jepa:py313-cu130-h100
+  scratch_root: /data/mehul-vla-jepa
+
+shared_contract:
+  state_dim: 18
+  action_dim: 18
+  action_horizon: 50
+  action_type: joint_delta_gripper_absolute
+  action_delta_anchor: chunk_start_state
+  gripper_action_type: absolute
+  state_action_normalization: q01_q99_unclipped
+  normalization_statistics_artifact: /data/mehul-vla-jepa/data_contracts/realman_union_openpi_q01q99_v1.json
+  normalization_statistics_artifact_sha256: 79212d802c009c00ebb33bd3945b00401ee5304873d1a3b26e1ada5ee3cdc0be
+  action_representation_contract_sha256: 9e1df348fb137c206b42a183892e29ec6247595fffc232bb2d73d94b5f5f91ac
+  statistics_holdout_manifest: /data/mehul-vla-jepa/data_contracts/realman_union_holdout_v1.json
+  statistics_holdout_manifest_sha256: f2fba177b07dff1d576af7f9ff0a20b1f4e45d94cbdb0a89e78e3667be793d8c
+
+stages:
+  - id: realsource_production10_handoff10
+    role: pretrain
+    initialization: upstream
+    handoff_checkpoint: natural_final
+    config: scripts/config/h100/realman_curriculum/handoff_validation/realsource_ten_steps_v2.yaml
+    expected_full_dataset_epochs: 1
+    expected_optimizer_steps: 10
+    local_evaluation_manifest_sha256: 7a1f8420aa8824c0bea0681a6acfa10193fca06b4f182174769f62894729a6d9
+    monitoring:
+      checkpoint_steps: [10]
+      full_epoch_required: false
+      partial_pass_is_epoch: false
+  - id: intervention_adapt_handoff10
+    role: adapt
+    initialization: previous_stage_final
+    handoff_checkpoint: natural_final
+    config: scripts/config/h100/realman_curriculum/handoff_validation/intervention_ten_steps_v1.yaml
+    expected_full_dataset_epochs: 2
+    expected_optimizer_steps: 10
+    require_useful_subtask_coverage: true
+    require_verified_action_supervision: true
+    local_evaluation_manifest_sha256: c0f64465eff57ff7e253cbf15bb3c612eb6befa5ce3e81bd12a32f9baa24e72b
+    monitoring:
+      checkpoint_steps: [10]
+      full_epoch_required: false
+      partial_pass_is_epoch: false
+  - id: hq_finetune_handoff10
+    role: finetune
+    initialization: previous_stage_final
+    handoff_checkpoint: natural_final
+    config: scripts/config/h100/realman_curriculum/handoff_validation/hq_ten_steps_v1.yaml
+    expected_full_dataset_epochs: 4
+    expected_optimizer_steps: 10
+    local_evaluation_manifest_sha256: 9730807c0ba8688c6ae525126fdf306cfbadb3d67366392c5f6eefe3399292a2
+    monitoring:
+      checkpoint_steps: [10]
+      full_epoch_required: false
+      partial_pass_is_epoch: false

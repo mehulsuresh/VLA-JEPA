@@ -40,6 +40,16 @@ trainer:
     vj_predictor: 3.0e-05
     depth_teacher_aux_head: 3.0e-05
   strict_learning_rate_groups: true
+  # The model enters this stage with world-model pretraining and intervention
+  # adaptation already complete.  Keep the steady-state auxiliary weight so
+  # the fresh stage optimizer does not temporarily triple the WM objective
+  # during the most behavior-specific fine-tuning phase.
+  loss_scale:
+    action: 1.0
+    wm: 0.1
+    wm_initial: 0.1
+    wm_warmup_steps: 0
+    depth_teacher: 0.016
   lr_scheduler_type: cosine_with_min_lr
   scheduler_specific_kwargs:
     min_lr: null

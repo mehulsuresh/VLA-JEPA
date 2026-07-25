@@ -21,7 +21,7 @@ CONTRACT_SHA256 = (
     "9e1df348fb137c206b42a183892e29ec6247595fffc232bb2d73d94b5f5f91ac"
 )
 PRODUCTION_CONFIG = (
-    CONFIG_ROOT / "realman_realsource_intervention_hq_curriculum_v1.yaml"
+    CONFIG_ROOT / "realman_realsource_intervention_hq_curriculum_v2.yaml"
 )
 
 
@@ -69,13 +69,14 @@ def test_curriculum_declares_bootstrap_and_complete_view_epochs():
     assert [
         stage["local_evaluation_manifest_sha256"] for stage in stages
     ] == [
-        "cb6eabe7ca09f850c972037077c538029b97761946cc1334892a557f1bc2bd5f",
+        "7a1f8420aa8824c0bea0681a6acfa10193fca06b4f182174769f62894729a6d9",
         "c0f64465eff57ff7e253cbf15bb3c612eb6befa5ce3e81bd12a32f9baa24e72b",
         "9730807c0ba8688c6ae525126fdf306cfbadb3d67366392c5f6eefe3399292a2",
     ]
     assert stages[0]["monitoring"]["first_epoch_exposure_fractions"] == [
         0.25,
         0.5,
+        0.75,
         1.0,
     ]
     assert (
@@ -89,7 +90,7 @@ def test_curriculum_declares_bootstrap_and_complete_view_epochs():
 @pytest.mark.parametrize(
     ("name", "epochs", "base_lr", "interface_lr", "head_lr"),
     (
-        ("realsource_production_50_v1.yaml", 1, 2e-5, 1e-5, 1e-4),
+        ("realsource_production_10_v1.yaml", 1, 2e-5, 1e-5, 1e-4),
         ("intervention_adapt_v1.yaml", 2, 1e-5, 5e-6, 5e-5),
         ("hq_finetune_v1.yaml", 4, 4e-6, 2e-6, 3e-5),
     ),
@@ -122,7 +123,9 @@ def test_stage_configs_are_exhaustive_and_lr_contract_is_config_owned(
     assert trainer["epochs"] == epochs
     assert trainer["max_train_steps"] == "auto"
     expected_fractions = (
-        [0.25, 0.5, 1.0] if name.startswith("realsource_") else [1.0]
+        [0.25, 0.5, 0.75, 1.0]
+        if name.startswith("realsource_")
+        else [1.0]
     )
     assert trainer["checkpoint_eval_milestone_fractions"] == expected_fractions
     assert trainer["checkpoint_eval_milestone_steps"] == "auto"
@@ -180,6 +183,14 @@ def test_stage_configs_are_exhaustive_and_lr_contract_is_config_owned(
         assert "magna_training_data_with_interventions" != Path(
             data["data_root_dir"]
         ).name
+    if name in {"intervention_adapt_v1.yaml", "hq_finetune_v1.yaml"}:
+        assert trainer["loss_scale"] == {
+            "action": 1.0,
+            "wm": 0.1,
+            "wm_initial": 0.1,
+            "wm_warmup_steps": 0,
+            "depth_teacher": 0.016,
+        }
 
 
 @pytest.mark.parametrize(
@@ -204,7 +215,7 @@ def test_canonical_h100_preflight_rejects_inherited_lerobot_eval_contract(
     error: str,
 ):
     _, payload = h100_training._load_config(
-        STAGE_ROOT / "realsource_production_50_v1.yaml"
+        STAGE_ROOT / "realsource_production_10_v1.yaml"
     )
     payload = copy.deepcopy(payload)
     payload["trainer"].update(trainer_override)
@@ -217,13 +228,19 @@ def test_canonical_h100_preflight_rejects_inherited_lerobot_eval_contract(
 def test_only_reviewed_production_curriculum_and_stage_configs_are_present():
     assert {
         path.name
-        for path in CONFIG_ROOT.glob("realman_*curriculum_v1.yaml")
-    } == {PRODUCTION_CONFIG.name}
+        for path in CONFIG_ROOT.glob(
+            "realman_realsource_intervention_hq_curriculum_v*.yaml"
+        )
+    } == {
+        "realman_realsource_intervention_hq_curriculum_v1.yaml",
+        PRODUCTION_CONFIG.name,
+    }
     assert {
         path.name
         for path in STAGE_ROOT.glob("*.yaml")
     } == {
         "realsource_common_v1.yaml",
+        "realsource_production_10_v1.yaml",
         "realsource_production_50_v1.yaml",
         "intervention_adapt_v1.yaml",
         "hq_finetune_v1.yaml",
@@ -233,7 +250,7 @@ def test_only_reviewed_production_curriculum_and_stage_configs_are_present():
 def test_production_stages_have_identical_model_seed_batch_and_prompts():
     resolved = {}
     for name in (
-        "realsource_production_50_v1.yaml",
+        "realsource_production_10_v1.yaml",
         "intervention_adapt_v1.yaml",
         "hq_finetune_v1.yaml",
     ):
@@ -331,7 +348,7 @@ def test_production_contract_gate_rejects_seed_batch_or_architecture_drift():
 def test_all_stages_share_the_same_persistent_h100_namespace():
     resolved = []
     for name in (
-        "realsource_production_50_v1.yaml",
+        "realsource_production_10_v1.yaml",
         "intervention_adapt_v1.yaml",
         "hq_finetune_v1.yaml",
     ):
@@ -377,7 +394,7 @@ def test_stage_shared_contract_excludes_curriculum_only_holdout_binding():
 
 def test_canonical_stage_uses_canonical_eval_when_episode_split_is_null():
     _, payload = h100_training._load_config(
-        STAGE_ROOT / "realsource_production_50_v1.yaml"
+        STAGE_ROOT / "realsource_production_10_v1.yaml"
     )
     data = payload["datasets"]["vla_data"]
     assert data["episode_split_manifest"] is None
@@ -496,7 +513,7 @@ def test_materialized_real_data_smoke_views_are_non_quality_exact_batches(
     path = (
         REPO_ROOT
         / "deployment/realman/curriculum_manifests/handoff_smoke"
-        / f"{source_id}_handoff_smoke_128_v1.json"
+        / f"{source_id}_handoff_smoke_128_v3.json"
     )
     digest = materialize_realman_handoff_smoke._validate_smoke_view(
         path, expected_source=source_id
@@ -636,10 +653,8 @@ def test_exhaustive_view_validator_rejects_non_unique_or_partial_epoch(
 
     payload = _load_yaml(manifest)
     payload["epoch_contract"]["epoch_passes"] = 2
-    manifest.write_text(
-        __import__("json").dumps(payload, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    payload["view_id"] = dataset_view.descriptor_view_id(payload)
+    manifest.write_bytes(dataset_view.canonical_json_bytes(payload) + b"\n")
     with pytest.raises(
         h100_curriculum.CurriculumError,
         match="not a one-pass exhaustive epoch",

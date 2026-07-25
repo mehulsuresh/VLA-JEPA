@@ -16,7 +16,7 @@ from starVLA.action_representation import (
 REPO_ROOT = Path(__file__).resolve().parents[1]
 EXACT_CONFIG = REPO_ROOT / (
     "scripts/config/h100/realman_curriculum/"
-    "realsource_production_50_v1.yaml"
+    "realsource_production_10_v1.yaml"
 )
 LEGACY_CONFIG = REPO_ROOT / (
     "scripts/config/h100/"

@@ -33,6 +33,9 @@ PRODUCTION_HANDOFF_STAGE_CONFIGS = (
     "realsource_ten_steps_v1.yaml",
     REPO_ROOT
     / "scripts/config/h100/realman_curriculum/handoff_validation/"
+    "realsource_ten_steps_v2.yaml",
+    REPO_ROOT
+    / "scripts/config/h100/realman_curriculum/handoff_validation/"
     "intervention_ten_steps_v1.yaml",
     REPO_ROOT
     / "scripts/config/h100/realman_curriculum/handoff_validation/"
