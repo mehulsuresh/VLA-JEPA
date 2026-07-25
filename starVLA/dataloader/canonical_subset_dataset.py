@@ -5430,6 +5430,9 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
                 SHARD_Q01_Q99,
                 SHARD_Q01_Q99_UNCLIPPED,
             }
+            shared_statistics_normalization = (
+                self.sidecar_normalization == Q01_Q99_UNCLIPPED
+            )
             clip_quantiles = self.sidecar_normalization == SHARD_Q01_Q99
             if quantile_normalization and not store_raw_values:
                 action_values = self._normalize(
@@ -5451,11 +5454,11 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
                     store_raw_values
                     and (
                         quantile_normalization
-                        or (
-                            self.sidecar_normalization
-                            == Q01_Q99_UNCLIPPED
-                            and self.allow_eval_selection_population_candidate
-                        )
+                        # Shared OpenPI statistics are applied only after the
+                        # canonical 18-D projection and chunk-start delta
+                        # transform.  The sidecar must therefore retain raw
+                        # absolute state/action values for both train and eval.
+                        or shared_statistics_normalization
                     )
                 ):
                     raise ValueError(f"Unsupported sidecar_normalization: {self.sidecar_normalization}")

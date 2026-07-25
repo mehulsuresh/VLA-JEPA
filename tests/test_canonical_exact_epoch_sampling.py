@@ -4,6 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pandas as pd
 import pytest
 import torch
 from torch.utils.data import DataLoader
@@ -13,8 +14,11 @@ from starVLA.dataloader.canonical_subset_dataset import (
     JOINT_DELTA_GRIPPER_ABSOLUTE,
     STATE_DIM,
     CanonicalSubsetVLADataset,
+    EpisodeSpec,
+    ShardSpec,
     WindowSpec,
     _RecoverableSampleError,
+    _ShardData,
 )
 from starVLA.action_representation import (
     CANONICAL_REALMAN_ACTION_SOURCE_INDICES,
@@ -291,5 +295,181 @@ def test_canonical_shared_statistics_project_and_normalize_18d() -> None:
     assert sample["action_mask"].shape == (2, 18)
     assert not sample["state_mask"][:, 16:18].any()
     assert not sample["action_mask"][:, 16:18].any()
+    np.testing.assert_allclose(sample["state"], expected_state, atol=1e-6)
+    np.testing.assert_allclose(sample["action"], expected_action, atol=1e-6)
+
+
+@pytest.mark.parametrize("mode", ("train", "eval"))
+def test_canonical_shared_q01_sidecar_stays_raw_and_normalizes_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+) -> None:
+    dataset = object.__new__(CanonicalSubsetVLADataset)
+    dataset.mode = mode
+    dataset.action_type = JOINT_DELTA_GRIPPER_ABSOLUTE
+    dataset.sidecar_normalization = "q01_q99_unclipped"
+    dataset.allow_eval_selection_population_candidate = False
+    dataset.sidecar_dtype = np.float16
+    dataset.sample_stride = 1
+    dataset.action_horizon = 2
+    dataset._action_offsets = np.arange(2, dtype=np.int64)
+    dataset.video_horizon = 1
+    dataset.video_frame_stride = 1
+    dataset.video_target_shift_steps = 0
+    dataset._compact_offsets_cache = None
+    dataset.data_cfg = {"append_subtask_to_prompt": False}
+    dataset.action_sidecar_variant = "shared-q01-test"
+    dataset.adapter_contract_sha256 = "c" * 64
+    dataset.canonical_eval_manifest = None
+    dataset.allow_gcs_download = False
+    dataset.gcs_download_timeout_seconds = 1
+    dataset.gcs_download_retries = 0
+    dataset.gcs_download_retry_backoff_seconds = 0.0
+    dataset.normalization_statistics = {
+        "selected": {
+            "state": {"q01": [-2.0] * 18, "q99": [2.0] * 18},
+            "action": {"q01": [-2.0] * 18, "q99": [2.0] * 18},
+        }
+    }
+
+    state_indices = np.asarray(CANONICAL_REALMAN_STATE_SOURCE_INDICES)
+    action_indices = np.asarray(CANONICAL_REALMAN_ACTION_SOURCE_INDICES)
+    policy_state = np.linspace(-0.8, 0.8, 18, dtype=np.float32)
+    policy_state[7] = 0.4
+    policy_state[15] = 0.6
+    policy_action = np.stack(
+        [policy_state + np.float32(0.2), policy_state + np.float32(0.4)]
+    )
+    policy_action[:, 7] = [0.25, 0.75]
+    policy_action[:, 15] = [0.8, 0.2]
+
+    raw_state = np.zeros((2, STATE_DIM), dtype=np.float32)
+    raw_action = np.zeros((2, ACTION_DIM), dtype=np.float32)
+    raw_state_mask = np.zeros_like(raw_state, dtype=bool)
+    raw_action_mask = np.zeros_like(raw_action, dtype=bool)
+    raw_state[:, state_indices] = policy_state
+    raw_action[:, action_indices] = policy_action
+    raw_state_mask[:, state_indices] = True
+    raw_action_mask[:, action_indices] = True
+
+    action_to_state = np.full((ACTION_DIM,), -1, dtype=np.int64)
+    for output_index, (action_index, state_index) in enumerate(
+        zip(action_indices, state_indices, strict=True)
+    ):
+        if output_index not in {7, 15}:
+            action_to_state[action_index] = state_index
+
+    dataset._load_adapter_config = lambda _path: object()
+
+    def _project(raw_sample, _adapter):
+        row = int(raw_sample["row"])
+        return {
+            "observation": {
+                "state": {
+                    "values": raw_state[row],
+                    "mask": raw_state_mask[row],
+                }
+            },
+            "action": {
+                "values": raw_action[row],
+                "mask": raw_action_mask[row],
+            },
+        }
+
+    dataset._apply_unified_adapter = _project
+    dataset._joint_delta_mapping_for_adapter = (
+        lambda _adapter: action_to_state.copy()
+    )
+
+    shard_root = tmp_path / mode
+    data_path = shard_root / "data/chunk.parquet"
+    adapter_path = shard_root / "adapter.yaml"
+    sidecar_path = shard_root / "sidecar.npz"
+    data_path.parent.mkdir(parents=True)
+    data_path.touch()
+    adapter_path.write_text("fixture: true\n", encoding="utf-8")
+    monkeypatch.setattr(
+        "starVLA.dataloader.canonical_subset_dataset.pd.read_parquet",
+        lambda _path: pd.DataFrame({"row": [0, 1]}),
+    )
+    shard = ShardSpec(
+        dataset_id="fixture/canonical",
+        sid=f"sid-{mode}",
+        revision="r1",
+        adapter_group_id="fixture",
+        adapter_path=adapter_path,
+        root=shard_root,
+        gcs_prefix="gs://fixture",
+        data_relative_path="data/chunk.parquet",
+        data_path=data_path,
+        sidecar_path=sidecar_path,
+        fps=20.0,
+        camera_source_keys={},
+        qwen_camera_slots=("main",),
+        vjepa_camera_slots=("main",),
+        decode_camera_slots=("main",),
+        task_map={0: "move the object"},
+        episodes=[
+            EpisodeSpec(
+                local_start=0,
+                length=2,
+                task="move the object",
+                video_paths={},
+                video_base_frames={},
+                episode_index=1,
+                dataset_from_index=0,
+            )
+        ],
+    )
+
+    dataset._ensure_sidecar(shard)
+
+    with np.load(sidecar_path) as payload:
+        # Global q01/q99 is intentionally *not* applied while caching.  The
+        # 53-D/49-D sidecar remains raw so projection and delta encoding happen
+        # before the one shared normalization pass.
+        np.testing.assert_array_equal(payload["state_values"], raw_state)
+        np.testing.assert_array_equal(payload["action_values"], raw_action)
+        assert payload["state_values"].dtype == np.float32
+        assert payload["action_values"].dtype == np.float32
+
+    shard_data = _ShardData(sidecar_path)
+    context = {
+        "shard_data": shard_data,
+        "shard": shard,
+        "episode": shard.episodes[0],
+        "row_base": 0,
+        "source_base_index": 0,
+        "action_rows": np.asarray([0, 1], dtype=np.int64),
+        "action_is_pad": np.asarray([False, False]),
+        "window": WindowSpec(0, 0, 0),
+        "video_frames": {
+            "main": (
+                tmp_path / "synthetic.mp4",
+                np.asarray([0], dtype=np.int64),
+                tmp_path / "synthetic.lock",
+            )
+        },
+        "qwen_frame_positions": {"main": 0},
+    }
+    dataset._decode_episode_video = lambda _shard, _path, indices, _lock: (
+        np.zeros((len(indices), 2, 2, 3), dtype=np.uint8)
+    )
+
+    sample = dataset._sample_from_context(context)
+    mixed_action = policy_action.copy()
+    mixed_action[:, [*range(0, 7), *range(8, 15), 16, 17]] -= (
+        policy_state[[*range(0, 7), *range(8, 15), 16, 17]]
+    )
+    expected_state = normalize_q01_q99_unclipped(
+        policy_state[None, :],
+        dataset.normalization_statistics["selected"]["state"],
+    )
+    expected_action = normalize_q01_q99_unclipped(
+        mixed_action,
+        dataset.normalization_statistics["selected"]["action"],
+    )
+
     np.testing.assert_allclose(sample["state"], expected_state, atol=1e-6)
     np.testing.assert_allclose(sample["action"], expected_action, atol=1e-6)
