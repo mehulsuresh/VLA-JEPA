@@ -27,6 +27,58 @@ logger = get_logger(__name__)
 _EXHAUSTIVE_EPOCH_SAMPLING_STRATEGIES = frozenset(
     {"primary_exhaustive", "all_sources_exhaustive"}
 )
+_CANONICAL_REALMAN_ACTION_DIM = 18
+_CANONICAL_SEMANTIC_FLAT_ACTION_DIM = 49
+
+
+def _canonical_eval_metric_groups(action_dim: int) -> list[str]:
+    """Return compact canonical groups supported by the trainer action layout."""
+
+    if int(action_dim) == _CANONICAL_REALMAN_ACTION_DIM:
+        return ["all_action", "arm", "gripper"]
+    if int(action_dim) == _CANONICAL_SEMANTIC_FLAT_ACTION_DIM:
+        return ["all_action", "arm", "hand"]
+    raise ValueError(
+        "Canonical heldout evaluation supports compact metric groups only for "
+        "the 18-D RealMan or 49-D semantic-flat action layouts; "
+        f"got action_dim={action_dim}."
+    )
+
+
+def _normalize_canonical_eval_metric_groups(dataset) -> None:
+    """Bind the runtime canonical report to its projected policy action layout.
+
+    The canonical dataset's adapter semantics and immutable cache hashes are
+    deliberately independent of trainer diagnostics.  Normalize the report in
+    this construction wrapper so both the trainer and the saved
+    ``heldout_eval_windows.json`` see the correct group names without changing
+    canonical sample, adapter, or sidecar semantics.
+    """
+
+    report = getattr(dataset, "_sampling_report", None)
+    if not isinstance(report, dict):
+        raise RuntimeError(
+            "Deterministic canonical eval dataset lacks its runtime sampling "
+            "report."
+        )
+    raw_action_dim = report.get("action_dim")
+    if isinstance(raw_action_dim, bool) or not isinstance(raw_action_dim, int):
+        raise RuntimeError(
+            "Canonical runtime sampling report has an invalid action_dim: "
+            f"{raw_action_dim!r}."
+        )
+    expected = _canonical_eval_metric_groups(raw_action_dim)
+    configured = report.get("metric_groups")
+    allowed_pre_normalization = (
+        expected,
+        ["all_action", "arm", "hand"],
+    )
+    if configured not in allowed_pre_normalization:
+        raise RuntimeError(
+            "Canonical runtime sampling report has unexpected compact metric "
+            f"groups for action_dim={raw_action_dim}: {configured!r}."
+        )
+    report["metric_groups"] = expected
 
 
 def _identity_collate(batch):
@@ -850,6 +902,7 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets", model=None, *, mode: st
         )
         if is_eval:
             vla_dataset = DeterministicCanonicalEvalDataset(vla_dataset)
+            _normalize_canonical_eval_metric_groups(vla_dataset)
             from starVLA.dataloader.heldout_eval import (
                 validate_global_eval_observation_count,
             )

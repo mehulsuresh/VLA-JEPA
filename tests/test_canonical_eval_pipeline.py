@@ -26,10 +26,13 @@ from starVLA.dataloader.canonical_subset_dataset import (
     EpisodeSpec,
     JOINT_DELTA_GRIPPER_ABSOLUTE,
     ShardSpec,
-    _canonical_eval_metric_groups,
     canonical_action_sidecar_variant,
     canonical_adapter_contract_sha256,
     load_canonical_eval_manifest,
+)
+from starVLA.dataloader import (
+    _canonical_eval_metric_groups,
+    _normalize_canonical_eval_metric_groups,
 )
 from starVLA.training.train_starvla import (
     VLATrainer,
@@ -784,6 +787,7 @@ def test_canonical_eval_report_proves_no_leakage_and_uses_compact_metrics(
     tmp_path,
 ):
     dataset = DeterministicCanonicalEvalDataset(_source(tmp_path))
+    _normalize_canonical_eval_metric_groups(dataset)
 
     report = dataset.sampling_report()
 
@@ -819,7 +823,9 @@ def test_18d_canonical_eval_report_requests_gripper_not_legacy_hand(tmp_path):
     source.normalization_statistics = {}
     source.normalization_statistics_artifact_sha256 = "d" * 64
 
-    report = DeterministicCanonicalEvalDataset(source).sampling_report()
+    dataset = DeterministicCanonicalEvalDataset(source)
+    _normalize_canonical_eval_metric_groups(dataset)
+    report = dataset.sampling_report()
 
     assert report["action_dim"] == 18
     assert report["metric_groups"] == ["all_action", "arm", "gripper"]
@@ -849,6 +855,18 @@ def test_canonical_eval_metric_groups_match_trainer_action_layout(
 def test_canonical_eval_metric_groups_reject_unknown_action_width():
     with pytest.raises(ValueError, match="18-D RealMan or 49-D"):
         _canonical_eval_metric_groups(22)
+
+
+def test_canonical_runtime_metric_group_normalization_rejects_report_drift():
+    dataset = SimpleNamespace(
+        _sampling_report={
+            "action_dim": 18,
+            "metric_groups": ["all_action", "arm", "base"],
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="unexpected compact metric groups"):
+        _normalize_canonical_eval_metric_groups(dataset)
 
 
 class _CanonicalEvalModel(torch.nn.Module):
