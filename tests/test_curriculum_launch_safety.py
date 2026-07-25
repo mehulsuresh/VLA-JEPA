@@ -433,6 +433,63 @@ def test_curriculum_run_preflights_before_creating_run_state(
     assert events == ["check", "run"]
 
 
+@pytest.mark.parametrize(
+    ("run_args", "expected_error"),
+    (
+        (
+            ["--run-id", "different_curriculum_unit"],
+            "curriculum run ID must start with fixture_",
+        ),
+        (
+            ["--run-id", "INVALID RUN ID"],
+            "invalid curriculum run ID",
+        ),
+        (
+            ["--resume"],
+            "curriculum resume requires the original --run-id",
+        ),
+    ),
+)
+def test_curriculum_run_rejects_invalid_request_before_preflight(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+    run_args: list[str],
+    expected_error: str,
+):
+    plan = {"curriculum_id": "fixture"}
+    events: list[str] = []
+    monkeypatch.setattr(
+        h100_curriculum,
+        "resolve_curriculum",
+        lambda *_args, **_kwargs: plan,
+    )
+    monkeypatch.setattr(
+        h100_curriculum,
+        "check",
+        lambda _plan: events.append("check"),
+    )
+    monkeypatch.setattr(
+        h100_curriculum,
+        "run_curriculum",
+        lambda _plan, **_kwargs: events.append("run"),
+    )
+
+    assert (
+        h100_curriculum.main(
+            [
+                "run",
+                "--config",
+                str(tmp_path / "curriculum.yaml"),
+                *run_args,
+            ]
+        )
+        == 2
+    )
+    assert events == []
+    assert expected_error in capsys.readouterr().err
+
+
 def test_trainer_authenticates_config_owned_pretrained_model_before_load(
     tmp_path: Path,
 ):

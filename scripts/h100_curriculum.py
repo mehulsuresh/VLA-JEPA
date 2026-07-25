@@ -2769,25 +2769,39 @@ def _training_environment(plan: Mapping[str, Any]) -> dict[str, str]:
     return env
 
 
-def run_curriculum(
+def _validate_run_request(
     plan: Mapping[str, Any],
     *,
     run_id: str | None,
-    resume: bool = False,
-) -> Path:
+    resume: bool,
+) -> None:
+    """Reject an invalid explicit run request before expensive preflight."""
+
     if resume and run_id is None:
         raise CurriculumError(
             "curriculum resume requires the original --run-id"
         )
     if run_id is None:
-        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-        run_id = f"{plan['curriculum_id']}_{timestamp}"
+        return
     if RUN_ID_RE.fullmatch(run_id) is None:
         raise CurriculumError(f"invalid curriculum run ID: {run_id!r}")
     if not run_id.startswith(f"{plan['curriculum_id']}_"):
         raise CurriculumError(
             f"curriculum run ID must start with {plan['curriculum_id']}_"
         )
+
+
+def run_curriculum(
+    plan: Mapping[str, Any],
+    *,
+    run_id: str | None,
+    resume: bool = False,
+) -> Path:
+    _validate_run_request(plan, run_id=run_id, resume=resume)
+    if run_id is None:
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        run_id = f"{plan['curriculum_id']}_{timestamp}"
+        _validate_run_request(plan, run_id=run_id, resume=False)
     state_dir = Path(plan["state_root_dir"]) / run_id
     state_path = state_dir / "curriculum_state.json"
     if resume:
@@ -3305,6 +3319,11 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "check":
             check(plan)
         elif args.command == "run":
+            _validate_run_request(
+                plan,
+                run_id=args.run_id,
+                resume=bool(args.resume),
+            )
             # Start and resume must pass the same artifact-authenticated,
             # hardware, source, dependency, port, and backend-specific deep
             # preflight as the explicit check command immediately before any
