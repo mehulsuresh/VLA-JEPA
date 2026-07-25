@@ -4,7 +4,7 @@
     "contract_sha256": "9e1df348fb137c206b42a183892e29ec6247595fffc232bb2d73d94b5f5f91ac",
     "normalization": "q01_q99_unclipped",
     "path": "/workspace/VLA-JEPA/deployment/realman/eval_manifests/artifacts/magna_hq_subtasks_delta_fractional_holdout_global_batch128_v1_openpi_realman18_stats.json",
-    "sha256": "89d3822411eebd9bec568d0b608edcbae47ade7e9e638db134a4155416c900cb",
+    "sha256": "9addb20eaddf646c30c59caefc21223351b66b6581e9f92f1b641c6dede399a7",
     "train_frame_count": 360052
   },
   "catalog_binding": {
@@ -914,7 +914,7 @@
     }
   },
   "manifest_path": "/workspace/VLA-JEPA/deployment/realman/eval_manifests/magna_hq_subtasks_delta_fractional_holdout_global_batch128_v1.json",
-  "manifest_sha256": "9730807c0ba8688c6ae525126fdf306cfbadb3d67366392c5f6eefe3399292a2",
+  "manifest_sha256": "293bf7bec52c4777818cb79b0681744d6827117c54e61571b31a41221bdffd5d",
   "schema_version": 1,
   "selection": {
     "eligibility": {

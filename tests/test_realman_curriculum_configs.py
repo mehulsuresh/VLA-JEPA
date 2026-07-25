@@ -70,8 +70,8 @@ def test_curriculum_declares_bootstrap_and_complete_view_epochs():
         stage["local_evaluation_manifest_sha256"] for stage in stages
     ] == [
         "972eae8ce1d3d901e59dd80897d4361ebfea05e13f8de7ea0e863871abe9f33f",
-        "c0f64465eff57ff7e253cbf15bb3c612eb6befa5ce3e81bd12a32f9baa24e72b",
-        "9730807c0ba8688c6ae525126fdf306cfbadb3d67366392c5f6eefe3399292a2",
+        "98c852d7894daa16c7e04b4b363f14b5234c2294c806d2b9c571f4f398d18700",
+        "293bf7bec52c4777818cb79b0681744d6827117c54e61571b31a41221bdffd5d",
     ]
     assert stages[0]["monitoring"]["first_epoch_exposure_fractions"] == [
         0.25,

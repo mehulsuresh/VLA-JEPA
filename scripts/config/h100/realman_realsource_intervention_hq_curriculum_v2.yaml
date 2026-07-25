@@ -51,7 +51,7 @@ stages:
     expected_full_dataset_epochs: 2
     require_useful_subtask_coverage: true
     require_verified_action_supervision: true
-    local_evaluation_manifest_sha256: c0f64465eff57ff7e253cbf15bb3c612eb6befa5ce3e81bd12a32f9baa24e72b
+    local_evaluation_manifest_sha256: 98c852d7894daa16c7e04b4b363f14b5234c2294c806d2b9c571f4f398d18700
     monitoring:
       first_epoch_exposure_fractions: [1.0]
       full_epoch_required: true
@@ -62,7 +62,7 @@ stages:
     handoff_checkpoint: natural_final
     config: scripts/config/h100/realman_curriculum/hq_finetune_v1.yaml
     expected_full_dataset_epochs: 4
-    local_evaluation_manifest_sha256: 9730807c0ba8688c6ae525126fdf306cfbadb3d67366392c5f6eefe3399292a2
+    local_evaluation_manifest_sha256: 293bf7bec52c4777818cb79b0681744d6827117c54e61571b31a41221bdffd5d
     monitoring:
       first_epoch_exposure_fractions: [1.0]
       full_epoch_required: true

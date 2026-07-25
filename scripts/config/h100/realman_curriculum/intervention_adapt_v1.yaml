@@ -49,8 +49,8 @@ datasets:
     normalization_statistics_artifact: /data/mehul-vla-jepa/data_contracts/realman_union_openpi_q01q99_v1.json
     normalization_statistics_artifact_sha256: 79212d802c009c00ebb33bd3945b00401ee5304873d1a3b26e1ada5ee3cdc0be
     action_representation_contract_sha256: 9e1df348fb137c206b42a183892e29ec6247595fffc232bb2d73d94b5f5f91ac
-    frozen_train_view_manifest: /data/mehul-vla-jepa/data_contracts/views/magna_intervention_incremental_v1.json
-    frozen_train_view_manifest_sha256: 68e8da8bfa9884cef6af6f8e5149b0f1675b3468335a2ec22faa917ec4f36679
+    frozen_train_view_manifest: /data/mehul-vla-jepa/data_contracts/views/magna_intervention_incremental_v3.json
+    frozen_train_view_manifest_sha256: 4188c52a7a9a289342090a45abd442057004c5980667de0d86db427031641b64
     frozen_train_view_require_data_shard_hashes: true
     subtask_prompt_append_probability: 0.7
     # Preserve the established mask behavior: individual mistake actions are
