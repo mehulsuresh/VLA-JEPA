@@ -1580,7 +1580,302 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
         self.frozen_train_view_manifest_sha256 = actual_manifest_sha256
         self.frozen_train_view = view
 
-    def _validate_checkpoint_handoff_smoke_eval_binding(self) -> bool:
+    def _load_eval_catalog_view_descriptor(
+        self,
+        manifest_path: Path,
+        *,
+        expected_manifest_sha256: str,
+    ) -> None:
+        """Load the exact production catalog that owns heldout evaluation.
+
+        The training YAML always names its frozen training view.  A normal
+        production view is already the post-holdout training population.  A
+        checkpoint-handoff smoke instead names a tiny child view, whose
+        descriptor hash-binds the production parent.  Evaluation scopes raw
+        canonical discovery to that production view and reconstructs the
+        pre-holdout logical catalog as ``train identities ∪ heldout
+        identities``.  The generator-only eval-selection candidate is never
+        authorized as a runtime dataset.
+        """
+
+        if self.mode != "eval":
+            raise ValueError(
+                "Canonical eval catalog views may only be loaded in eval mode."
+            )
+        evaluation = self.canonical_eval_manifest
+        if evaluation is None:
+            raise ValueError(
+                "Canonical eval catalog view requires canonical_eval_manifest."
+            )
+
+        expected_representation = {
+            "state_dim": REALMAN_18D_ACTION_CONTRACT.state_dim,
+            "action_dim": REALMAN_18D_ACTION_CONTRACT.action_dim,
+            "horizon": REALMAN_18D_ACTION_CONTRACT.action_horizon,
+            "action_type": JOINT_DELTA_GRIPPER_ABSOLUTE,
+            "normalization": Q01_Q99_UNCLIPPED,
+        }
+        source_manifest_sha256 = _hash_file(self.manifest_path)
+
+        def load_bound_view(
+            path: Path,
+            expected_sha256: str,
+            *,
+            expected_view_id: str | None = None,
+        ) -> FrozenDatasetView:
+            raw_path = path.expanduser()
+            if raw_path.is_symlink():
+                raise ValueError(
+                    "Canonical eval catalog view must be a regular "
+                    f"non-symlink file: {raw_path}"
+                )
+            resolved = raw_path.resolve(strict=True)
+            if not resolved.is_file():
+                raise FileNotFoundError(
+                    f"Canonical eval catalog view is missing: {resolved}"
+                )
+            actual_sha256 = _hash_file(resolved)
+            if actual_sha256 != expected_sha256:
+                raise ValueError(
+                    "Canonical eval catalog view SHA-256 mismatch: "
+                    f"expected {expected_sha256}, found {actual_sha256}."
+                )
+            loaded = load_frozen_view(
+                resolved,
+                expected_view_id=expected_view_id,
+                expected_representation_contract_sha256=(
+                    REALMAN_18D_ACTION_CONTRACT.sha256()
+                ),
+                verify_ledger=True,
+            )
+            representation = loaded.descriptor["representation"]
+            mismatches = {
+                key: {
+                    "expected": expected,
+                    "found": representation.get(key),
+                }
+                for key, expected in expected_representation.items()
+                if representation.get(key) != expected
+            }
+            if mismatches:
+                raise ValueError(
+                    "Canonical eval catalog view representation mismatch: "
+                    f"{mismatches}."
+                )
+            if int(
+                loaded.descriptor["epoch_contract"]["epoch_passes"]
+            ) != 1:
+                raise ValueError(
+                    "Canonical eval catalog view must define exactly one "
+                    "logical epoch pass."
+                )
+            canonical_sources = [
+                source
+                for source in loaded.descriptor["sources"]
+                if source.get("backend") == "canonical"
+            ]
+            if len(canonical_sources) != len(
+                loaded.descriptor["sources"]
+            ):
+                raise ValueError(
+                    "Canonical eval catalog view contains a non-canonical "
+                    "source."
+                )
+            for source in canonical_sources:
+                if (
+                    source.get("manifest_sha256")
+                    != source_manifest_sha256
+                ):
+                    raise ValueError(
+                        "Canonical eval catalog source manifest mismatch for "
+                        f"source_id={source.get('source_id')!r}."
+                    )
+            return loaded
+
+        configured = load_bound_view(
+            manifest_path,
+            expected_manifest_sha256,
+        )
+        effective = configured
+        effective_path = configured.manifest_path
+        effective_sha256 = configured.manifest_sha256
+        if (
+            configured.descriptor.get("purpose")
+            == CHECKPOINT_HANDOFF_SMOKE_PURPOSE
+        ):
+            # This authenticates the exact eval SHA, smoke-only statistics,
+            # parent lineage fields, and dual-identity exclusions before the
+            # parent path is trusted.
+            if not self._validate_checkpoint_handoff_smoke_eval_binding(
+                configured
+            ):
+                raise ValueError(
+                    "Canonical handoff-smoke eval binding was not accepted."
+                )
+            selection = configured.descriptor["selection"]
+            parent_path = Path(str(selection["parent_manifest"]))
+            parent_sha256 = str(selection["parent_manifest_sha256"])
+            parent_view_id = str(selection["parent_view_id"])
+            effective = load_bound_view(
+                parent_path,
+                parent_sha256,
+                expected_view_id=parent_view_id,
+            )
+            if (
+                effective.descriptor["rows"]["sha256"]
+                != selection["parent_ledger_sha256"]
+            ):
+                raise ValueError(
+                    "Canonical handoff-smoke parent ledger SHA-256 mismatch."
+                )
+            effective_path = effective.manifest_path
+            effective_sha256 = effective.manifest_sha256
+
+        purpose = effective.descriptor.get("purpose")
+        usage = effective.descriptor.get("usage_contract")
+        if (
+            purpose
+            in {
+                CHECKPOINT_HANDOFF_SMOKE_PURPOSE,
+                STATISTICS_POPULATION_CANDIDATE_PURPOSE,
+                EVAL_SELECTION_POPULATION_CANDIDATE_PURPOSE,
+            }
+            or not isinstance(usage, Mapping)
+            or usage.get("training_allowed") is not True
+            or usage.get("eval_manifest_generation") is not False
+        ):
+            raise ValueError(
+                "Canonical eval catalog must resolve to the trainable "
+                "production frozen view, not a smoke or generator-only "
+                f"candidate; purpose={purpose!r}, usage={usage!r}."
+            )
+
+        exclusions = effective.descriptor.get("holdout_exclusions")
+        expected_exclusion_source = (
+            f"canonical_eval_manifest:{evaluation.sha256}"
+        )
+        if (
+            not isinstance(exclusions, Mapping)
+            or exclusions.get("source_id") != expected_exclusion_source
+            or not exclusions.get("lineage_ids")
+            or not exclusions.get("content_ids")
+        ):
+            raise ValueError(
+                "Canonical eval catalog production view is not bound to the "
+                "exact evaluation manifest and dual-identity exclusions."
+            )
+
+        binding = effective.descriptor.get("selection", {}).get(
+            "evaluation_holdout"
+        )
+        episode_identities = sorted(
+            evaluation.heldout_episode_identities
+        )
+        expected_binding = {
+            "schema": "realsource-canonical-eval-holdout-binding-v1",
+            "manifest_sha256": evaluation.sha256,
+            "source_manifest_sha256": (
+                evaluation.source_manifest_sha256
+            ),
+            "window_count": len(evaluation.windows),
+            "episode_count": len(episode_identities),
+            "episode_identity_fields": [
+                "dataset_id",
+                "sid",
+                "revision",
+                "data_file",
+                "episode_index",
+            ],
+            "episode_identities_sha256": _stable_json_sha256(
+                episode_identities
+            ),
+            "copy_detection": [
+                "episode_identity",
+                "episode_lineage_id",
+                "episode_content_id",
+            ],
+        }
+        binding_mismatches = {
+            key: {
+                "expected": expected,
+                "found": (
+                    binding.get(key)
+                    if isinstance(binding, Mapping)
+                    else None
+                ),
+            }
+            for key, expected in expected_binding.items()
+            if (
+                not isinstance(binding, Mapping)
+                or binding.get(key) != expected
+            )
+        }
+        unsigned_binding = (
+            dict(binding) if isinstance(binding, Mapping) else {}
+        )
+        binding_sha256 = unsigned_binding.pop("sha256", None)
+        if (
+            binding_mismatches
+            or not self._valid_sha256(binding_sha256)
+            or binding_sha256
+            != _stable_json_sha256(unsigned_binding)
+        ):
+            raise ValueError(
+                "Canonical eval catalog production holdout binding drifted: "
+                f"{binding_mismatches}."
+            )
+
+        train_identities = self._frozen_view_episode_identity_set(
+            effective
+        )
+        heldout_identities = evaluation.heldout_episode_identities
+        overlap = train_identities & heldout_identities
+        if overlap:
+            raise ValueError(
+                "Canonical eval catalog production view contains heldout "
+                f"episodes: {sorted(overlap)[:5]}."
+            )
+        logical_catalog = frozenset(
+            {*train_identities, *heldout_identities}
+        )
+        selection = evaluation.selection
+        catalog_sha256 = _stable_json_sha256(sorted(logical_catalog))
+        if (
+            selection.configured_episode_count != len(logical_catalog)
+            or selection.configured_episode_catalog_sha256
+            != catalog_sha256
+        ):
+            raise ValueError(
+                "Canonical eval logical catalog does not match the immutable "
+                "evaluation selection count/hash."
+            )
+
+        source_identities = {
+            (
+                str(source["dataset_id"]),
+                str(source["sid"]),
+                str(source["revision"]),
+            )
+            for source in effective.descriptor["sources"]
+        }
+        missing_sources = {
+            identity[:3] for identity in heldout_identities
+        } - source_identities
+        if missing_sources:
+            raise ValueError(
+                "Canonical eval catalog production view omits heldout "
+                f"sources: {sorted(missing_sources)[:5]}."
+            )
+
+        self.eval_catalog_view_manifest_path = effective_path
+        self.eval_catalog_view_manifest_sha256 = effective_sha256
+        self.eval_catalog_view = effective
+        self._eval_logical_episode_identities = logical_catalog
+
+    def _validate_checkpoint_handoff_smoke_eval_binding(
+        self,
+        view: FrozenDatasetView | None = None,
+    ) -> bool:
         """Authenticate the one-batch smoke against its production eval split.
 
         A handoff smoke is intentionally a tiny prefix of a production frozen
@@ -1593,7 +1888,7 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
         caller must retain the full catalog count/hash validation.
         """
 
-        view = self.frozen_train_view
+        view = self.frozen_train_view if view is None else view
         if (
             view is None
             or view.descriptor.get("purpose")
@@ -1842,6 +2137,17 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
         self.frozen_train_view_manifest_path: Path | None = None
         self.frozen_train_view_manifest_sha256: str | None = None
         self.frozen_train_view: FrozenDatasetView | None = None
+        # Evaluation must use the exact logical catalog that produced the
+        # configured holdout manifest, not every adapter-compatible entry in
+        # the broader canonical source manifest.  This view is loaded only in
+        # ``mode="eval"`` from the same config-owned frozen training view (or
+        # the authenticated production parent of a handoff-smoke view).
+        self.eval_catalog_view_manifest_path: Path | None = None
+        self.eval_catalog_view_manifest_sha256: str | None = None
+        self.eval_catalog_view: FrozenDatasetView | None = None
+        self._eval_logical_episode_identities: (
+            frozenset[tuple[str, str, str, str, int]] | None
+        ) = None
         self.frozen_train_view_index_path: Path | None = None
         self.frozen_train_view_index_metadata_path: Path | None = None
         self.frozen_train_view_index_sha256: str | None = None
@@ -2233,6 +2539,17 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
                     configured_frozen_view_sha256
                 ),
             )
+        elif (
+            configured_frozen_view
+            and self.mode == "eval"
+            and self.canonical_eval_manifest is not None
+        ):
+            self._load_eval_catalog_view_descriptor(
+                Path(str(configured_frozen_view)),
+                expected_manifest_sha256=str(
+                    configured_frozen_view_sha256
+                ),
+            )
         self.lazy_cache_shards = bool(_cfg_get(data_cfg, "lazy_cache_shards", False))
         self.index_windows_lazily = bool(_cfg_get(data_cfg, "index_windows_lazily", False))
         self.prefetch_metadata_across_ranks = bool(_cfg_get(data_cfg, "prefetch_metadata_across_ranks", False))
@@ -2318,7 +2635,22 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
         )
 
         self.shards = self._resolve_shards_with_index_cache()
-        self._full_episode_identities = self._episode_identity_set(self.shards)
+        resolved_episode_identities = self._episode_identity_set(self.shards)
+        eval_logical_catalog = self._eval_logical_episode_identities
+        if eval_logical_catalog is not None:
+            missing = eval_logical_catalog - resolved_episode_identities
+            if missing:
+                raise ValueError(
+                    "Canonical eval logical catalog contains episodes absent "
+                    "from the authenticated production-source metadata: "
+                    f"{sorted(missing)[:5]}."
+                )
+            # Raw source metadata can contain strict-invalid or fractionally
+            # unselected episodes.  Evaluation provenance must describe the
+            # exact production train+holdout catalog instead.
+            self._full_episode_identities = eval_logical_catalog
+        else:
+            self._full_episode_identities = resolved_episode_identities
         handoff_smoke = (
             self._validate_checkpoint_handoff_smoke_eval_binding()
         )
@@ -2357,7 +2689,10 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
                         "does not match the current filtered stream."
                     )
         if self.mode == "train" and self.canonical_eval_manifest is not None:
-            self.shards = self._without_heldout_episodes(self.shards)
+            self.shards = self._without_heldout_episodes(
+                self.shards,
+                allow_partial_catalog=handoff_smoke,
+            )
             if not self.shards:
                 raise RuntimeError(
                     "Canonical heldout split removed every selected training episode."
@@ -2554,6 +2889,7 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
         stem = (
             f"{self.frozen_train_view.view_id[:16]}."
             f"{ledger_sha256[:16]}."
+            f"{self.adapter_contract_sha256[:16]}."
             f"{encoding}"
         )
         return (
@@ -3707,8 +4043,9 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
 
     def _frozen_view_episode_identity_set(
         self,
+        view: FrozenDatasetView | None = None,
     ) -> frozenset[tuple[str, str, str, str, int]]:
-        view = self.frozen_train_view
+        view = self.frozen_train_view if view is None else view
         if view is None:
             return frozenset()
         identities: set[tuple[str, str, str, str, int]] = set()
@@ -3742,11 +4079,13 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
     def _without_heldout_episodes(
         self,
         shards: Sequence[ShardSpec],
+        *,
+        allow_partial_catalog: bool = False,
     ) -> list[ShardSpec]:
         assert self.canonical_eval_manifest is not None
         heldout = self.canonical_eval_manifest.heldout_episode_identities
         missing = heldout - self._episode_identity_set(shards)
-        if missing:
+        if missing and not allow_partial_catalog:
             preview = sorted(missing)[:5]
             raise ValueError(
                 "Canonical evaluation manifest references episodes outside the "
@@ -3911,14 +4250,19 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
     def _candidate_rows(self) -> list[tuple[dict[str, Any], dict[str, Any], Any]]:
         rows = _read_jsonl_gz(self.manifest_path)
         frozen_sources: frozenset[tuple[str, str, str]] | None = None
-        if self.frozen_train_view is not None:
+        source_scope_view = (
+            self.frozen_train_view
+            if self.frozen_train_view is not None
+            else getattr(self, "eval_catalog_view", None)
+        )
+        if source_scope_view is not None:
             frozen_sources = frozenset(
                 (
                     str(source["dataset_id"]),
                     str(source["sid"]),
                     str(source["revision"]),
                 )
-                for source in self.frozen_train_view.descriptor["sources"]
+                for source in source_scope_view.descriptor["sources"]
             )
         candidates = []
         for row in rows:
@@ -4059,8 +4403,32 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
     def _build_metadata_index_cache_key(self) -> str:
         payload = {
             "version": CANONICAL_INDEX_CACHE_VERSION,
+            "mode": getattr(self, "mode", "train"),
             "manifest_path": self.manifest_path.resolve().as_posix(),
             "manifest_sha256": _hash_file(self.manifest_path),
+            "frozen_train_view_manifest_path": (
+                None
+                if self.frozen_train_view_manifest_path is None
+                else self.frozen_train_view_manifest_path.resolve().as_posix()
+            ),
+            "frozen_train_view_manifest_sha256": (
+                self.frozen_train_view_manifest_sha256
+            ),
+            "eval_catalog_view_manifest_path": (
+                None
+                if getattr(
+                    self, "eval_catalog_view_manifest_path", None
+                )
+                is None
+                else self.eval_catalog_view_manifest_path.resolve().as_posix()
+            ),
+            "eval_catalog_view_manifest_sha256": (
+                getattr(
+                    self,
+                    "eval_catalog_view_manifest_sha256",
+                    None,
+                )
+            ),
             "adapter_dir": self.adapter_dir.resolve().as_posix(),
             "adapter_manifest_sha256": _hash_file(self.adapter_dir / "MANIFEST.json"),
             "adapter_dir_fingerprint": _fingerprint_directory(self.adapter_dir),
@@ -4426,11 +4794,16 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
                 )
                 subtask_segments_stat = subtask_segments_path.stat()
                 source_descriptor = None
-                if self.frozen_train_view is not None:
+                source_scope_view = (
+                    self.frozen_train_view
+                    if self.frozen_train_view is not None
+                    else getattr(self, "eval_catalog_view", None)
+                )
+                if source_scope_view is not None:
                     source_descriptor = next(
                         (
                             source
-                            for source in self.frozen_train_view.descriptor[
+                            for source in source_scope_view.descriptor[
                                 "sources"
                             ]
                             if str(source.get("dataset_id")) == dataset_id
@@ -7285,6 +7658,29 @@ class DeterministicCanonicalEvalDataset(torch.utils.data.Dataset):
                 }
             ],
         }
+        eval_catalog_view = getattr(
+            self.source, "eval_catalog_view", None
+        )
+        if eval_catalog_view is not None:
+            report["eval_catalog_view"] = {
+                "manifest_path": (
+                    self.source.eval_catalog_view_manifest_path.as_posix()
+                ),
+                "manifest_sha256": (
+                    self.source.eval_catalog_view_manifest_sha256
+                ),
+                "view_id": eval_catalog_view.view_id,
+                "ledger_sha256": str(
+                    eval_catalog_view.descriptor["rows"]["sha256"]
+                ),
+                "train_episode_count": int(
+                    eval_catalog_view.episode_count
+                ),
+                "logical_catalog_episode_count": len(full),
+                "logical_catalog_sha256": _stable_json_sha256(
+                    self._identity_payload(full)
+                ),
+            }
         if self.manifest.selection.frames_per_episode is not None:
             report["frames_per_episode"] = int(
                 self.manifest.selection.frames_per_episode

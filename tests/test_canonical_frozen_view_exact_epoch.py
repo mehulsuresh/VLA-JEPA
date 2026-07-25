@@ -29,6 +29,73 @@ def _sha(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def _metadata_cache_key_dataset(
+    tmp_path: Path,
+) -> CanonicalSubsetVLADataset:
+    manifest = tmp_path / "canonical-manifest.jsonl.gz"
+    manifest.write_bytes(b"immutable canonical source manifest\n")
+    adapter_dir = tmp_path / "adapters"
+    adapter_dir.mkdir()
+    (adapter_dir / "MANIFEST.json").write_text(
+        '{"adapters":[]}\n',
+        encoding="utf-8",
+    )
+    dataset = object.__new__(CanonicalSubsetVLADataset)
+    dataset.manifest_path = manifest
+    dataset.frozen_train_view_manifest_path = tmp_path / "view-a.json"
+    dataset.frozen_train_view_manifest_sha256 = _sha("view-a")
+    dataset.adapter_dir = adapter_dir
+    dataset.cache_dir = tmp_path / "cache"
+    dataset.bucket_root = "gs://fixture"
+    dataset.dataset_id_list = []
+    dataset.exclude_dataset_id_list = []
+    dataset.exclude_dataset_ids_path_list = []
+    dataset.exclude_sid_list = []
+    dataset.exclude_sid_path_list = []
+    dataset.adapter_group_ids = set()
+    dataset.camera_slots = ["left", "right", "main"]
+    dataset.qwen_camera_slots = ["main", "left", "right"]
+    dataset.vjepa_camera_slots = ["left", "right", "main"]
+    dataset.append_subtask_to_prompt = True
+    dataset.preferred_fps = {30.0}
+    dataset.allow_gcs_download = True
+    dataset.max_shards = 0
+    dataset.max_shards_per_dataset = 0
+    dataset.max_windows = 0
+    dataset.max_windows_per_dataset = 0
+    dataset.canonical_eval_min_episodes_per_shard = 2
+    dataset.sample_stride = 1
+    dataset.video_horizon = 8
+    dataset.action_horizon = 50
+    dataset.action_type = "joint_delta_gripper_absolute"
+    dataset.action_delta_anchor = "chunk_start_state"
+    dataset.absolute_action_references = {"absolute_qpos"}
+    dataset.action_sidecar_variant = "fixture"
+    dataset.video_frame_stride = 1
+    dataset.video_target_shift_steps = 0
+    dataset.lazy_cache_shards = True
+    dataset.index_windows_lazily = True
+    return dataset
+
+
+def test_metadata_cache_key_binds_frozen_view_path_and_sha256(
+    tmp_path: Path,
+) -> None:
+    dataset = _metadata_cache_key_dataset(tmp_path)
+    first = dataset._build_metadata_index_cache_key()
+
+    dataset.frozen_train_view_manifest_path = tmp_path / "view-b.json"
+    second = dataset._build_metadata_index_cache_key()
+
+    dataset.frozen_train_view_manifest_path = tmp_path / "view-a.json"
+    dataset.frozen_train_view_manifest_sha256 = _sha("view-b")
+    third = dataset._build_metadata_index_cache_key()
+
+    assert first != second
+    assert first != third
+    assert second != third
+
+
 def _build_view(
     tmp_path: Path,
     *,
@@ -570,6 +637,22 @@ def test_frozen_canonical_corrupt_cached_offset_index_fails_closed(
 
     with pytest.raises(RuntimeError, match="SHA-256 mismatch"):
         _dataset(tmp_path)
+
+
+def test_frozen_canonical_offset_cache_isolated_by_adapter_contract(
+    tmp_path: Path,
+) -> None:
+    dataset = _dataset(tmp_path)
+    first_path = dataset.frozen_train_view_index_path
+    ledger_sha256 = str(
+        dataset.frozen_train_view.descriptor["rows"]["sha256"]
+    )
+
+    dataset.adapter_contract_sha256 = _sha("new-adapter-contract")
+    second_path, _, _ = dataset._frozen_index_cache_paths(ledger_sha256)
+
+    assert first_path != second_path
+    assert dataset.adapter_contract_sha256[:16] in second_path.name
 
 
 def test_frozen_view_and_index_hashes_bind_resume_provenance(
