@@ -14,11 +14,11 @@ shared_contract:
   action_delta_anchor: chunk_start_state
   gripper_action_type: absolute
   state_action_normalization: q01_q99_unclipped
-  normalization_statistics_artifact: /data/mehul-vla-jepa/data_contracts/handoff_smoke_openpi_q01q99_v3/openpi_q01q99_unclipped.json
-  normalization_statistics_artifact_sha256: b33359e94f92897c0de9791e41aeab1e2caae8fa791292140030322b33838f11
+  normalization_statistics_artifact: /data/mehul-vla-jepa/data_contracts/handoff_smoke_openpi_q01q99_v4/openpi_q01q99_unclipped.json
+  normalization_statistics_artifact_sha256: 5dc0d902a5ea89a8c16fdb3efb326e2f87a4259b98d4083f74f31f26b595aff0
   action_representation_contract_sha256: 9e1df348fb137c206b42a183892e29ec6247595fffc232bb2d73d94b5f5f91ac
-  statistics_holdout_manifest: /data/mehul-vla-jepa/data_contracts/handoff_smoke_openpi_q01q99_v3/holdout.json
-  statistics_holdout_manifest_sha256: e48b30bf52d34c3b3d78563b1697438cb80b68b40d346d892e5870b4fbe927c2
+  statistics_holdout_manifest: /data/mehul-vla-jepa/data_contracts/handoff_smoke_openpi_q01q99_v4/holdout.json
+  statistics_holdout_manifest_sha256: a395232da6b03ba33b4d166f549d4ea8e4b4fbbbb6f4bf883175a4295d37f82c
 stages:
 - id: realsource_handoff_smoke
   role: pretrain
@@ -26,7 +26,7 @@ stages:
   handoff_checkpoint: natural_final
   config: scripts/config/h100/generated/realman_checkpoint_handoff_smoke_v1/01_realsource_one_step_v1.yaml
   expected_full_dataset_epochs: 1
-  local_evaluation_manifest_sha256: b6266499f5ee19c550b56d6a30951c81473bfe29fa40f8c1b588d3ffade35abe
+  local_evaluation_manifest_sha256: 7a1f8420aa8824c0bea0681a6acfa10193fca06b4f182174769f62894729a6d9
   monitoring:
     first_epoch_exposure_fractions:
     - 1.0

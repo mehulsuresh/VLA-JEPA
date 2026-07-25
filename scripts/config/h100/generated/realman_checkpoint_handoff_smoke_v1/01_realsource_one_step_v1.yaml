@@ -2,8 +2,8 @@ extends:
 - scripts/config/h100/realman_curriculum/handoff_smoke/realsource_one_step_v1.yaml
 datasets:
   vla_data:
-    frozen_train_view_manifest: deployment/realman/curriculum_manifests/handoff_smoke/realsource_handoff_smoke_128_v2.json
-    frozen_train_view_manifest_sha256: e3fe577fe7ecf1a4f5adb28470af9e2bb600fdc1babf86358205442935063857
-    normalization_statistics_artifact: /data/mehul-vla-jepa/data_contracts/handoff_smoke_openpi_q01q99_v3/openpi_q01q99_unclipped.json
-    normalization_statistics_artifact_sha256: b33359e94f92897c0de9791e41aeab1e2caae8fa791292140030322b33838f11
-    canonical_eval_manifest: /data/mehul-vla-jepa/checkpoints/eval_manifests/realsource_strict_valid_fractional_eval128_v3.json
+    frozen_train_view_manifest: deployment/realman/curriculum_manifests/handoff_smoke/realsource_handoff_smoke_128_v3.json
+    frozen_train_view_manifest_sha256: 48240827962df145792874d469e6f15c3f35bbed3db3e10e6c24bc2dc3fe0c5e
+    normalization_statistics_artifact: /data/mehul-vla-jepa/data_contracts/handoff_smoke_openpi_q01q99_v4/openpi_q01q99_unclipped.json
+    normalization_statistics_artifact_sha256: 5dc0d902a5ea89a8c16fdb3efb326e2f87a4259b98d4083f74f31f26b595aff0
+    canonical_eval_manifest: /data/mehul-vla-jepa/checkpoints/eval_manifests/realsource_strict_valid_fractional_eval128_v4.json
