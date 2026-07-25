@@ -98,6 +98,14 @@ DEFAULT_QWEN_CAMERA_SLOTS = ("main", "left", "right", "extra")
 DEFAULT_VJEPA_CAMERA_SLOTS = ("left", "right", "main")
 JOINT_DELTA_GRIPPER_ABSOLUTE = "joint_delta_gripper_absolute"
 SHARD_Q01_Q99 = "shard_q01_q99"
+CHECKPOINT_HANDOFF_SMOKE_PURPOSE = "checkpoint_handoff_smoke"
+CHECKPOINT_HANDOFF_SMOKE_VIEW_SCHEMA = (
+    "realman-checkpoint-handoff-smoke-view-v1"
+)
+CHECKPOINT_HANDOFF_SMOKE_STATISTICS_SCHEMA = (
+    "realman-handoff-smoke-statistics-v1"
+)
+CHECKPOINT_HANDOFF_SMOKE_SCOPE = "checkpoint_handoff_validation_only"
 REALSOURCE_DATASET_PREFIX = "RealSourceData/RealSource-World/"
 REALSOURCE_COLLECT_MAIL_DATASET_ID = (
     "RealSourceData/RealSource-World/Collect_the_mail"
@@ -1572,6 +1580,229 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
         self.frozen_train_view_manifest_sha256 = actual_manifest_sha256
         self.frozen_train_view = view
 
+    def _validate_checkpoint_handoff_smoke_eval_binding(self) -> bool:
+        """Authenticate the one-batch smoke against its production eval split.
+
+        A handoff smoke is intentionally a tiny prefix of a production frozen
+        view, so ``smoke train episodes ∪ production holdout episodes`` cannot
+        reproduce the production eval manifest's full catalog count/hash.  We
+        accept that mismatch only when the frozen view, exact eval manifest,
+        and isolated smoke statistics mutually authenticate one another.
+
+        Returning ``False`` means this is an ordinary production view and the
+        caller must retain the full catalog count/hash validation.
+        """
+
+        view = self.frozen_train_view
+        if (
+            view is None
+            or view.descriptor.get("purpose")
+            != CHECKPOINT_HANDOFF_SMOKE_PURPOSE
+        ):
+            return False
+        evaluation = self.canonical_eval_manifest
+        if evaluation is None:
+            raise ValueError(
+                "Canonical checkpoint-handoff smoke requires its exact "
+                "production evaluation manifest."
+            )
+        if view.row_count != 128 or view.unique_sample_count != 128:
+            raise ValueError(
+                "Canonical checkpoint-handoff smoke must contain exactly "
+                "128 unique logical rows."
+            )
+
+        usage = view.descriptor.get("usage_contract")
+        expected_usage = {
+            "training_allowed": True,
+            "scope": CHECKPOINT_HANDOFF_SMOKE_SCOPE,
+            "model_quality_claim_allowed": False,
+            "statistics_accumulation": "forbidden",
+        }
+        if usage != expected_usage:
+            raise ValueError(
+                "Canonical checkpoint-handoff smoke has an unsafe "
+                "usage_contract."
+            )
+
+        selection = view.descriptor.get("selection")
+        if not isinstance(selection, Mapping):
+            raise ValueError(
+                "Canonical checkpoint-handoff smoke lacks selection lineage."
+            )
+        parent_manifest = selection.get("parent_manifest")
+        parent_digests = {
+            "parent_manifest_sha256": selection.get(
+                "parent_manifest_sha256"
+            ),
+            "parent_view_id": selection.get("parent_view_id"),
+            "parent_ledger_sha256": selection.get(
+                "parent_ledger_sha256"
+            ),
+        }
+        if (
+            selection.get("schema")
+            != CHECKPOINT_HANDOFF_SMOKE_VIEW_SCHEMA
+            or selection.get("algorithm")
+            != "ordered_logical_prefix_from_authenticated_parent_v1"
+            or selection.get("requested_logical_row_count") != 128
+            or not isinstance(parent_manifest, str)
+            or not parent_manifest
+            or any(
+                not self._valid_sha256(value)
+                for value in parent_digests.values()
+            )
+        ):
+            raise ValueError(
+                "Canonical checkpoint-handoff smoke lacks authenticated "
+                "production-parent lineage."
+            )
+
+        binding = selection.get("evaluation_holdout")
+        if not isinstance(binding, Mapping):
+            raise ValueError(
+                "Canonical checkpoint-handoff smoke lacks its production "
+                "evaluation-holdout binding."
+            )
+        episode_identities = sorted(
+            evaluation.heldout_episode_identities
+        )
+        unsigned_binding = dict(binding)
+        binding_sha256 = unsigned_binding.pop("sha256", None)
+        expected_binding = {
+            "schema": "realsource-canonical-eval-holdout-binding-v1",
+            "manifest_sha256": evaluation.sha256,
+            "source_manifest_sha256": (
+                evaluation.source_manifest_sha256
+            ),
+            "window_count": len(evaluation.windows),
+            "episode_count": len(episode_identities),
+            "episode_identity_fields": [
+                "dataset_id",
+                "sid",
+                "revision",
+                "data_file",
+                "episode_index",
+            ],
+            "episode_identities_sha256": _stable_json_sha256(
+                episode_identities
+            ),
+            "copy_detection": [
+                "episode_identity",
+                "episode_lineage_id",
+                "episode_content_id",
+            ],
+        }
+        mismatches = {
+            key: {"expected": expected, "found": binding.get(key)}
+            for key, expected in expected_binding.items()
+            if binding.get(key) != expected
+        }
+        if (
+            mismatches
+            or not self._valid_sha256(binding_sha256)
+            or binding_sha256
+            != _stable_json_sha256(unsigned_binding)
+        ):
+            raise ValueError(
+                "Canonical checkpoint-handoff smoke is not bound to the "
+                f"exact production evaluation population: {mismatches}."
+            )
+
+        exclusions = view.descriptor.get("holdout_exclusions")
+        if (
+            not isinstance(exclusions, Mapping)
+            or exclusions.get("source_id")
+            != f"canonical_eval_manifest:{evaluation.sha256}"
+            or not exclusions.get("lineage_ids")
+            or not exclusions.get("content_ids")
+        ):
+            raise ValueError(
+                "Canonical checkpoint-handoff smoke lacks the production "
+                "dual-identity holdout exclusions."
+            )
+
+        statistics = self.normalization_statistics
+        population = (
+            statistics.get("population")
+            if isinstance(statistics, Mapping)
+            else None
+        )
+        sources = (
+            population.get("sources")
+            if isinstance(population, Mapping)
+            else None
+        )
+        if (
+            not isinstance(population, Mapping)
+            or population.get("source_order")
+            != ["realsource", "intervention", "hq"]
+            or population.get("unique_base_frames") != 384
+            or not isinstance(sources, list)
+            or [
+                candidate.get("id")
+                if isinstance(candidate, Mapping)
+                else None
+                for candidate in sources
+            ]
+            != ["realsource", "intervention", "hq"]
+        ):
+            raise ValueError(
+                "Canonical checkpoint-handoff smoke requires the exact "
+                "384-row RealSource/intervention/HQ normalization population."
+            )
+        source = next(
+            (
+                candidate
+                for candidate in sources
+                if isinstance(candidate, Mapping)
+                and candidate.get("id") == "realsource"
+            ),
+            None,
+        )
+        provenance = (
+            source.get("provenance")
+            if isinstance(source, Mapping)
+            else None
+        )
+        smoke_statistics = (
+            provenance.get("handoff_smoke")
+            if isinstance(provenance, Mapping)
+            else None
+        )
+        expected_statistics = {
+            "schema": CHECKPOINT_HANDOFF_SMOKE_STATISTICS_SCHEMA,
+            "scope": CHECKPOINT_HANDOFF_SMOKE_SCOPE,
+            "model_quality_claim_allowed": False,
+            "exact_training_logical_rows": 128,
+            "parent_smoke_view_sha256": view.manifest_sha256,
+            "parent_smoke_ledger_sha256": (
+                view.descriptor["rows"]["sha256"]
+            ),
+        }
+        statistics_mismatches = {
+            key: {
+                "expected": expected,
+                "found": (
+                    smoke_statistics.get(key)
+                    if isinstance(smoke_statistics, Mapping)
+                    else None
+                ),
+            }
+            for key, expected in expected_statistics.items()
+            if (
+                not isinstance(smoke_statistics, Mapping)
+                or smoke_statistics.get(key) != expected
+            )
+        }
+        if statistics_mismatches:
+            raise ValueError(
+                "Canonical checkpoint-handoff smoke is not bound to its "
+                "isolated smoke-only normalization population: "
+                f"{statistics_mismatches}."
+            )
+        return True
+
     def __init__(
         self,
         data_cfg: Any,
@@ -2088,37 +2319,43 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
 
         self.shards = self._resolve_shards_with_index_cache()
         self._full_episode_identities = self._episode_identity_set(self.shards)
+        handoff_smoke = (
+            self._validate_checkpoint_handoff_smoke_eval_binding()
+        )
         if self.canonical_eval_manifest is not None:
-            selection = self.canonical_eval_manifest.selection
-            configured_episode_identities = self._full_episode_identities
-            if self.frozen_train_view is not None:
-                # The frozen view defines this experiment's population. Its
-                # production ledger is already holdout-free, so reconstruct
-                # the exact pre-holdout selection as train ∪ holdout.
-                configured_episode_identities = frozenset(
-                    {
-                        *self._frozen_view_episode_identity_set(),
-                        *self.canonical_eval_manifest.heldout_episode_identities,
-                    }
+            if not handoff_smoke:
+                selection = self.canonical_eval_manifest.selection
+                configured_episode_identities = self._full_episode_identities
+                if self.frozen_train_view is not None:
+                    # The frozen view defines this experiment's population.
+                    # Its production ledger is already holdout-free, so
+                    # reconstruct the exact pre-holdout selection as train ∪
+                    # holdout.
+                    configured_episode_identities = frozenset(
+                        {
+                            *self._frozen_view_episode_identity_set(),
+                            *self.canonical_eval_manifest.heldout_episode_identities,
+                        }
+                    )
+                catalog_count = len(configured_episode_identities)
+                catalog_sha256 = _stable_json_sha256(
+                    sorted(configured_episode_identities)
                 )
-            catalog_count = len(configured_episode_identities)
-            catalog_sha256 = _stable_json_sha256(
-                sorted(configured_episode_identities)
-            )
-            if selection.configured_episode_count != catalog_count:
-                raise ValueError(
-                    "Canonical evaluation manifest configured_episode_count "
-                    "does not match the current filtered stream: "
-                    f"{selection.configured_episode_count} != {catalog_count}."
-                )
-            if (
-                selection.configured_episode_catalog_sha256
-                != catalog_sha256
-            ):
-                raise ValueError(
-                    "Canonical evaluation manifest episode catalog hash does "
-                    "not match the current filtered stream."
-                )
+                if selection.configured_episode_count != catalog_count:
+                    raise ValueError(
+                        "Canonical evaluation manifest "
+                        "configured_episode_count does not match the current "
+                        f"filtered stream: {selection.configured_episode_count} "
+                        f"!= {catalog_count}."
+                    )
+                if (
+                    selection.configured_episode_catalog_sha256
+                    != catalog_sha256
+                ):
+                    raise ValueError(
+                        "Canonical evaluation manifest episode catalog hash "
+                        "does not match the current filtered stream."
+                    )
         if self.mode == "train" and self.canonical_eval_manifest is not None:
             self.shards = self._without_heldout_episodes(self.shards)
             if not self.shards:
