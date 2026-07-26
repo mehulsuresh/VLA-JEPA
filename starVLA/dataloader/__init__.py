@@ -1,4 +1,5 @@
 import copy
+import hashlib
 import json
 import math
 import multiprocessing as mp
@@ -29,6 +30,151 @@ _EXHAUSTIVE_EPOCH_SAMPLING_STRATEGIES = frozenset(
 )
 _CANONICAL_REALMAN_ACTION_DIM = 18
 _CANONICAL_SEMANTIC_FLAT_ACTION_DIM = 49
+_EXHAUSTIVE_GLOBAL_AFFINE = "global_affine"
+_EXHAUSTIVE_VIDEO_LOCAL_BLOCKS = "video_local_blocks"
+_CANONICAL_VIDEO_LOCAL_SAMPLER_VERSION = (
+    "all_sources_exhaustive_frozen_view_video_local_sampler_v1"
+)
+_CANONICAL_FROZEN_AFFINE_VERSION = (
+    "all_sources_exhaustive_frozen_view_affine_v1"
+)
+
+
+class _CanonicalVideoLocalExhaustiveSampler(
+    torch.utils.data.SequentialSampler
+):
+    """Reorder exact canonical epochs by episode without changing row semantics.
+
+    The canonical dataset already maps each loader index through a deterministic
+    affine bijection. This sampler emits the inverse affine loader index for a
+    desired raw row, allowing compact episode ranges to remain contiguous while
+    preserving the dataset's exact once-per-epoch contract.
+    """
+
+    algorithm_version = _CANONICAL_VIDEO_LOCAL_SAMPLER_VERSION
+
+    def __init__(self, dataset) -> None:
+        super().__init__(dataset)
+        if (
+            getattr(dataset, "epoch_sampling_algorithm_version", None)
+            != _CANONICAL_FROZEN_AFFINE_VERSION
+        ):
+            raise ValueError(
+                "Canonical video-local exhaustive sampling requires the "
+                "authenticated frozen-view affine dataset schedule."
+            )
+        frozen_view = getattr(dataset, "frozen_train_view", None)
+        if (
+            frozen_view is None
+            or getattr(frozen_view, "encoding", None)
+            != "episode_ranges_v1"
+        ):
+            raise ValueError(
+                "Canonical exhaustive_window_order='video_local_blocks' "
+                "requires a frozen episode_ranges_v1 view; expanded row views "
+                "do not authenticate episode block boundaries."
+            )
+        offsets, _ = dataset._open_frozen_view_readers()
+        cumulative = np.asarray(offsets[:, 1], dtype=np.int64).copy()
+        length = int(len(dataset))
+        if (
+            cumulative.ndim != 1
+            or cumulative.size < 2
+            or int(cumulative[0]) != 0
+            or int(cumulative[-1]) != length
+            or np.any(cumulative[1:] <= cumulative[:-1])
+        ):
+            raise RuntimeError(
+                "Canonical video-local exhaustive block boundaries are "
+                "invalid or do not cover the exact logical epoch."
+            )
+        self._block_starts = cumulative[:-1]
+        self._block_ends = cumulative[1:]
+        self._length = length
+        self.epoch = int(getattr(dataset, "current_epoch", 0))
+        self.source_algorithm_version = str(
+            dataset.epoch_sampling_algorithm_version
+        )
+        dataset.epoch_sampling_algorithm_version = self.algorithm_version
+        dataset.exhaustive_window_order = (
+            _EXHAUSTIVE_VIDEO_LOCAL_BLOCKS
+        )
+
+    @staticmethod
+    def _affine_parameters(length: int, seed: int) -> tuple[int, int]:
+        if length <= 1:
+            return 1, 0
+        multiplier = int(seed % length) or 1
+        while math.gcd(multiplier, length) != 1:
+            multiplier += 1
+            if multiplier >= length:
+                multiplier = 1
+        offset = int((seed >> 64) % length)
+        return multiplier, offset
+
+    def _dataset_inverse_affine(self, epoch: int) -> tuple[int, int]:
+        if self._length <= 1:
+            return 1, 0
+        dataset = self.data_source
+        seed_payload = (
+            f"{dataset.epoch_sampling_strategy}|{int(epoch)}|"
+            f"{int(dataset.seed)}|{self._length}"
+        ).encode("utf-8")
+        permutation_seed = int.from_bytes(
+            hashlib.sha256(seed_payload).digest()[:16],
+            byteorder="big",
+            signed=False,
+        )
+        multiplier, offset = self._affine_parameters(
+            self._length, permutation_seed
+        )
+        return pow(multiplier, -1, self._length), offset
+
+    def _block_order(self, epoch: int) -> np.ndarray:
+        block_count = int(self._block_starts.size)
+        seed_payload = (
+            f"{self.algorithm_version}|{int(self.data_source.seed)}|"
+            f"{self._length}|{block_count}"
+        ).encode("utf-8")
+        permutation_seed = int.from_bytes(
+            hashlib.sha256(seed_payload).digest()[:16],
+            byteorder="big",
+            signed=False,
+        )
+        multiplier, offset = self._affine_parameters(
+            block_count, permutation_seed
+        )
+        positions = (
+            np.arange(block_count, dtype=np.int64) + int(epoch)
+        ) % block_count
+        return (multiplier * positions + offset) % block_count
+
+    def __iter__(self):
+        dataset = self.data_source
+        dataset.set_epoch(self.epoch)
+        inverse_multiplier, dataset_offset = (
+            self._dataset_inverse_affine(self.epoch)
+        )
+        for block_index in self._block_order(self.epoch):
+            start = int(self._block_starts[int(block_index)])
+            stop = int(self._block_ends[int(block_index)])
+            for raw_index in range(start, stop):
+                yield int(
+                    inverse_multiplier
+                    * ((raw_index - dataset_offset) % self._length)
+                    % self._length
+                )
+
+    def __len__(self) -> int:
+        return self._length
+
+    def set_epoch(self, epoch: int) -> None:
+        if isinstance(epoch, bool) or int(epoch) < 0:
+            raise ValueError(
+                f"epoch must be a non-negative integer, got {epoch!r}"
+            )
+        self.epoch = int(epoch)
+        self.data_source.set_epoch(self.epoch)
 
 
 def _canonical_eval_metric_groups(action_dim: int) -> list[str]:
@@ -216,6 +362,67 @@ def _validate_exhaustive_dataloader(dataset, dataloader: DataLoader) -> None:
             "Exhaustive epoch DataLoader must use shuffle=false; the dataset "
             "owns the deterministic epoch permutation."
         )
+    window_order = str(
+        getattr(
+            dataset,
+            "exhaustive_window_order",
+            _EXHAUSTIVE_GLOBAL_AFFINE,
+        )
+    )
+    if (
+        window_order == _EXHAUSTIVE_VIDEO_LOCAL_BLOCKS
+        and not isinstance(
+            dataloader.sampler,
+            _CanonicalVideoLocalExhaustiveSampler,
+        )
+    ):
+        raise RuntimeError(
+            "Canonical video-local exhaustive training lost its authenticated "
+            "episode-block sampler."
+        )
+
+
+def _resolve_canonical_exhaustive_sampler(
+    vla_dataset_cfg,
+    dataset,
+    *,
+    exhaustive_training: bool,
+    is_eval: bool,
+):
+    raw_order = vla_dataset_cfg.get(
+        "exhaustive_window_order",
+        _EXHAUSTIVE_GLOBAL_AFFINE,
+    )
+    if not isinstance(raw_order, str) or not raw_order.strip():
+        raise ValueError(
+            "datasets.vla_data.exhaustive_window_order must be a non-empty "
+            "string."
+        )
+    window_order = raw_order.strip().lower()
+    if window_order not in {
+        _EXHAUSTIVE_GLOBAL_AFFINE,
+        _EXHAUSTIVE_VIDEO_LOCAL_BLOCKS,
+    }:
+        raise ValueError(
+            "Canonical exhaustive_window_order must be "
+            f"{_EXHAUSTIVE_GLOBAL_AFFINE!r} or "
+            f"{_EXHAUSTIVE_VIDEO_LOCAL_BLOCKS!r}; got "
+            f"{window_order!r}."
+        )
+    if is_eval:
+        return None
+    if not exhaustive_training:
+        if window_order != _EXHAUSTIVE_GLOBAL_AFFINE:
+            raise ValueError(
+                "Canonical exhaustive_window_order="
+                f"{window_order!r} requires "
+                "epoch_sampling_strategy='all_sources_exhaustive'."
+            )
+        return None
+    dataset.exhaustive_window_order = window_order
+    if window_order == _EXHAUSTIVE_VIDEO_LOCAL_BLOCKS:
+        return _CanonicalVideoLocalExhaustiveSampler(dataset)
+    return None
 
 
 def _resolve_worker_multiprocessing_context(
@@ -891,6 +1098,12 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets", model=None, *, mode: st
         )
         if exhaustive_training:
             _validate_exhaustive_dataset_schedule(vla_dataset)
+        canonical_sampler = _resolve_canonical_exhaustive_sampler(
+            vla_dataset_cfg,
+            vla_dataset,
+            exhaustive_training=exhaustive_training,
+            is_eval=is_eval,
+        )
         loader_generator = None
         batch_size = int(
             vla_dataset_cfg.get(
@@ -960,6 +1173,8 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets", model=None, *, mode: st
             drop_last=drop_last,
             generator=loader_generator,
         )
+        if canonical_sampler is not None:
+            loader_kwargs["sampler"] = canonical_sampler
         if num_workers > 0:
             loader_kwargs["prefetch_factor"] = _loader_prefetch_factor(
                 vla_dataset_cfg,

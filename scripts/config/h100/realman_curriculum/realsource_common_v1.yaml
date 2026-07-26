@@ -100,6 +100,12 @@ datasets:
     sample_stride: 1
     sidecar_dtype: float16
     video_decode_backend: pyav
+    # Keep each persistent worker's resident decoder/sidecar set bounded.
+    # With 32 workers, the old implicit cache of 64 readers allowed tens of
+    # unrelated MP4 decoders per worker to consume most of host RAM.
+    reader_cache_size: 2
+    pyav_reader_cache_size: 2
+    sidecar_cache_size: 2
     lazy_cache_shards: true
     index_windows_lazily: true
     prefetch_metadata_across_ranks: true

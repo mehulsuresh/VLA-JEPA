@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -9,10 +11,16 @@ from omegaconf import OmegaConf
 from torch.utils.data import DataLoader, Dataset
 
 from starVLA.dataloader import (
+    _CANONICAL_VIDEO_LOCAL_SAMPLER_VERSION,
+    _CanonicalVideoLocalExhaustiveSampler,
+    _resolve_canonical_exhaustive_sampler,
     _resolve_epoch_loader_contract,
     _validate_exhaustive_dataloader,
     _validate_exhaustive_dataset_schedule,
     build_dataloader,
+)
+from starVLA.dataloader.canonical_subset_dataset import (
+    CanonicalSubsetVLADataset,
 )
 
 
@@ -41,6 +49,58 @@ class _ExactDataset(Dataset):
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = int(epoch)
+
+
+class _CanonicalRangeDataset(_ExactDataset):
+    def __init__(
+        self,
+        *,
+        block_lengths: tuple[int, ...] = (256, 256, 256, 256),
+        seed: int = 23,
+        encoding: str = "episode_ranges_v1",
+    ) -> None:
+        self.block_lengths = tuple(int(value) for value in block_lengths)
+        super().__init__(size=sum(self.block_lengths))
+        self.seed = int(seed)
+        self.epoch_sampling_algorithm_version = (
+            "all_sources_exhaustive_frozen_view_affine_v1"
+        )
+        self.frozen_train_view = SimpleNamespace(encoding=encoding)
+        cumulative = np.concatenate(
+            (
+                np.zeros((1,), dtype=np.uint64),
+                np.cumsum(self.block_lengths, dtype=np.uint64),
+            )
+        )
+        self._offsets = np.zeros(
+            (cumulative.size, 2), dtype=np.uint64
+        )
+        self._offsets[:, 1] = cumulative
+
+    @property
+    def current_epoch(self) -> int:
+        return int(self.epoch)
+
+    def _open_frozen_view_readers(self):
+        return self._offsets, None
+
+    def __getitem__(self, index: int) -> int:
+        length = len(self)
+        seed_payload = (
+            f"{self.epoch_sampling_strategy}|{self.current_epoch}|"
+            f"{self.seed}|{length}"
+        ).encode("utf-8")
+        permutation_seed = int.from_bytes(
+            hashlib.sha256(seed_payload).digest()[:16],
+            byteorder="big",
+            signed=False,
+        )
+        multiplier, offset = (
+            CanonicalSubsetVLADataset._affine_permutation_parameters(
+                length, permutation_seed
+            )
+        )
+        return int((multiplier * int(index) + offset) % length)
 
 
 @pytest.mark.parametrize(
@@ -117,6 +177,82 @@ def test_exhaustive_schedule_and_loader_surface_are_consistent() -> None:
         _validate_exhaustive_dataloader(dataset, shuffled)
 
 
+def test_canonical_video_local_sampler_is_exact_and_episode_contiguous() -> None:
+    dataset = _CanonicalRangeDataset()
+    sampler = _resolve_canonical_exhaustive_sampler(
+        {"exhaustive_window_order": "video_local_blocks"},
+        dataset,
+        exhaustive_training=True,
+        is_eval=False,
+    )
+    assert isinstance(sampler, _CanonicalVideoLocalExhaustiveSampler)
+    loader = DataLoader(
+        dataset,
+        batch_size=16,
+        sampler=sampler,
+        shuffle=False,
+        drop_last=False,
+    )
+    _validate_exhaustive_dataloader(dataset, loader)
+
+    epoch_zero = [
+        int(value)
+        for batch in loader
+        for value in batch.tolist()
+    ]
+    sampler.set_epoch(1)
+    epoch_one = [
+        int(value)
+        for batch in loader
+        for value in batch.tolist()
+    ]
+
+    assert dataset.epoch_sampling_algorithm_version == (
+        _CANONICAL_VIDEO_LOCAL_SAMPLER_VERSION
+    )
+    assert sorted(epoch_zero) == list(range(len(dataset)))
+    assert sorted(epoch_one) == list(range(len(dataset)))
+    assert epoch_zero != epoch_one
+    for values in (epoch_zero, epoch_one):
+        for start in range(0, len(values), 16):
+            batch = values[start : start + 16]
+            assert len({value // 256 for value in batch}) == 1
+
+
+def test_canonical_video_local_sampler_requires_compact_range_view() -> None:
+    dataset = _CanonicalRangeDataset(encoding="expanded_rows_v1")
+    with pytest.raises(ValueError, match="episode_ranges_v1"):
+        _resolve_canonical_exhaustive_sampler(
+            {"exhaustive_window_order": "video_local_blocks"},
+            dataset,
+            exhaustive_training=True,
+            is_eval=False,
+        )
+
+
+def test_canonical_video_local_sampler_requires_exhaustive_strategy() -> None:
+    dataset = _CanonicalRangeDataset()
+    with pytest.raises(ValueError, match="all_sources_exhaustive"):
+        _resolve_canonical_exhaustive_sampler(
+            {"exhaustive_window_order": "video_local_blocks"},
+            dataset,
+            exhaustive_training=False,
+            is_eval=False,
+        )
+
+
+def test_canonical_video_local_sampler_handles_single_row_epoch() -> None:
+    dataset = _CanonicalRangeDataset(block_lengths=(1,))
+    sampler = _resolve_canonical_exhaustive_sampler(
+        {"exhaustive_window_order": "video_local_blocks"},
+        dataset,
+        exhaustive_training=True,
+        is_eval=False,
+    )
+
+    assert list(iter(sampler)) == [0]
+
+
 def _config(dataset_py: str):
     return OmegaConf.create(
         {
@@ -169,3 +305,42 @@ def test_build_dataloader_enforces_exact_contract_for_both_paths(
     assert loader.drop_last is False
     assert isinstance(loader.sampler, torch.utils.data.SequentialSampler)
     assert len(loader) == 3
+
+
+def test_build_canonical_dataloader_installs_video_local_sampler(
+    monkeypatch,
+) -> None:
+    module = __import__(
+        "starVLA.dataloader.canonical_subset_dataset",
+        fromlist=["get_vla_dataset"],
+    )
+    dataset = _CanonicalRangeDataset(
+        block_lengths=(8, 8, 8, 8)
+    )
+    monkeypatch.setattr(
+        module,
+        "get_vla_dataset",
+        lambda **_kwargs: dataset,
+    )
+    config = _config("canonical_subset_vla")
+    config.datasets.vla_data.exhaustive_window_order = (
+        "video_local_blocks"
+    )
+
+    loader = build_dataloader(
+        config, dataset_py="canonical_subset_vla"
+    )
+
+    assert isinstance(
+        loader.sampler, _CanonicalVideoLocalExhaustiveSampler
+    )
+    values = [
+        int(value)
+        for batch in loader
+        for value in batch
+    ]
+    assert sorted(values) == list(range(len(dataset)))
+    assert all(
+        len({value // 8 for value in values[start : start + 4]}) == 1
+        for start in range(0, len(values), 4)
+    )
