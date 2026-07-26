@@ -1289,6 +1289,15 @@ def _validate_source_stage(
         raise CurriculumError(
             f"{stage_id} must use all_sources_exhaustive"
         )
+    if (
+        data_cfg.get("dataset_py") == "canonical_subset_vla"
+        and data_cfg.get("exhaustive_window_order")
+        != "video_local_blocks"
+    ):
+        raise CurriculumError(
+            f"{stage_id} canonical exhaustive training must set "
+            "exhaustive_window_order=video_local_blocks"
+        )
     if data_cfg.get("fail_on_sample_error") is not True:
         raise CurriculumError(f"{stage_id} must set fail_on_sample_error=true")
     if data_cfg.get("drop_last") is not False:

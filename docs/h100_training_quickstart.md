@@ -31,8 +31,14 @@ Dataset support is intentionally explicit:
   logical epoch traverses every eligible row from every configured training
   source exactly once before bounded distributed tail padding. Corrupt rows
   fail the run instead of being replaced, and checkpoint resume restores the
-  exact data-stream cursor. Canonical GCS keeps its separately validated
-  streaming contract and does not claim this exact-cursor behavior.
+  exact data-stream cursor. Exact 18-D canonical RealMan profiles provide the
+  same once-per-epoch and exact-cursor contract over an authenticated frozen
+  view. They additionally require
+  `exhaustive_window_order: video_local_blocks`: episode blocks are
+  deterministically reordered each epoch while rows inside each block remain
+  sequential. This avoids scattering one distributed batch across unrelated
+  videos without dropping, repeating, or replacing training rows. Legacy
+  canonical profiles keep their separately validated streaming contract.
 - LIBERO is supported for H100 training and simulator rollout evaluation, but
   it does not yet have a launcher-managed immutable offline holdout artifact.
   Its profile therefore rejects holdout-policy keys instead of silently
@@ -254,6 +260,7 @@ Edit the YAML, not the launcher. In particular, the YAML owns:
 - model, action/state representation, and horizon;
 - prompt/subtask probability;
 - loader workers and video backend;
+- exhaustive epoch order (`video_local_blocks` for exact canonical RealMan);
 - batch size, optimizer, learning rates, schedules, and loss scales;
 - checkpoint, evaluation, retention, and best-model selection settings.
 

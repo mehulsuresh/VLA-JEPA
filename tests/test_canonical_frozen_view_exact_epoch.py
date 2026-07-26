@@ -8,6 +8,8 @@ import pytest
 
 from starVLA.action_representation import REALMAN_18D_ACTION_CONTRACT
 from starVLA.dataloader.canonical_subset_dataset import (
+    EXHAUSTIVE_GLOBAL_AFFINE,
+    EXHAUSTIVE_VIDEO_LOCAL_BLOCKS,
     CanonicalSubsetVLADataset,
     EpisodeSpec,
     ShardSpec,
@@ -268,6 +270,7 @@ def _dataset(
     tmp_path: Path,
     *,
     row_sids: tuple[str, ...] = ("sid0", "sid0", "sid0"),
+    exhaustive_window_order: str = EXHAUSTIVE_GLOBAL_AFFINE,
 ) -> CanonicalSubsetVLADataset:
     source_manifest = tmp_path / "canonical-manifest.jsonl.gz"
     source_manifest.write_bytes(b"immutable canonical source manifest\n")
@@ -333,8 +336,11 @@ def _dataset(
     dataset._frozen_view_episode_lookup = {}
     dataset.mode = "train"
     dataset.epoch_sampling_strategy = "all_sources_exhaustive"
+    dataset.exhaustive_window_order = exhaustive_window_order
     dataset.epoch_sampling_algorithm_version = (
-        "all_sources_exhaustive_frozen_view_affine_v1"
+        "all_sources_exhaustive_frozen_view_video_local_blocks_v1"
+        if exhaustive_window_order == EXHAUSTIVE_VIDEO_LOCAL_BLOCKS
+        else "all_sources_exhaustive_frozen_view_affine_v1"
     )
     dataset.seed = 17
     dataset.fail_on_sample_error = True
@@ -357,6 +363,8 @@ def _range_dataset(
     tmp_path: Path,
     *,
     selected_episode_count: int,
+    samples_per_episode: int = 7,
+    exhaustive_window_order: str = EXHAUSTIVE_GLOBAL_AFFINE,
 ) -> CanonicalSubsetVLADataset:
     tmp_path.mkdir(parents=True, exist_ok=True)
     source_manifest = tmp_path / "canonical-range-manifest.jsonl.gz"
@@ -366,14 +374,15 @@ def _range_dataset(
     annotation_sha256 = _sha("annotation-catalog")
     ranges = []
     episodes = []
-    target_count = (2 * 10 + 1) // 3
+    target_count = int(samples_per_episode)
+    source_episode_length = max(10, target_count * 2)
     for episode_index in range(selected_episode_count):
         lineage = make_episode_lineage_id(
             backend="canonical",
             source_id="source0",
             catalog_sha256=_sha("range-catalog"),
             episode_index=episode_index,
-            length=10,
+            length=source_episode_length,
             episode_metadata_sha256=_sha(
                 f"range-episode-{episode_index}"
             ),
@@ -382,7 +391,7 @@ def _range_dataset(
             frame_content_sha256=_sha(
                 f"range-content-{episode_index}"
             ),
-            length=10,
+            length=source_episode_length,
             content_contract="canonical-range-test-v1",
         )
         ranges.append(
@@ -402,7 +411,7 @@ def _range_dataset(
                 "horizon": 50,
                 "target_fps": 20,
                 "source_fps": 30.0,
-                "source_episode_length": 10,
+                "source_episode_length": source_episode_length,
                 "annotation_ordinal": episode_index,
                 "annotation_episode_index": episode_index,
                 "annotation_sha256": annotation_sha256,
@@ -424,8 +433,8 @@ def _range_dataset(
         )
         episodes.append(
             EpisodeSpec(
-                local_start=episode_index * 10,
-                length=10,
+                local_start=episode_index * source_episode_length,
+                length=source_episode_length,
                 task="move the chain",
                 video_paths={},
                 video_base_frames={},
@@ -537,8 +546,11 @@ def _range_dataset(
     dataset._frozen_view_episode_lookup = {}
     dataset.mode = "train"
     dataset.epoch_sampling_strategy = "all_sources_exhaustive"
+    dataset.exhaustive_window_order = exhaustive_window_order
     dataset.epoch_sampling_algorithm_version = (
-        "all_sources_exhaustive_frozen_view_affine_v1"
+        "all_sources_exhaustive_frozen_view_video_local_blocks_v1"
+        if exhaustive_window_order == EXHAUSTIVE_VIDEO_LOCAL_BLOCKS
+        else "all_sources_exhaustive_frozen_view_affine_v1"
     )
     dataset.seed = 23
     dataset.fail_on_sample_error = True
@@ -751,3 +763,95 @@ def test_compact_range_cached_cumulative_index_corruption_fails_closed(
 
     with pytest.raises(RuntimeError, match="SHA-256 mismatch"):
         _range_dataset(tmp_path, selected_episode_count=5)
+
+
+def test_video_local_compact_range_epoch_is_exact_and_episode_contiguous(
+    tmp_path: Path,
+) -> None:
+    dataset = _range_dataset(
+        tmp_path,
+        selected_episode_count=5,
+        exhaustive_window_order=EXHAUSTIVE_VIDEO_LOCAL_BLOCKS,
+    )
+
+    def epoch_rows() -> list[dict[str, object]]:
+        return [
+            dataset._frozen_view_row(
+                dataset._epoch_window_index(index)
+            )
+            for index in range(len(dataset))
+        ]
+
+    epoch_zero = epoch_rows()
+    dataset.set_epoch(1)
+    epoch_one = epoch_rows()
+
+    assert dataset.epoch_sampling_algorithm_version == (
+        "all_sources_exhaustive_frozen_view_video_local_blocks_v1"
+    )
+    assert {row["sample_id"] for row in epoch_zero} == {
+        row["sample_id"] for row in epoch_one
+    }
+    assert len({row["sample_id"] for row in epoch_zero}) == len(dataset)
+
+    for rows in (epoch_zero, epoch_one):
+        episode_runs: list[int] = []
+        for row in rows:
+            episode_index = int(row["episode_index"])
+            if not episode_runs or episode_runs[-1] != episode_index:
+                episode_runs.append(episode_index)
+        assert len(episode_runs) == 5
+        assert set(episode_runs) == set(range(5))
+        for episode_index in episode_runs:
+            assert [
+                int(row["base_index"])
+                for row in rows
+                if int(row["episode_index"]) == episode_index
+            ] == list(range(7))
+
+    assert [
+        int(row["episode_index"]) for row in epoch_zero
+    ] != [int(row["episode_index"]) for row in epoch_one]
+    ordered_starts, cumulative_ends = (
+        dataset._epoch_block_schedule_cache[(1, len(dataset))]
+    )
+    assert ordered_starts.shape == (5,)
+    assert cumulative_ends.shape == (5,)
+
+
+def test_video_local_order_keeps_each_ddp_rank_batch_on_one_video_block(
+    tmp_path: Path,
+) -> None:
+    dataset = _range_dataset(
+        tmp_path,
+        selected_episode_count=4,
+        samples_per_episode=256,
+        exhaustive_window_order=EXHAUSTIVE_VIDEO_LOCAL_BLOCKS,
+    )
+
+    world_size = 8
+    per_rank_batch = 16
+    for rank in range(world_size):
+        loader_slots = [
+            rank + world_size * offset
+            for offset in range(per_rank_batch)
+        ]
+        episode_ids = {
+            int(
+                dataset._frozen_view_row(
+                    dataset._epoch_window_index(index)
+                )["episode_index"]
+            )
+            for index in loader_slots
+        }
+        assert len(episode_ids) == 1
+
+
+def test_video_local_order_rejects_expanded_frozen_row_view(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ValueError, match="episode_ranges_v1"):
+        _dataset(
+            tmp_path,
+            exhaustive_window_order=EXHAUSTIVE_VIDEO_LOCAL_BLOCKS,
+        )

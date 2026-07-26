@@ -98,6 +98,8 @@ DEFAULT_QWEN_CAMERA_SLOTS = ("main", "left", "right", "extra")
 DEFAULT_VJEPA_CAMERA_SLOTS = ("left", "right", "main")
 JOINT_DELTA_GRIPPER_ABSOLUTE = "joint_delta_gripper_absolute"
 SHARD_Q01_Q99 = "shard_q01_q99"
+EXHAUSTIVE_GLOBAL_AFFINE = "global_affine"
+EXHAUSTIVE_VIDEO_LOCAL_BLOCKS = "video_local_blocks"
 CHECKPOINT_HANDOFF_SMOKE_PURPOSE = "checkpoint_handoff_smoke"
 CHECKPOINT_HANDOFF_SMOKE_VIEW_SCHEMA = (
     "realman-checkpoint-handoff-smoke-view-v1"
@@ -2353,6 +2355,33 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
                 "'with_replacement' or 'all_sources_exhaustive'; got "
                 f"{self.epoch_sampling_strategy!r}."
             )
+        self.exhaustive_window_order = str(
+            _cfg_get(
+                data_cfg,
+                "exhaustive_window_order",
+                EXHAUSTIVE_GLOBAL_AFFINE,
+            )
+        ).strip().lower()
+        if self.exhaustive_window_order not in {
+            EXHAUSTIVE_GLOBAL_AFFINE,
+            EXHAUSTIVE_VIDEO_LOCAL_BLOCKS,
+        }:
+            raise ValueError(
+                "Canonical exhaustive_window_order must be "
+                f"{EXHAUSTIVE_GLOBAL_AFFINE!r} or "
+                f"{EXHAUSTIVE_VIDEO_LOCAL_BLOCKS!r}; got "
+                f"{self.exhaustive_window_order!r}."
+            )
+        if (
+            self.epoch_sampling_strategy != "all_sources_exhaustive"
+            and self.exhaustive_window_order
+            != EXHAUSTIVE_GLOBAL_AFFINE
+        ):
+            raise ValueError(
+                "Canonical exhaustive_window_order="
+                f"{self.exhaustive_window_order!r} requires "
+                "epoch_sampling_strategy='all_sources_exhaustive'."
+            )
         # ``max_shards=1`` is retained only as the legacy smoke-test default
         # for with-replacement sampling.  Once the user selects an exhaustive
         # epoch, an omitted cap must mean *all* shards; silently inheriting the
@@ -2376,7 +2405,12 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
         )
         self.epoch_sampling_algorithm_version = {
             "with_replacement": "legacy_canonical_index_v1",
-            "all_sources_exhaustive": "all_sources_exhaustive_affine_v1",
+            "all_sources_exhaustive": (
+                "all_sources_exhaustive_video_local_blocks_v1"
+                if self.exhaustive_window_order
+                == EXHAUSTIVE_VIDEO_LOCAL_BLOCKS
+                else "all_sources_exhaustive_affine_v1"
+            ),
         }[self.epoch_sampling_strategy]
         self.seed = int(
             _cfg_get(
@@ -2708,7 +2742,10 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
             self.total_windows = int(self.frozen_train_view.row_count)
             self.windows = []
             self.epoch_sampling_algorithm_version = (
-                "all_sources_exhaustive_frozen_view_affine_v1"
+                "all_sources_exhaustive_frozen_view_video_local_blocks_v1"
+                if self.exhaustive_window_order
+                == EXHAUSTIVE_VIDEO_LOCAL_BLOCKS
+                else "all_sources_exhaustive_frozen_view_affine_v1"
             )
         else:
             self._window_ranges = self._build_window_ranges()
@@ -2753,6 +2790,8 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
         state["_shard_prefetch_executor"] = None
         state["_shard_prefetch_futures"] = OrderedDict()
         state["_shard_prefetch_seen"] = set()
+        state["_epoch_permutation_cache"] = {}
+        state["_epoch_block_schedule_cache"] = {}
         return state
 
     def __setstate__(self, state: dict[str, Any]) -> None:
@@ -2766,8 +2805,12 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
             "epoch_sampling_algorithm_version",
             "legacy_canonical_index_v1",
         )
+        self.__dict__.setdefault(
+            "exhaustive_window_order", EXHAUSTIVE_GLOBAL_AFFINE
+        )
         self.__dict__.setdefault("seed", 0)
-        self.__dict__.setdefault("_epoch_permutation_cache", {})
+        self._epoch_permutation_cache = {}
+        self._epoch_block_schedule_cache = {}
         if not hasattr(self, "_shared_epoch"):
             self._shared_epoch = torch.tensor(
                 int(getattr(self, "epoch", 0)), dtype=torch.int64
@@ -2776,6 +2819,11 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
     def _initialize_epoch_schedule(self) -> None:
         """Bind one exact logical epoch to every selected canonical window."""
 
+        self.exhaustive_window_order = getattr(
+            self,
+            "exhaustive_window_order",
+            EXHAUSTIVE_GLOBAL_AFFINE,
+        )
         window_count = int(self.total_windows)
         if not self.index_windows_lazily:
             window_count = int(len(self.windows))
@@ -2791,6 +2839,18 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
         self._primary_dataset_indices = np.asarray([True], dtype=np.bool_)
         self._epoch_dataset_counts = self._dataset_lengths.copy()
         self._epoch_permutation_cache: dict[tuple[int, int], tuple[int, int]] = {}
+        self._epoch_block_schedule_cache: dict[
+            tuple[int, int], tuple[np.ndarray, np.ndarray]
+        ] = {}
+        if (
+            self.epoch_sampling_strategy == "all_sources_exhaustive"
+            and self.exhaustive_window_order
+            == EXHAUSTIVE_VIDEO_LOCAL_BLOCKS
+        ):
+            # Validate the block contract in the parent process before any
+            # persistent workers are launched. Compact frozen range ledgers
+            # authenticate episode boundaries; expanded row ledgers do not.
+            self._exhaustive_episode_block_bounds(window_count)
         self._shared_epoch = torch.zeros((), dtype=torch.int64).share_memory_()
         # The trainer fingerprints child provenance for exact cursor
         # authentication. Canonical is a single logical source, so expose
@@ -3971,6 +4031,101 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
         offset = int((seed >> 64) % length)
         return multiplier, offset
 
+    def _exhaustive_episode_block_bounds(
+        self,
+        expected_window_count: int,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Return authenticated contiguous episode-window boundaries."""
+
+        expected_window_count = int(expected_window_count)
+        frozen_view = getattr(self, "frozen_train_view", None)
+        if frozen_view is not None:
+            if frozen_view.encoding != EPISODE_RANGES_ENCODING:
+                raise ValueError(
+                    "Canonical exhaustive_window_order='video_local_blocks' "
+                    "requires a frozen episode_ranges_v1 view; expanded row "
+                    "views do not authenticate episode block boundaries."
+                )
+            offsets, _ = self._open_frozen_view_readers()
+            cumulative = np.asarray(offsets[:, 1], dtype=np.int64).copy()
+        else:
+            range_ends = getattr(self, "_window_range_ends", None)
+            if not range_ends:
+                raise ValueError(
+                    "Canonical exhaustive_window_order='video_local_blocks' "
+                    "requires non-empty episode window ranges."
+                )
+            cumulative = np.concatenate(
+                (
+                    np.zeros((1,), dtype=np.int64),
+                    np.asarray(range_ends, dtype=np.int64),
+                )
+            )
+
+        if (
+            cumulative.ndim != 1
+            or cumulative.size < 2
+            or int(cumulative[0]) != 0
+            or int(cumulative[-1]) != expected_window_count
+            or np.any(cumulative[1:] <= cumulative[:-1])
+        ):
+            raise RuntimeError(
+                "Canonical video-local exhaustive block boundaries are "
+                "invalid or do not cover the exact logical epoch."
+            )
+        return cumulative[:-1], cumulative[1:]
+
+    def _video_local_epoch_schedule(
+        self,
+        *,
+        epoch: int,
+        length: int,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        cache_key = (int(epoch), int(length))
+        schedule = self._epoch_block_schedule_cache.get(cache_key)
+        if schedule is not None:
+            return schedule
+
+        block_starts, block_ends = self._exhaustive_episode_block_bounds(
+            length
+        )
+        block_count = int(block_starts.size)
+        seed_payload = (
+            f"{self.epoch_sampling_algorithm_version}|{self.seed}|"
+            f"{length}|{block_count}"
+        ).encode("utf-8")
+        permutation_seed = int.from_bytes(
+            hashlib.sha256(seed_payload).digest()[:16],
+            byteorder="big",
+            signed=False,
+        )
+        multiplier, offset = self._affine_permutation_parameters(
+            block_count, permutation_seed
+        )
+        # Rotate the deterministic block cycle once per epoch. This guarantees
+        # a changed episode order for every epoch modulo block_count while
+        # retaining every block and every within-block row exactly once.
+        positions = (
+            np.arange(block_count, dtype=np.int64) + int(epoch)
+        ) % block_count
+        block_order = (
+            multiplier * positions + offset
+        ) % block_count
+        block_lengths = block_ends - block_starts
+        ordered_starts = block_starts[block_order]
+        ordered_cumulative_ends = np.cumsum(
+            block_lengths[block_order], dtype=np.int64
+        )
+        if int(ordered_cumulative_ends[-1]) != int(length):
+            raise RuntimeError(
+                "Canonical video-local exhaustive schedule lost logical rows."
+            )
+        schedule = (ordered_starts, ordered_cumulative_ends)
+        if len(self._epoch_block_schedule_cache) >= 8:
+            self._epoch_block_schedule_cache.clear()
+        self._epoch_block_schedule_cache[cache_key] = schedule
+        return schedule
+
     def _epoch_window_index(self, index: int) -> int:
         """Map a loader slot bijectively onto the selected canonical windows."""
 
@@ -3993,6 +4148,35 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
         ):
             return index
         epoch = self.current_epoch
+        if (
+            getattr(
+                self,
+                "exhaustive_window_order",
+                EXHAUSTIVE_GLOBAL_AFFINE,
+            )
+            == EXHAUSTIVE_VIDEO_LOCAL_BLOCKS
+        ):
+            ordered_starts, ordered_cumulative_ends = (
+                self._video_local_epoch_schedule(
+                    epoch=epoch,
+                    length=length,
+                )
+            )
+            block_position = int(
+                np.searchsorted(
+                    ordered_cumulative_ends,
+                    np.int64(index),
+                    side="right",
+                )
+            )
+            previous_end = (
+                0
+                if block_position == 0
+                else int(ordered_cumulative_ends[block_position - 1])
+            )
+            return int(
+                ordered_starts[block_position] + index - previous_end
+            )
         cache_key = (epoch, length)
         parameters = self._epoch_permutation_cache.get(cache_key)
         if parameters is None:
@@ -7025,6 +7209,9 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
                     self.normalization_statistics_artifact_sha256
                 ),
                 "epoch_sampling_strategy": self.epoch_sampling_strategy,
+                "exhaustive_window_order": (
+                    self.exhaustive_window_order
+                ),
                 "epoch_sampling_algorithm_version": (
                     self.epoch_sampling_algorithm_version
                 ),
@@ -7132,7 +7319,12 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
                     "normalization_statistics_artifact_sha256": (
                         self.normalization_statistics_artifact_sha256
                     ),
-                    "epoch_sampling_strategy": self.epoch_sampling_strategy,
+                    "epoch_sampling_strategy": (
+                        self.epoch_sampling_strategy
+                    ),
+                    "exhaustive_window_order": (
+                        self.exhaustive_window_order
+                    ),
                     "epoch_sampling_algorithm_version": (
                         self.epoch_sampling_algorithm_version
                     ),
@@ -7269,6 +7461,11 @@ class CanonicalSubsetVLADataset(torch.utils.data.Dataset):
             ),
             "epoch_sampling_strategy": getattr(
                 self, "epoch_sampling_strategy", "with_replacement"
+            ),
+            "exhaustive_window_order": getattr(
+                self,
+                "exhaustive_window_order",
+                EXHAUSTIVE_GLOBAL_AFFINE,
             ),
             "epoch_sampling_algorithm_version": getattr(
                 self,

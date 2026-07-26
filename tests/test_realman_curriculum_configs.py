@@ -110,6 +110,8 @@ def test_stage_configs_are_exhaustive_and_lr_contract_is_config_owned(
     assert (action["state_dim"], action["action_dim"]) == (18, 18)
     assert action["action_horizon"] == 50
     assert data["epoch_sampling_strategy"] == "all_sources_exhaustive"
+    if data["dataset_py"] == "canonical_subset_vla":
+        assert data["exhaustive_window_order"] == "video_local_blocks"
     assert data["fail_on_sample_error"] is True
     assert data["drop_last"] is False
     assert data["shuffle"] is False

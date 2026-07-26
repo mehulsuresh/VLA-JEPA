@@ -111,6 +111,11 @@ datasets:
     shuffle_shards: false
     shuffle: false
     epoch_sampling_strategy: all_sources_exhaustive
+    # Preserve exact once-per-epoch coverage while keeping adjacent global
+    # batches inside a small number of episode videos. Global row permutation
+    # made every worker open unrelated videos and allowed one DDP rank to lag
+    # until the NCCL watchdog aborted training.
+    exhaustive_window_order: video_local_blocks
     fail_on_sample_error: true
     drop_last: false
     skip_corrupt_videos: false
